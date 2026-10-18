@@ -146,7 +146,13 @@ export function restorableAgyConversation(
 ): PersistedAgyConversation | undefined {
   for (let index = branch.length - 1; index >= 0; index -= 1) {
     const entry = branch[index];
-    if (entry.type !== "custom" || entry.customType !== AGY_CONVERSATION_STATE_ENTRY) continue;
+    if (
+      entry.type !== "custom" ||
+      (entry.customType !== AGY_CONVERSATION_STATE_ENTRY &&
+        entry.customType !== "pi-antigravity-conversation-state")
+    ) {
+      continue;
+    }
     const state = parsePersistedAgyState(entry.data);
     // The newest state marker is authoritative. A reset or malformed marker
     // must not accidentally resurrect an older conversation.

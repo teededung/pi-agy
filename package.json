@@ -26,11 +26,17 @@
     "index.ts",
     "lib",
     "src",
+    "extensions",
+    "skills",
     "CHANGELOG.md"
   ],
   "pi": {
     "extensions": [
-      "./index.ts"
+      "./index.ts",
+      "./extensions/btw.ts"
+    ],
+    "skills": [
+      "./skills"
     ]
   },
   "dependencies": {
