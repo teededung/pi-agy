@@ -27,7 +27,7 @@ import type {
   ProviderModelConfig,
 } from "@earendil-works/pi-coding-agent";
 import { getDocsPath, getExamplesPath, getReadmePath } from "@earendil-works/pi-coding-agent";
-import { stripTerminalSequences, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Marked, stripTerminalSequences, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
@@ -292,7 +292,40 @@ async function discoverModels(refresh = false): Promise<ModelCache> {
   return cache;
 }
 
+const MARKED_BR_PATCH_SYMBOL = Symbol.for("pi-agy.marked-br-patch");
+
+/**
+ * Normalize inline `<br>`, `<br/>`, and `<br />` HTML tags into Marked `br`
+ * tokens on the shared `@earendil-works/pi-tui` Marked Tokenizer prototype so
+ * multi-line Markdown table cells render as real line breaks in both
+ * `pi-better-render` and Pi's built-in Markdown renderer without modifying
+ * external packages.
+ */
+function installMarkedBrTagPatch(): void {
+  try {
+    const marked = new Marked({ gfm: true }) as unknown as {
+      Tokenizer?: { prototype?: { tag?: (src: string) => any; [MARKED_BR_PATCH_SYMBOL]?: boolean } };
+    };
+    const proto = marked.Tokenizer?.prototype;
+    if (!proto || typeof proto.tag !== "function" || proto[MARKED_BR_PATCH_SYMBOL]) return;
+    const origTag = proto.tag;
+    proto.tag = function patchedTag(this: unknown, src: string) {
+      const tok = origTag.call(this, src);
+      if (tok && tok.type === "html" && typeof tok.raw === "string" && /^<br\s*\/?>$/i.test(tok.raw.trim())) {
+        return { type: "br", raw: tok.raw };
+      }
+      return tok;
+    };
+    proto[MARKED_BR_PATCH_SYMBOL] = true;
+  } catch {
+    // Best-effort patch for pi-tui / pi-better-render Marked inline tokenizer.
+  }
+}
+
+installMarkedBrTagPatch();
+
 export default function antigravityExtension(pi: ExtensionAPI): void {
+  installMarkedBrTagPatch();
   installAgyDeathHooks();
   const runtime = createAntigravityRuntime();
   const service = runtime.runSync(AntigravityRuntime);
