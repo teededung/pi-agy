@@ -16,6 +16,8 @@
 //   /agy-usage      show Antigravity model quotas (weekly and 5-hour limits)
 //   /agy-boost      alias for /boost
 //   /consult        alias for /m
+//   /clear          clear agy conversation and start a new Pi session
+//   /rename         alias for /name (set session display name and sync to agy)
 
 import type {
   ExtensionAPI,
@@ -1463,6 +1465,32 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       } else {
         ctx.ui.notify("✓ Cleared conversation and started a new session.", "info");
       }
+    },
+  });
+
+  pi.registerCommand("rename", {
+    description: "Set session display name (alias for /name)",
+    handler: async (args, ctx) => {
+      const name = args.trim();
+      if (!name) {
+        const currentName = pi.getSessionName()?.trim() ?? ctx.sessionManager.getSessionName()?.trim();
+        if (currentName) {
+          ctx.ui.notify(`Session name: ${currentName}`, "info");
+        } else {
+          ctx.ui.notify("Usage: /rename <name>", "warning");
+        }
+        return;
+      }
+      pi.setSessionName(name);
+      const sessionName = pi.getSessionName() ?? ctx.sessionManager.getSessionName();
+      if (sessionName && sessionName !== name) {
+        ctx.ui.notify(
+          `Session name was normalized from ${JSON.stringify(name)} to ${JSON.stringify(sessionName)}`,
+          "warning",
+        );
+      }
+      await syncSessionNameToAgy(ctx);
+      ctx.ui.notify(`Session name set: ${sessionName ?? name}`, "info");
     },
   });
 

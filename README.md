@@ -98,6 +98,7 @@ Pi's system instructions are relayed on the first native turn, after a native co
 | `/boost`         | Toggle Boost multi-agent mode, or run a single task with orchestrator (`/boost <task>`)                         |
 | `/agy-boost`     | Alias for `/boost`                                                                                              |
 | `/clear [prompt]`| Clear the agy conversation and start a fresh Pi session (optionally sending an initial prompt)                  |
+| `/rename [name]` | Set or view the session display name (alias for `/name`, immediately synced to agy conversation metadata)       |
 | `/agy`           | Conversation title/status (id, model, turns, process, native context)                                           |
 | `/agy-reset`     | Drop the agy conversation and driver; next turn starts fresh                                                    |
 | `/agy-models`    | Re-discover models and re-register the provider                                                                 |
