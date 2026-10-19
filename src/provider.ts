@@ -252,6 +252,33 @@ export function isSideConversationRequest(prompt: string, systemPrompt?: string)
   return false;
 }
 
+const BTW_ASIDE_INSTRUCTION =
+  "You are having an aside conversation with the user, separate from their main working session. Answer the side question directly and concisely, using the session context when helpful without derailing or continuing the main task unless asked.";
+
+function buildSideConversationSystemPrompt(
+  rawSystemPrompt: string | undefined,
+  relayedSystemPrompt: string | undefined,
+): string {
+  if (rawSystemPrompt?.includes("Summarize the side conversation concisely")) {
+    return rawSystemPrompt;
+  }
+  const isReadOnlyAside =
+    rawSystemPrompt?.includes("Available tools in this BTW session: read, grep, find, ls.") ||
+    rawSystemPrompt?.includes("No tools are available in this BTW session.");
+  const asideInstruction = isReadOnlyAside
+    ? `${BTW_ASIDE_INSTRUCTION}\nThis is a read-only aside turn: do not modify files or run mutating commands.`
+    : BTW_ASIDE_INSTRUCTION;
+  const baseRelay = relayedSystemPrompt?.trim();
+  if (baseRelay) {
+    return `${baseRelay}\n\n${asideInstruction}`;
+  }
+  if (!rawSystemPrompt) {
+    return asideInstruction;
+  }
+  const stripped = rawSystemPrompt.replace(/<btw_capabilities>[\s\S]*?<\/btw_capabilities>/g, "").trim();
+  return stripped || asideInstruction;
+}
+
 const OVERFLOW_PATTERN = /context (length|window|size).*(exceed|limit)|exceeds.*context/i;
 
 /**
@@ -417,7 +444,7 @@ export function streamAntigravity(
       let turnRuntime = runtime;
       let turnService = service;
       let isolatedRuntime: AntigravityRuntimeInstance | undefined;
-      let isDisposableSummary = false;
+      let isDisposableTurn = false;
       let turnCleared = false;
 
       const clearTurn = () => {
@@ -428,13 +455,14 @@ export function streamAntigravity(
           onSettled?.();
           return;
         }
-        // A summarizer has no continuity to preserve. Abort any unfinished
-        // child, then dispose its private Effect runtime and remove the
-        // disposable agy conversation so `/compact` never hijacks `agy -c`.
-        const shouldDeleteSummaryConv = isDisposableSummary;
+        // A summarizer or disposable side-conversation (/btw) has no main-thread
+        // continuity to preserve in `agy -c`. Abort any unfinished child, then
+        // dispose its private Effect runtime and remove the disposable agy
+        // conversation so `/compact` and `/btw` never hijack `agy -c`.
+        const shouldDeleteDisposableConv = isDisposableTurn;
         void finished
           .then(async () => {
-            const snap = shouldDeleteSummaryConv
+            const snap = shouldDeleteDisposableConv
               ? await turnRuntime.runPromise(turnService.snapshot).catch(() => undefined)
               : undefined;
             await turnRuntime.runPromise(turnService.close).catch(() => {});
@@ -468,11 +496,11 @@ export function streamAntigravity(
         const summaryRequest = rawUserPrompt
           ? isSummarizationRequest(rawUserPrompt, systemPrompt)
           : false;
-        isDisposableSummary = summaryRequest;
         const sideRequest = rawUserPrompt
           ? isSideConversationRequest(rawUserPrompt, systemPrompt)
           : false;
         const isolatedRequest = summaryRequest || sideRequest;
+        isDisposableTurn = isolatedRequest;
         let prompt = rawUserPrompt;
         let consultOverride: OneShotConsultOverride | undefined;
         if (!isolatedRequest && prompt) {
@@ -559,7 +587,7 @@ export function streamAntigravity(
         }
 
         let bridgeRevision: string | undefined;
-        let processProfile: AgyProcessProfile = {};
+        const processProfile: AgyProcessProfile = getProcessProfile();
         if (!isolatedRequest) {
           // Refresh and resolve before the driver fingerprint is evaluated.
           // Re-entry into a pending bridge turn returns the existing controller,
@@ -567,7 +595,6 @@ export function streamAntigravity(
           bridge.refreshTools();
           resolveBridgeResultsFromContext(bridge, context.messages);
           bridgeRevision = getBridgeRevision();
-          processProfile = getProcessProfile();
         }
         const requestedEffort =
           consultOverride?.effort ?? mapThinkingToEffort(options?.reasoning);
@@ -576,18 +603,27 @@ export function streamAntigravity(
           onConsultUsed?.({ modelId: effectiveModelId, effort });
         }
 
+        const sideSummaryRequest =
+          sideRequest &&
+          (rawUserPrompt.includes("Summarize the side conversation concisely") ||
+            Boolean(systemPrompt?.includes("Summarize the side conversation concisely")));
+        const effectiveSystemPrompt = summaryRequest
+          ? systemPrompt
+          : sideRequest
+            ? buildSideConversationSystemPrompt(systemPrompt, getSystemPromptRelay?.())
+            : (getSystemPromptRelay?.() ?? systemPrompt);
+
         const controller = await turnRuntime.runPromise(
           turnService.beginStreamTurn({
             prompt: turnPrompt,
-            // Summary requests and side conversations carry their own instructions
-            // in transcript system messages — the docs-only relay is for main user turns
-            // only and must not override them.
-            systemPrompt: isolatedRequest
-              ? systemPrompt
-              : (getSystemPromptRelay?.() ?? systemPrompt),
-            historyBootstrap: summaryRequest
-              ? undefined
-              : piHistoryBootstrap(context, turnPrompt.length),
+            // Summary requests keep their summarization prompt; side conversations
+            // combine the slimmed Pi instruction relay with the aside directive
+            // (stripping conflicting <btw_capabilities> tool claims).
+            systemPrompt: effectiveSystemPrompt,
+            historyBootstrap:
+              summaryRequest || sideSummaryRequest
+                ? undefined
+                : piHistoryBootstrap(context, turnPrompt.length),
             bootstrapSuffix: isolatedRequest ? undefined : getBootstrapSuffix?.(),
             modelId: effectiveModelId,
             effort,

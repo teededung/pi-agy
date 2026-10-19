@@ -2809,8 +2809,14 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
+    let resolveHandleReady!: () => void;
+    const handleReady = new Promise<void>((resolve) => {
+      resolveHandleReady = resolve;
+    });
+
     const runtime: OverlayRuntime = {};
     const closeRuntime = () => {
+      resolveHandleReady();
       if (runtime.closed) {
         return;
       }
@@ -2899,6 +2905,7 @@ export default function (pi: ExtensionAPI) {
             } else {
               handle.focus();
             }
+            resolveHandleReady();
             if (runtime.closed) {
               closeRuntime();
             }
@@ -2906,11 +2913,14 @@ export default function (pi: ExtensionAPI) {
         },
       )
       .catch((error) => {
+        resolveHandleReady();
         if (overlayRuntime === runtime) {
           overlayRuntime = null;
         }
         notify(ctx, error instanceof Error ? error.message : String(error), "error");
       });
+
+    await handleReady;
   }
 
   async function dispatchBtwCommand(name: string, args: string, ctx: ExtensionCommandContext): Promise<boolean> {
@@ -3292,13 +3302,27 @@ export default function (pi: ExtensionAPI) {
       } finally {
         pendingSubmissionsCount = Math.max(0, pendingSubmissionsCount - 1);
         if (generation === btwLifecycleGeneration && pendingSubmissionsCount === 0 && overlayMinimized && overlayRuntime?.handle) {
-          restoreOverlay(ctx);
+          const mainEditorHasDraft = Boolean(ctx.ui?.getEditorText?.()?.trim());
+          if (ctx.isIdle() && !mainEditorHasDraft) {
+            restoreOverlay(ctx);
+          } else {
+            syncUi(ctx);
+          }
         } else {
           syncUi(ctx);
         }
       }
     });
     btwSubmissionQueue = submission.catch(() => {});
+    if (canRenderBtwOverlay(ctx)) {
+      setOverlayStatus("⏳ streaming...", ctx);
+      if (!overlayMinimized || !overlayRuntime?.handle) {
+        await ensureOverlay(ctx);
+      } else {
+        syncUi(ctx);
+      }
+      return;
+    }
     await submission;
   }
 
@@ -3345,6 +3369,7 @@ export default function (pi: ExtensionAPI) {
     if (!sessionRuntime) {
       return;
     }
+    subscribeOverlayToActiveBtwSession(ctx);
 
     const session = sessionRuntime.session;
     const wasBusy = !ctx.isIdle();
