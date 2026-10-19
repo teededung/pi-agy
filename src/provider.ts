@@ -1109,7 +1109,50 @@ export function streamAntigravity(
             }
             case "tool_start": {
               controller.beginTextSegment();
-              if (isolatedRequest) break;
+              if (isolatedRequest) {
+                if (!summaryRequest) {
+                  if (textIndex !== null) closeText();
+                  closeUnfilledThought();
+                  if (thinkingIndex === null) {
+                    output.content.push({ type: "thinking", thinking: "" });
+                    thinkingIndex = output.content.length - 1;
+                    thinkingBuffer = "";
+                    thinkingStepId = activity.stepId;
+                    stream.push({
+                      type: "thinking_start",
+                      contentIndex: thinkingIndex,
+                      partial: output,
+                    });
+                  }
+                  hasRealThinking = true;
+                  const args = activity.args ?? {};
+                  const detail =
+                    (typeof args.CommandLine === "string" && args.CommandLine.trim()) ||
+                    (typeof args.AbsolutePath === "string" && args.AbsolutePath.trim()) ||
+                    (typeof args.TargetFile === "string" && args.TargetFile.trim()) ||
+                    (typeof args.toolAction === "string" && args.toolAction.trim()) ||
+                    (typeof args.toolSummary === "string" && args.toolSummary.trim()) ||
+                    "";
+                  const oneLine = detail.replace(/\s+/g, " ").trim();
+                  const clipped = oneLine.length > 96 ? `${oneLine.slice(0, 93)}...` : oneLine;
+                  const toolLine = clipped
+                    ? `🔧 \`${activity.name}\` · ${clipped}`
+                    : `🔧 \`${activity.name}\``;
+                  const prefix =
+                    thinkingBuffer.length === 0 || thinkingBuffer.endsWith("\n") ? "" : "\n";
+                  const delta = `${prefix}${toolLine}\n`;
+                  thinkingBuffer += delta;
+                  const block = output.content[thinkingIndex];
+                  if (block.type === "thinking") block.thinking = thinkingBuffer;
+                  stream.push({
+                    type: "thinking_delta",
+                    contentIndex: thinkingIndex,
+                    delta,
+                    partial: output,
+                  });
+                }
+                break;
+              }
               if (isBridgedMcpStep(activity, bridge.serverName)) break;
               closeText();
               emitStartedReplayTool(activity);

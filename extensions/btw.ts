@@ -2058,7 +2058,9 @@ export class BtwOverlayComponent extends Container implements Focusable {
     this.modeText.setText(this.modeTextValue);
     const entries = this.readTranscriptEntries();
     const exchanges = getCompletedExchangeCount(entries);
-    const isStreaming = hasStreamingTranscriptEntry(entries);
+    const currentStatus = this.getStatus();
+    const isStreaming =
+      hasStreamingTranscriptEntry(entries) || Boolean(currentStatus?.trim().startsWith("⏳"));
     const active = isStreaming ? " · streaming" : " · idle";
     this.summaryTextValue = `${exchanges} exchange${exchanges === 1 ? "" : "s"}${active}`;
     this.summaryText.setText(this.summaryTextValue);
@@ -2069,7 +2071,7 @@ export class BtwOverlayComponent extends Container implements Focusable {
       this.transcript.addChild(new Text(line, 1, 0));
     }
 
-    const status = this.getStatus() ?? "Ready. Enter submits; Esc or Alt+m minimizes while working.";
+    const status = currentStatus ?? "Ready. Enter submits; Esc or Alt+m minimizes while working.";
     this.statusTextValue = status;
     this.statusText.setText(this.statusTextValue);
     this.hintsTextValue = isStreaming
@@ -2136,6 +2138,15 @@ export default function (pi: ExtensionAPI) {
           return `⏳ tool: ${entry.toolName}${entry.args ? ` · ${entry.args}` : ""}`;
         }
         if (entry.type === "thinking" && entry.streaming) {
+          const lastToolLine = entry.text
+            .split("\n")
+            .map((line) => line.trim())
+            .filter((line) => line.startsWith("🔧 "))
+            .pop();
+          if (lastToolLine) {
+            const preview = lastToolLine.length > 56 ? `${lastToolLine.slice(0, 53)}...` : lastToolLine;
+            return `⏳ ${preview}`;
+          }
           return "⏳ thinking...";
         }
       }
@@ -2353,6 +2364,18 @@ export default function (pi: ExtensionAPI) {
       event.type === "message_end" ||
       event.type === "turn_start"
     ) {
+      if (event.type === "message_update" && event.message.role === "assistant") {
+        const thinkingText = extractThinking(event.message);
+        const lastToolLine = thinkingText
+          .split("\n")
+          .map((line) => line.trim())
+          .filter((line) => line.startsWith("🔧 "))
+          .pop();
+        if (lastToolLine) {
+          setOverlayStatus(`⏳ ${lastToolLine}`, ctx);
+          return;
+        }
+      }
       syncUi(ctx);
     }
   }
