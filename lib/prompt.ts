@@ -111,11 +111,12 @@ export function stripPiToolInventory(instructions: string): string {
     .trim();
 }
 
-/** Absolute paths into pi's own documentation install. */
+/** Absolute paths into pi's own documentation install and active workspace. */
 export interface PiDocsPaths {
   readme: string;
   docs: string;
   examples: string;
+  cwd?: string;
 }
 
 /**
@@ -134,6 +135,7 @@ export interface PiDocsPaths {
  */
 export function buildAgyRelayedInstructions(piDocs: PiDocsPaths): string {
   return [
+    ...(piDocs.cwd ? [`Current working directory: ${piDocs.cwd}`, ""] : []),
     "Pi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):",
     `- Main documentation: ${piDocs.readme}`,
     `- Additional docs: ${piDocs.docs}`,

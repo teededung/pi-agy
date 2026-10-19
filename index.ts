@@ -610,6 +610,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       readme: getReadmePath(),
       docs: getDocsPath(),
       examples: getExamplesPath(),
+      cwd: activeSessionCtx?.cwd || tasksSessionCwd || process.cwd(),
     });
 
   function captureSkills(skills: unknown): void {
