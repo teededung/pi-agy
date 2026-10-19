@@ -500,62 +500,98 @@ type ParsedBtwModelCommand =
   | { action: "lookup"; query: string; thinkingLevel?: SessionThinkingLevel }
   | { action: "invalid"; message: string };
 
+function parseSingleBtwModelSpecToken(
+  token: string,
+): { query: string; thinkingLevel?: SessionThinkingLevel } | { action: "clear" } | { action: "show" } {
+  const lower = token.toLowerCase();
+  if (lower === "show" || lower === "status") {
+    return { action: "show" };
+  }
+  if (lower === "clear" || lower === "reset" || lower === "default" || lower === "main") {
+    return { action: "clear" };
+  }
+
+  const aliasMatch = token.match(
+    /^(argon|flash|opus|sonnet|grok-fast|grok)(?:[-:]?(0|1|2|3|4|off|low|mid|medium|high|xhigh))?$/i,
+  );
+  if (aliasMatch) {
+    const base = aliasMatch[1]!.toLowerCase();
+    const thinkingLevel =
+      base === "grok-fast" ? "off" : parseBtwThinkingToken(aliasMatch[2]);
+    return { query: base, thinkingLevel };
+  }
+
+  const suffixMatch = token.match(/^([a-z0-9/_.-]+?):?(?:[-:](0|1|2|3|4|off|low|mid|medium|high|xhigh))$/i);
+  if (suffixMatch && !BTW_MODEL_ALIASES[lower]) {
+    const thinkingLevel = parseBtwThinkingToken(suffixMatch[2]);
+    if (thinkingLevel) {
+      return { query: suffixMatch[1]!, thinkingLevel };
+    }
+  }
+
+  return { query: token };
+}
+
+function splitBtwModelCommandArgs(args: string): { spec: string; question: string } {
+  const trimmed = args.trim();
+  if (!trimmed) {
+    return { spec: "", question: "" };
+  }
+  const match = trimmed.match(/^(\S+)(?:\s+([\s\S]*))?$/);
+  if (!match) {
+    return { spec: trimmed, question: "" };
+  }
+  const firstToken = match[1]!;
+  const rest = match[2]?.trim() ?? "";
+  if (!rest) {
+    return { spec: firstToken, question: "" };
+  }
+
+  // Keep legacy 2-token `<model> <thinkingLevel>` when there is no trailing question,
+  // e.g. `/btw:model argon medium` or `/btw:model argon 2`.
+  const restParts = rest.split(/\s+/);
+  if (restParts.length === 1 && parseBtwThinkingToken(restParts[0])) {
+    return { spec: `${firstToken} ${restParts[0]}`, question: "" };
+  }
+
+  return { spec: firstToken, question: rest };
+}
+
 function parseBtwModelArgs(args: string): ParsedBtwModelCommand {
   const trimmed = args.trim();
   if (!trimmed) {
     return { action: "show", interactive: true };
   }
 
-  const lower = trimmed.toLowerCase();
-  if (lower === "show" || lower === "status") {
-    return { action: "show", interactive: false };
-  }
-
-  if (lower === "clear" || lower === "reset" || lower === "default" || lower === "main") {
-    return { action: "clear" };
-  }
-
   const parts = trimmed.split(/\s+/);
-  if (parts.length === 3) {
-    const [provider, id, api] = parts;
-    return { action: "set", model: { provider, id, api } as BtwModelRef };
+  if (parts.length === 1) {
+    const single = parseSingleBtwModelSpecToken(parts[0]!);
+    if ("action" in single) {
+      return single.action === "show" ? { action: "show", interactive: false } : { action: "clear" };
+    }
+    return { action: "lookup", query: single.query, thinkingLevel: single.thinkingLevel };
   }
 
   if (parts.length === 2) {
     const secondThinking = parseBtwThinkingToken(parts[1]);
     if (secondThinking) {
-      return { action: "lookup", query: parts[0]!, thinkingLevel: secondThinking };
+      const single = parseSingleBtwModelSpecToken(parts[0]!);
+      if (!("action" in single)) {
+        return { action: "lookup", query: single.query, thinkingLevel: secondThinking };
+      }
     }
     return { action: "lookup", query: `${parts[0]}/${parts[1]}` };
   }
 
-  if (parts.length === 1) {
-    const token = parts[0]!;
-    const aliasMatch = token.match(
-      /^(argon|flash|opus|sonnet|grok-fast|grok)(?:[-:]?(0|1|2|3|4|off|low|mid|medium|high|xhigh))?$/i,
-    );
-    if (aliasMatch) {
-      const base = aliasMatch[1]!.toLowerCase();
-      const thinkingLevel =
-        base === "grok-fast" ? "off" : parseBtwThinkingToken(aliasMatch[2]);
-      return { action: "lookup", query: base, thinkingLevel };
-    }
-
-    const suffixMatch = token.match(/^([a-z0-9/_.-]+?):?(?:[-:](0|1|2|3|4|off|low|mid|medium|high|xhigh))$/i);
-    if (suffixMatch && !BTW_MODEL_ALIASES[token.toLowerCase()]) {
-      const thinkingLevel = parseBtwThinkingToken(suffixMatch[2]);
-      if (thinkingLevel) {
-        return { action: "lookup", query: suffixMatch[1]!, thinkingLevel };
-      }
-    }
-
-    return { action: "lookup", query: token };
+  if (parts.length === 3) {
+    const [provider, id, api] = parts;
+    return { action: "set", model: { provider, id, api } as BtwModelRef };
   }
 
   return {
     action: "invalid",
     message:
-      "Usage: /btw:model [opus|sonnet|argon|flash|grok][1|2|3] | <provider>/<model> | clear",
+      "Usage: /btw:model [opus|sonnet|argon|flash|grok][1|2|3] [prompt] | <provider>/<model> [prompt] | clear",
   };
 }
 
@@ -1758,7 +1794,14 @@ export class BtwOverlayComponent extends Container implements Focusable {
     if (matchesKey(data, Key.up) || matchesKey(data, Key.down)) {
       const delta = matchesKey(data, Key.up) ? -1 : 1;
       this.completionIndex = (this.completionIndex + delta + this.completionItems.length) % this.completionItems.length;
-    } else if (matchesKey(data, Key.tab) || (matchesKey(data, Key.enter) && !isExactMatch)) {
+    } else if (matchesKey(data, Key.tab)) {
+      if (currentSelection) {
+        const nextDraft = currentSelection.value.endsWith(" ")
+          ? currentSelection.value
+          : `${currentSelection.value} `;
+        this.setDraft(nextDraft);
+      }
+    } else if (matchesKey(data, Key.enter) && !isExactMatch) {
       if (currentSelection) {
         this.setDraft(currentSelection.value);
       }
@@ -2984,14 +3027,15 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (name === "btw:model") {
-      const parsed = parseBtwModelArgs(trimmedArgs);
+      const { spec, question } = splitBtwModelCommandArgs(trimmedArgs);
+      const parsed = parseBtwModelArgs(spec);
       if (parsed.action === "invalid") {
         setOverlayStatus(parsed.message, ctx);
         notify(ctx, parsed.message, "error");
         return true;
       }
 
-      if (parsed.action === "show") {
+      if (parsed.action === "show" && !question) {
         const settings = await resolveBtwSettings(ctx);
         const message = `${describeResolvedModel(settings)} ${describeResolvedThinking(settings)}`;
         if (parsed.interactive && ctx.hasUI && !overlayRuntime?.handle) {
@@ -3012,13 +3056,21 @@ export default function (pi: ExtensionAPI) {
         return true;
       }
 
-      await applyBtwModelSpec(ctx, trimmedArgs);
+      if (!(await applyBtwModelSpec(ctx, spec))) {
+        return true;
+      }
+      if (question) {
+        await runBtw(ctx, question, false, pendingMode);
+      }
       return true;
     }
 
     if (name === "btw:thinking") {
-      const parsed = parseBtwThinkingArgs(trimmedArgs);
-      if (parsed.action === "show") {
+      const match = trimmedArgs.match(/^(\S+)(?:\s+([\s\S]*))?$/);
+      const levelArg = match?.[1] ?? "";
+      const question = match?.[2]?.trim() ?? "";
+      const parsed = parseBtwThinkingArgs(levelArg);
+      if (parsed.action === "show" && !question) {
         const settings = await resolveBtwSettings(ctx);
         const message = describeResolvedThinking(settings);
         setOverlayStatus(message, ctx);
@@ -3026,7 +3078,10 @@ export default function (pi: ExtensionAPI) {
         return true;
       }
 
-      await setBtwThinkingOverride(ctx, parsed.action === "clear" ? null : parsed.thinkingLevel);
+      await setBtwThinkingOverride(ctx, parsed.action === "clear" ? null : parsed.action === "set" ? parsed.thinkingLevel : null);
+      if (question) {
+        await runBtw(ctx, question, false, pendingMode);
+      }
       return true;
     }
 
