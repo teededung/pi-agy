@@ -263,6 +263,7 @@ type BtwTurnOutcome = "completed" | "aborted" | "failed";
 type BtwTranscriptEntry =
   | { id: number; turnId: number; type: "turn-boundary"; phase: "start" | "end"; outcome?: BtwTurnOutcome }
   | { id: number; turnId: number; type: "user-message"; text: string }
+  | { id: number; turnId: number; type: "queued-user-message"; text: string; queuePosition: number; queueTotal: number }
   | { id: number; turnId: number; type: "thinking"; text: string; streaming: boolean }
   | { id: number; turnId: number; type: "assistant-text"; text: string; streaming: boolean }
   | { id: number; turnId: number; type: "tool-call"; toolCallId: string; toolName: string; args: string }
@@ -1388,6 +1389,21 @@ function buildOverlayTranscript(
       continue;
     }
 
+    if (entry.type === "queued-user-message") {
+      if (lines.length > 0) {
+        pushBlankLine();
+        lines.push(separator);
+      }
+      const queuedLabel = entry.queueTotal > 1 ? `Queued #${entry.queuePosition}` : "Queued";
+      const queuedBadge = buildTranscriptBadge(theme, queuedLabel, "toolPendingBg", "warning");
+      const waitingHint = theme.fg("dim", "(⏳ waiting for current turn...)");
+      pushStackedBlock(`${queuedBadge} ${waitingHint}`, entry.text, {
+        blankBefore: false,
+        style: (line) => theme.fg("dim", line),
+      });
+      continue;
+    }
+
     if (entry.type === "thinking") {
       const thinkingHeader = entry.streaming ? `${thinkingBadge} ${theme.fg("warning", "▍")}` : thinkingBadge;
       const markdownLines = new Markdown(entry.text, 0, 0, markdownTheme, {
@@ -2058,11 +2074,15 @@ export class BtwOverlayComponent extends Container implements Focusable {
     this.modeText.setText(this.modeTextValue);
     const entries = this.readTranscriptEntries();
     const exchanges = getCompletedExchangeCount(entries);
+    const queuedCount = entries.filter((entry) => entry.type === "queued-user-message").length;
     const currentStatus = this.getStatus();
     const isStreaming =
-      hasStreamingTranscriptEntry(entries) || Boolean(currentStatus?.trim().startsWith("⏳"));
+      hasStreamingTranscriptEntry(entries) ||
+      queuedCount > 0 ||
+      Boolean(currentStatus?.trim().startsWith("⏳"));
     const active = isStreaming ? " · streaming" : " · idle";
-    this.summaryTextValue = `${exchanges} exchange${exchanges === 1 ? "" : "s"}${active}`;
+    const queuedBadge = queuedCount > 0 ? ` · 📥 ${queuedCount} queued` : "";
+    this.summaryTextValue = `${exchanges} exchange${exchanges === 1 ? "" : "s"}${active}${queuedBadge}`;
     this.summaryText.setText(this.summaryTextValue);
 
     this.rebuildTranscriptLines();
@@ -2071,7 +2091,11 @@ export class BtwOverlayComponent extends Container implements Focusable {
       this.transcript.addChild(new Text(line, 1, 0));
     }
 
-    const status = currentStatus ?? "Ready. Enter submits; Esc or Alt+m minimizes while working.";
+    const baseStatus = currentStatus ?? "Ready. Enter submits; Esc or Alt+m minimizes while working.";
+    const status =
+      queuedCount > 0 && !baseStatus.includes("queued")
+        ? `${baseStatus} · 📥 ${queuedCount} queued`
+        : baseStatus;
     this.statusTextValue = status;
     this.statusText.setText(this.statusTextValue);
     this.hintsTextValue = isStreaming
@@ -2093,6 +2117,9 @@ export default function (pi: ExtensionAPI) {
   let overlayWidthMode: BtwOverlayWidthMode = "window";
   let overlayMinimized = false;
   let pendingSubmissionsCount = 0;
+  let activeBtwExecutions = 0;
+  let nextQueuedPromptId = 1;
+  let queuedPrompts: Array<{ id: number; question: string; generation: number }> = [];
   let overlayRuntime: OverlayRuntime | null = null;
   let lastUiContext: ExtensionContext | ExtensionCommandContext | null = null;
   let activeBtwSession: BtwSessionRuntime | null = null;
@@ -2102,6 +2129,25 @@ export default function (pi: ExtensionAPI) {
 
   function invalidateBtwLifecycle(): void {
     btwLifecycleGeneration += 1;
+    queuedPrompts = [];
+  }
+
+  function getTranscriptEntriesWithQueue(): BtwTranscript {
+    if (queuedPrompts.length === 0) {
+      return transcriptState.entries;
+    }
+    const total = queuedPrompts.length;
+    return [
+      ...transcriptState.entries,
+      ...queuedPrompts.map((item, idx) => ({
+        id: -item.id,
+        turnId: -item.id,
+        type: "queued-user-message" as const,
+        text: item.question,
+        queuePosition: idx + 1,
+        queueTotal: total,
+      })),
+    ];
   }
 
   function isBtwWorking(): boolean {
@@ -2109,11 +2155,16 @@ export default function (pi: ExtensionAPI) {
     return (
       (Boolean(sessionRuntime?.session.isStreaming) && !sessionRuntime?.abortPromise) ||
       pendingSubmissionsCount > 0 ||
+      queuedPrompts.length > 0 ||
       hasStreamingTranscriptEntry(transcriptState.entries)
     );
   }
 
   function buildMinimizedStatusPreview(): string {
+    const withQueueSuffix = (text: string): string =>
+      queuedPrompts.length > 0 && !text.includes("queued")
+        ? `${text} · 📥 ${queuedPrompts.length} queued`
+        : text;
     const entries = transcriptState.entries;
     const currentTurnId = transcriptState.currentTurnId;
     if (currentTurnId !== null) {
@@ -2131,11 +2182,11 @@ export default function (pi: ExtensionAPI) {
             .pop();
           if (lastLine) {
             const preview = lastLine.length > 56 ? `${lastLine.slice(0, 53)}...` : lastLine;
-            return `⏳ ${preview}`;
+            return withQueueSuffix(`⏳ ${preview}`);
           }
         }
         if (entry.type === "tool-call") {
-          return `⏳ tool: ${entry.toolName}${entry.args ? ` · ${entry.args}` : ""}`;
+          return withQueueSuffix(`⏳ tool: ${entry.toolName}${entry.args ? ` · ${entry.args}` : ""}`);
         }
         if (entry.type === "thinking" && entry.streaming) {
           const lastToolLine = entry.text
@@ -2145,18 +2196,18 @@ export default function (pi: ExtensionAPI) {
             .pop();
           if (lastToolLine) {
             const preview = lastToolLine.length > 56 ? `${lastToolLine.slice(0, 53)}...` : lastToolLine;
-            return `⏳ ${preview}`;
+            return withQueueSuffix(`⏳ ${preview}`);
           }
-          return "⏳ thinking...";
+          return withQueueSuffix("⏳ thinking...");
         }
       }
     }
     if (overlayStatus) {
-      return overlayStatus;
+      return withQueueSuffix(overlayStatus);
     }
     const exchanges = getCompletedExchangeCount(entries);
     return isBtwWorking()
-      ? "⏳ working..."
+      ? withQueueSuffix("⏳ working...")
       : `${exchanges} exchange${exchanges === 1 ? "" : "s"} · ready`;
   }
 
@@ -2454,9 +2505,12 @@ export default function (pi: ExtensionAPI) {
    */
   async function dismissOrAbortOverlaySession(ctx?: ExtensionContext | ExtensionCommandContext): Promise<void> {
     const sessionRuntime = activeBtwSession;
-    if (sessionRuntime?.session.isStreaming && !sessionRuntime.abortPromise) {
+    if ((sessionRuntime?.session.isStreaming && !sessionRuntime.abortPromise) || queuedPrompts.length > 0) {
+      invalidateBtwLifecycle();
       setOverlayStatus("⏹ Aborting. Press Esc or Ctrl+C again to dismiss the BTW overlay.", ctx);
-      await requestBtwSessionAbort(sessionRuntime);
+      if (sessionRuntime) {
+        await requestBtwSessionAbort(sessionRuntime);
+      }
       if (activeBtwSession === sessionRuntime && overlayRuntime) {
         setOverlayStatus("⏹ Aborted. Press Esc or Ctrl+C again to dismiss the BTW overlay.", ctx);
       }
@@ -2867,7 +2921,7 @@ export default function (pi: ExtensionAPI) {
             tui,
             theme,
             keybindings,
-            () => transcriptState.entries,
+            () => getTranscriptEntriesWithQueue(),
             () => overlayStatus,
             () => pendingMode,
             () => overlayWidthMode,
@@ -3214,8 +3268,6 @@ export default function (pi: ExtensionAPI) {
     }
 
     setOverlayDraft("");
-    setOverlayStatus("⏳ streaming...", ctx);
-    syncUi(ctx);
     await runBtw(cmdCtx, question, false, pendingMode);
   }
 
@@ -3315,14 +3367,37 @@ export default function (pi: ExtensionAPI) {
     mode: BtwThreadMode,
   ): Promise<void> {
     const generation = btwLifecycleGeneration;
+    const shouldQueue =
+      activeBtwExecutions > 0 ||
+      queuedPrompts.length > 0 ||
+      Boolean(activeBtwSession?.session.isStreaming);
+    const queuedId = shouldQueue ? nextQueuedPromptId++ : null;
+    if (queuedId !== null) {
+      queuedPrompts.push({ id: queuedId, question, generation });
+    }
+    const dequeuePrompt = () => {
+      if (queuedId === null) {
+        return;
+      }
+      const next = queuedPrompts.filter((item) => item.id !== queuedId);
+      if (next.length !== queuedPrompts.length) {
+        queuedPrompts = next;
+        syncUi(ctx);
+      }
+    };
+
     pendingSubmissionsCount += 1;
     const submission = btwSubmissionQueue.then(async () => {
+      activeBtwExecutions += 1;
       try {
         if (generation !== btwLifecycleGeneration) {
+          dequeuePrompt();
           return;
         }
-        await executeBtw(ctx, question, saveRequested, mode, generation);
+        await executeBtw(ctx, question, saveRequested, mode, generation, dequeuePrompt);
       } finally {
+        dequeuePrompt();
+        activeBtwExecutions = Math.max(0, activeBtwExecutions - 1);
         pendingSubmissionsCount = Math.max(0, pendingSubmissionsCount - 1);
         if (generation === btwLifecycleGeneration && pendingSubmissionsCount === 0 && overlayMinimized && overlayRuntime?.handle) {
           const mainEditorHasDraft = Boolean(ctx.ui?.getEditorText?.()?.trim());
@@ -3338,12 +3413,13 @@ export default function (pi: ExtensionAPI) {
     });
     btwSubmissionQueue = submission.catch(() => {});
     if (canRenderBtwOverlay(ctx)) {
-      setOverlayStatus("⏳ streaming...", ctx);
+      if (!shouldQueue || !overlayStatus) {
+        setOverlayStatus("⏳ streaming...", ctx);
+      }
       if (!overlayMinimized || !overlayRuntime?.handle) {
         await ensureOverlay(ctx);
-      } else {
-        syncUi(ctx);
       }
+      syncUi(ctx);
       return;
     }
     await submission;
@@ -3355,6 +3431,7 @@ export default function (pi: ExtensionAPI) {
     saveRequested: boolean,
     mode: BtwThreadMode,
     generation: number,
+    onPromptStarting?: () => void,
   ): Promise<void> {
     const isCurrentGeneration = () => generation === btwLifecycleGeneration;
     lastUiContext = ctx;
@@ -3431,6 +3508,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     sessionRuntime.abortPromise = undefined;
+    onPromptStarting?.();
     setOverlayStatus("⏳ streaming...", ctx);
     if (!overlayMinimized || !overlayRuntime?.handle) {
       await ensureOverlay(ctx);
