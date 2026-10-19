@@ -61,7 +61,7 @@ const BTW_ENTRY_TYPE = "btw-thread-entry";
 const BTW_RESET_TYPE = "btw-thread-reset";
 const BTW_MODEL_OVERRIDE_TYPE = "btw-model-override";
 const BTW_THINKING_OVERRIDE_TYPE = "btw-thinking-override";
-const BTW_DEFAULT_FOCUS_SHORTCUTS: readonly KeyId[] = [Key.alt("/"), Key.super("/"), Key.ctrlAlt("w")];
+const BTW_DEFAULT_FOCUS_SHORTCUTS: readonly KeyId[] = [Key.alt("/"), Key.super("/")];
 const BTW_FOCUS_KEYS_ENV = "PI_BTW_FOCUS_KEYS";
 const BTW_FOCUS_MODIFIERS = new Set(["ctrl", "shift", "alt", "super"]);
 // Mirrors the SpecialKey union in @earendil-works/pi-tui keys.d.ts (lower-cased).
