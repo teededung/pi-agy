@@ -1940,6 +1940,27 @@ export class BtwOverlayComponent extends Container implements Focusable {
 
     if (this.handleCompletionInput(data)) return;
 
+    if (
+      this.keybindings.matches(data, "tui.altScreen.top") ||
+      matchesKey(data, "super+up") ||
+      matchesKey(data, "ctrl+home")
+    ) {
+      this.followTranscript = false;
+      this.transcriptScrollOffset = 0;
+      this.tui.requestRender();
+      return;
+    }
+
+    if (
+      this.keybindings.matches(data, "tui.altScreen.bottom") ||
+      matchesKey(data, "super+down") ||
+      matchesKey(data, "ctrl+end")
+    ) {
+      this.followTranscript = true;
+      this.tui.requestRender();
+      return;
+    }
+
     if (matchesKey(data, Key.pageUp) || matchesKey(data, Key.up)) {
       const step = matchesKey(data, Key.pageUp) ? Math.max(1, this.transcriptViewportHeight - 1) : 1;
       this.scrollTranscript(-step);
