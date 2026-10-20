@@ -1938,7 +1938,55 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     handler: handleBoostCommand,
   });
 
+  const listOtherPiModels = (registry: ExtensionContext["modelRegistry"]) => {
+    try {
+      return registry.getAvailable().filter((m) => m.provider !== "antigravity");
+    } catch {
+      return [];
+    }
+  };
+
+  const handleOtherPiModelConsult = async (
+    args: string,
+    ctx: ExtensionCommandContext,
+  ): Promise<boolean> => {
+    const trimmed = args.trim();
+    const spaceAt = trimmed.search(/\s/);
+    if (spaceAt < 0) return false;
+    const token = trimmed.slice(0, spaceAt).toLowerCase();
+    const prompt = trimmed.slice(spaceAt).trim();
+    const match = listOtherPiModels(ctx.modelRegistry).find(
+      (m) => `${m.provider}/${m.id}`.toLowerCase() === token || m.id.toLowerCase() === token,
+    );
+    if (!match || !prompt) return false;
+
+    const label = `Consulted ${match.name || match.id}`;
+    const message = `${prompt}\n${label}`;
+    if (!ctx.isIdle()) {
+      ctx.ui.notify("Wait for the current turn to finish before consulting another pi model.", "warning");
+      return true;
+    }
+    const restoreModel = ctx.model;
+    const restoreThinkingLevel = pi.getThinkingLevel();
+    try {
+      await pi.setModel(match);
+    } catch {
+      ctx.ui.notify(`Cannot switch to ${match.provider}/${match.id}.`, "error");
+      return true;
+    }
+    oneShotConsult = {
+      modelId: match.id,
+      effort: undefined,
+      restoreModel,
+      restoreThinkingLevel,
+    };
+    if (ctx.hasUI) updateConsultStatus(ctx.ui);
+    pi.sendUserMessage(message);
+    return true;
+  };
+
   const handleConsultCommand = async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
+    if (await handleOtherPiModelConsult(args, ctx)) return;
     const parsed = resolveAgyConsultSpec(args, currentCache.models);
     if (!parsed.ok) {
       ctx.ui.notify(parsed.error, "error");
@@ -2003,7 +2051,25 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         (selectedModelKey?.startsWith("antigravity:")
           ? selectedModelKey.slice("antigravity:".length)
           : undefined);
-      return getAgyConsultCompletions(argumentPrefix, currentCache.models, currentModelId);
+      const agyItems = getAgyConsultCompletions(argumentPrefix, currentCache.models, currentModelId) ?? [];
+      const prefix = argumentPrefix.trim().toLowerCase();
+      const otherItems = activeSessionCtx
+        ? (probeCtx(() => listOtherPiModels(activeSessionCtx!.modelRegistry)).value ?? [])
+            .map((m) => ({
+              value: `${m.provider}/${m.id} `,
+              label: `${m.provider}/${m.id}`,
+              description: `${m.name || m.id} · pi model`,
+            }))
+            .filter(
+              (item) =>
+                !prefix ||
+                item.label.toLowerCase().includes(prefix) ||
+                item.description.toLowerCase().includes(prefix),
+            )
+        : [];
+      if (argumentPrefix.includes(" ")) return null;
+      const all = [...agyItems, ...otherItems];
+      return all.length > 0 ? all : null;
     },
     handler: handleConsultCommand,
   };
