@@ -446,6 +446,9 @@ export function streamAntigravity(
       let isolatedRuntime: AntigravityRuntimeInstance | undefined;
       let isDisposableTurn = false;
       let turnCleared = false;
+      // Set once the pacers exist; fail() must stop their timers so no deltas
+      // are pushed after the error event / stream.end().
+      let stopPacing = (): void => {};
 
       const clearTurn = () => {
         if (turnCleared) return;
@@ -482,6 +485,7 @@ export function streamAntigravity(
           : "";
         output.stopReason = options?.signal?.aborted ? "aborted" : "error";
         output.errorMessage = `${message}${hint}`;
+        stopPacing();
         clearTurn();
         stream.push({ type: "error", reason: output.stopReason, error: output });
         stream.end();
@@ -686,14 +690,87 @@ export function streamAntigravity(
           thoughtIndex = null;
         };
 
-        // Non-blocking typewriter pacing for thinking text. Text is queued and
-        // dripped by a timer; any other activity (or close) flushes the rest
-        // immediately, so pacing never delays real work.
-        let pendingThink: string[] = [];
-        let dripTimer: ReturnType<typeof setInterval> | undefined;
-        let dripRate = 1; // chars per 16ms tick; constant between enqueues => linear typing
-        let dripAcc = 0;
-        const paceThinking = process.env.PI_ANTIGRAVITY_THINKING_PACE !== "0";
+        // Non-blocking typewriter pacing for thinking and answer text. Text is
+        // queued and dripped by a timer at one steady rate (chosen per enqueue);
+        // any other activity (or close) flushes the rest immediately, so pacing
+        // never delays real work.
+        const paceEnabled = process.env.PI_ANTIGRAVITY_THINKING_PACE !== "0";
+        const makePacer = (emit: (piece: string) => void, isOpen: () => boolean) => {
+          let pending: string[] = [];
+          let timer: ReturnType<typeof setInterval> | undefined;
+          let rate = 1; // chars per 16ms tick; constant between enqueues => linear typing
+          let acc = 0;
+          let pause = 0; // ticks to wait after punctuation (natural rhythm)
+          let draining = false;
+          const stop = (): void => {
+            if (timer) clearInterval(timer);
+            timer = undefined;
+          };
+          const flush = (): void => {
+            stop();
+            if (pending.length === 0) return;
+            const rest = pending.join("");
+            pending = [];
+            emit(rest);
+          };
+          const enqueue = (delta: string): void => {
+            if (!paceEnabled) {
+              emit(delta);
+              return;
+            }
+            for (const g of new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(delta)) {
+              pending.push(g.segment);
+            }
+            // Drain the backlog in ~1.5s (never below ~50 cps, never above ~500 cps).
+            rate = Math.min(8, Math.max(0.9, (pending.length / 94) * 1.15));
+            timer ??= setInterval(() => {
+              if (!isOpen() || pending.length === 0) {
+                if (!isOpen()) pending = [];
+                stop();
+                return;
+              }
+              if (pause > 0) {
+                pause--;
+                return;
+              }
+              acc += rate;
+              const n = Math.floor(acc);
+              if (n < 1) return;
+              acc -= n;
+              const piece = pending.splice(0, n).join("");
+              emit(piece);
+              // Brief beat after punctuation, skipped when a big backlog is draining.
+              if (!draining && pending.length < 400) {
+                const last = piece[piece.length - 1];
+                if (last === "." || last === "!" || last === "?" || last === "\n") pause = 3;
+                else if (last === "," || last === ";" || last === ":") pause = 2;
+              }
+            }, 16);
+          };
+          /**
+           * Finish the queued text smoothly within maxMs, then flush. Used only
+           * at turn end, when agy has already finished and nothing waits on it.
+           */
+          const drain = async (maxMs: number): Promise<void> => {
+            if (paceEnabled && pending.length > 0 && isOpen()) {
+              draining = true;
+              pause = 0;
+              rate = Math.max(rate, pending.length / Math.max(1, Math.floor(maxMs / 16)));
+              const deadline = Date.now() + maxMs + 32;
+              while (
+                pending.length > 0 &&
+                isOpen() &&
+                !options?.signal?.aborted &&
+                Date.now() < deadline
+              ) {
+                await new Promise((r) => setTimeout(r, 16));
+              }
+              draining = false;
+            }
+            flush();
+          };
+          return { enqueue, flush, drain, stop };
+        };
         const emitThinkingPiece = (piece: string): void => {
           if (thinkingIndex === null || !piece) return;
           thinkingBuffer += piece;
@@ -706,40 +783,27 @@ export function streamAntigravity(
             partial: output,
           });
         };
-        const stopDrip = (): void => {
-          if (dripTimer) clearInterval(dripTimer);
-          dripTimer = undefined;
+        const emitTextPiece = (piece: string): void => {
+          if (textIndex === null || !piece) return;
+          textBuffer += piece;
+          const block = output.content[textIndex];
+          if (block.type === "text") block.text = textBuffer;
+          stream.push({
+            type: "text_delta",
+            contentIndex: textIndex,
+            delta: piece,
+            partial: output,
+          });
         };
-        const flushThinking = (): void => {
-          stopDrip();
-          if (pendingThink.length === 0) return;
-          const rest = pendingThink.join("");
-          pendingThink = [];
-          emitThinkingPiece(rest);
-        };
-        const enqueueThinking = (delta: string): void => {
-          if (!paceThinking) {
-            emitThinkingPiece(delta);
-            return;
-          }
-          for (const s of new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(delta)) {
-            pendingThink.push(s.segment);
-          }
-          // Pick one steady rate that drains the current backlog in ~1.5s
-          // (never below ~50 cps, never above ~500 cps) so typing stays linear.
-          dripRate = Math.min(8, Math.max(0.8, pendingThink.length / 94));
-          dripTimer ??= setInterval(() => {
-            if (thinkingIndex === null || pendingThink.length === 0) {
-              pendingThink = thinkingIndex === null ? [] : pendingThink;
-              stopDrip();
-              return;
-            }
-            dripAcc += dripRate;
-            const n = Math.floor(dripAcc);
-            if (n < 1) return;
-            dripAcc -= n;
-            emitThinkingPiece(pendingThink.splice(0, n).join(""));
-          }, 16);
+        const thinkingPacer = makePacer(emitThinkingPiece, () => thinkingIndex !== null);
+        const textPacer = makePacer(emitTextPiece, () => textIndex !== null);
+        const flushThinking = thinkingPacer.flush;
+        const enqueueThinking = thinkingPacer.enqueue;
+        const flushText = textPacer.flush;
+        const enqueueText = textPacer.enqueue;
+        stopPacing = () => {
+          thinkingPacer.stop();
+          textPacer.stop();
         };
 
         const closeThinking = () => {
@@ -757,6 +821,7 @@ export function streamAntigravity(
         };
 
         const closeText = () => {
+          flushText();
           closeThinking();
           closeUnfilledThought();
           if (textIndex === null) return;
@@ -1058,6 +1123,15 @@ export function streamAntigravity(
           if (activity === null || (activity.type !== "thinking_delta" && activity.type !== "usage")) {
             flushThinking();
           }
+          if (
+            activity === null ||
+            (activity.type !== "text" &&
+              activity.type !== "usage" &&
+              activity.type !== "thought" &&
+              activity.type !== "result")
+          ) {
+            flushText();
+          }
           if (activity === null) {
             const ended = turnEndedMessage(controller.closeReason());
             if (!isolatedRequest && emitIncompleteTools() > 0) {
@@ -1278,20 +1352,13 @@ export function streamAntigravity(
                 stream.push({ type: "text_start", contentIndex: textIndex, partial: output });
               }
               controller.recordEmittedText(activity.delta, activity.stepId);
-              textBuffer += activity.delta;
-              const block = output.content[textIndex];
-              if (block.type === "text") block.text = textBuffer;
-              stream.push({
-                type: "text_delta",
-                contentIndex: textIndex,
-                delta: activity.delta,
-                partial: output,
-              });
+              enqueueText(activity.delta);
               break;
             }
             case "result": {
               if (!isolatedRequest && emitIncompleteTools(activity.error) > 0) {
                 controller.deferResult(activity);
+                flushText();
                 endWithToolUse();
                 return;
               }
@@ -1313,35 +1380,18 @@ export function streamAntigravity(
                 // glued onto the last word of streamed commentary.
                 if (suffix === activity.response) closeText();
                 controller.recordEmittedText(suffix);
-                if (textIndex !== null) {
-                  textBuffer += suffix;
-                  const block = output.content[textIndex];
-                  if (block.type === "text") block.text = textBuffer;
-                  stream.push({
-                    type: "text_delta",
-                    contentIndex: textIndex,
-                    delta: suffix,
-                    partial: output,
-                  });
-                } else {
+                if (textIndex === null) {
                   closeUnfilledThought();
-                  output.content.push({ type: "text", text: suffix });
-                  const idx = output.content.length - 1;
-                  stream.push({ type: "text_start", contentIndex: idx, partial: output });
-                  stream.push({
-                    type: "text_delta",
-                    contentIndex: idx,
-                    delta: suffix,
-                    partial: output,
-                  });
-                  stream.push({
-                    type: "text_end",
-                    contentIndex: idx,
-                    content: suffix,
-                    partial: output,
-                  });
+                  output.content.push({ type: "text", text: "" });
+                  textIndex = output.content.length - 1;
+                  textBuffer = "";
+                  stream.push({ type: "text_start", contentIndex: textIndex, partial: output });
                 }
+                enqueueText(suffix);
               }
+              // Let the tail of the answer type out instead of popping in at
+              // once; bounded so turn completion waits at most ~0.4s.
+              await textPacer.drain(400);
               closeText();
 
               const hasResponse =
