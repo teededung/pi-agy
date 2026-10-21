@@ -1082,15 +1082,35 @@ export function streamAntigravity(
               }
               hasRealThinking = true;
               if (activity.stepId !== undefined) realThinkingSteps.add(activity.stepId);
-              thinkingBuffer += activity.delta;
-              const block = output.content[thinkingIndex];
-              if (block.type === "thinking") block.thinking = thinkingBuffer;
-              stream.push({
-                type: "thinking_delta",
-                contentIndex: thinkingIndex,
-                delta: activity.delta,
-                partial: output,
-              });
+              {
+                const block = output.content[thinkingIndex];
+                const paceOff = process.env.PI_ANTIGRAVITY_THINKING_PACE === "0";
+                const graphemes = paceOff
+                  ? [activity.delta]
+                  : Array.from(
+                      new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(
+                        activity.delta,
+                      ),
+                      (s) => s.segment,
+                    );
+                // Bound total added latency (~300ms per delta) at ~12ms per step.
+                const steps = Math.min(graphemes.length, 25);
+                const per = Math.ceil(graphemes.length / Math.max(1, steps));
+                for (let i = 0; i < graphemes.length; i += per) {
+                  const piece = graphemes.slice(i, i + per).join("");
+                  thinkingBuffer += piece;
+                  if (block.type === "thinking") block.thinking = thinkingBuffer;
+                  stream.push({
+                    type: "thinking_delta",
+                    contentIndex: thinkingIndex,
+                    delta: piece,
+                    partial: output,
+                  });
+                  if (!paceOff && i + per < graphemes.length) {
+                    await new Promise((r) => setTimeout(r, 12));
+                  }
+                }
+              }
               break;
             }
             case "thought": {
