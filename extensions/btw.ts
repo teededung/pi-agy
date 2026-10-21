@@ -1,5 +1,6 @@
 import {
   buildSessionContext,
+  copyToClipboard,
   createAgentSession,
   createExtensionRuntime,
   getAgentDir,
@@ -52,6 +53,7 @@ export const BTW_COMMANDS = [
   { name: "btw:clear", description: "Dismiss the BTW modal/widget and clear the current thread." },
   { name: "btw:inject", description: "Inject the full BTW thread into the main agent as a user message." },
   { name: "btw:summarize", description: "Summarize the BTW thread, then inject the summary into the main agent." },
+  { name: "btw:copy", description: "Copy the latest BTW assistant message to the clipboard." },
   { name: "btw:model", description: "Show, set, or clear the BTW-only model override." },
   { name: "btw:thinking", description: "Show, set, or clear the BTW-only thinking override." },
 ] as const;
@@ -3131,6 +3133,33 @@ export default function (pi: ExtensionAPI) {
       await resetThread(ctx);
       dismissOverlay(ctx);
       notify(ctx, "Cleared BTW thread.", "info");
+      return true;
+    }
+
+    if (name === "btw:copy") {
+      let latest: string | undefined;
+      for (let i = transcriptState.entries.length - 1; i >= 0; i--) {
+        const entry = transcriptState.entries[i];
+        if (entry.type === "assistant-text" && entry.text.trim() && !entry.text.startsWith("❌")) {
+          latest = entry.text.trim();
+          break;
+        }
+      }
+      if (!latest) {
+        setOverlayStatus("No BTW message to copy yet.", ctx);
+        notify(ctx, "No BTW message to copy yet.", "warning");
+        return true;
+      }
+      try {
+        await copyToClipboard(latest);
+        const msg = `Copied latest BTW message (${latest.length} chars).`;
+        setOverlayStatus(msg, ctx);
+        notify(ctx, msg, "info");
+      } catch (error) {
+        const msg = `Copy failed: ${error instanceof Error ? error.message : String(error)}`;
+        setOverlayStatus(msg, ctx);
+        notify(ctx, msg, "error");
+      }
       return true;
     }
 
