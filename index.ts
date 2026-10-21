@@ -771,6 +771,9 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     return lines.map((line) => truncateToWidth(line, width, ""));
   }
 
+  /** Slash commands shown in the status widget; clickable in fullscreen mode. */
+  const AGY_WIDGET_COMMANDS = ["/agy-tasks", "/agy-artifacts", "/agy-subagents"];
+
   function renderAgyStatusWidget(force = false): void {
     if (!tasksUi) return;
     const liveTasks = Math.max(0, widgetLiveCount);
@@ -801,8 +804,10 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         return;
       }
 
-      tasksUi.setWidget(AGY_STATUS_WIDGET_KEY, (_tui, theme) => {
-        return {
+      tasksUi.setWidget(AGY_STATUS_WIDGET_KEY, (tui, theme) => {
+        // Click regions for the slash-command hints, rebuilt on every render.
+        const regions: { x: number; y: number; width: number; command: string }[] = [];
+        const widget = {
           render: (width: number) => {
             const items: string[] = [];
             if (liveTasks > 0) {
@@ -837,9 +842,65 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
                   theme.fg("accent", "/agy-subagents"),
               );
             }
-            return packHintItems(items, width, theme);
+            const lines = packHintItems(items, width, theme);
+            regions.length = 0;
+            lines.forEach((line, y) => {
+              const plain = stripTerminalSequences(line);
+              for (const command of AGY_WIDGET_COMMANDS) {
+                const index = plain.indexOf(command);
+                if (index < 0) continue;
+                regions.push({
+                  x: visibleWidth(plain.slice(0, index)),
+                  y,
+                  width: visibleWidth(command),
+                  command,
+                });
+              }
+            });
+            return lines;
           },
           invalidate: () => {},
+        };
+        // Mouse input only exists in fullscreen mode; typing the command stays
+        // the keyboard path everywhere else.
+        if ((tui as { mode?: string }).mode !== "fullscreen") return widget;
+        let pressed: (typeof regions)[number] | undefined;
+        const hitAt = (event: { x: number; y: number }) =>
+          regions.find((r) => event.y === r.y && event.x >= r.x && event.x < r.x + r.width);
+        return {
+          ...widget,
+          handleMouse(event: {
+            type: string;
+            button?: string;
+            x: number;
+            y: number;
+            shift?: boolean;
+            alt?: boolean;
+            ctrl?: boolean;
+          }) {
+            if (event.button !== "left" || event.shift || event.alt || event.ctrl) return undefined;
+            const hit = hitAt(event);
+            if (event.type === "press" && hit) {
+              pressed = hit;
+              return { handled: true, capture: true, render: false };
+            }
+            if (event.type === "drag" && pressed) {
+              if (hit?.command !== pressed.command) pressed = undefined;
+              return { handled: true, render: false };
+            }
+            if (event.type === "release") {
+              const started = pressed;
+              pressed = undefined;
+              if (!started) return undefined;
+              if (hit?.command === started.command) {
+                // expandPromptTemplates routes the text to the extension-command
+                // handler instead of sending it to the model as a prompt.
+                pi.sendUserMessage(started.command, { expandPromptTemplates: true });
+              }
+              return { handled: true, render: false };
+            }
+            return undefined;
+          },
         };
       });
     } catch {
