@@ -1093,9 +1093,12 @@ export function streamAntigravity(
                       ),
                       (s) => s.segment,
                     );
-                // Bound total added latency (~300ms per delta) at ~12ms per step.
-                const steps = Math.min(graphemes.length, 25);
-                const per = Math.ceil(graphemes.length / Math.max(1, steps));
+                // Smooth typewriter: ~8ms/char at 16ms ticks, total capped at 2.5s per
+                // delta (agy delivers thinking in large bursts polled from SQLite).
+                const tickMs = 16;
+                const totalMs = Math.min(graphemes.length * 8, 2500);
+                const ticks = Math.max(1, Math.ceil(totalMs / tickMs));
+                const per = Math.max(1, Math.ceil(graphemes.length / ticks));
                 for (let i = 0; i < graphemes.length; i += per) {
                   const piece = graphemes.slice(i, i + per).join("");
                   thinkingBuffer += piece;
@@ -1107,7 +1110,7 @@ export function streamAntigravity(
                     partial: output,
                   });
                   if (!paceOff && i + per < graphemes.length) {
-                    await new Promise((r) => setTimeout(r, 12));
+                    await new Promise((r) => setTimeout(r, tickMs));
                   }
                 }
               }
