@@ -104,8 +104,17 @@ export class AgyStallError extends Error {
 function appendProcessArgs(args: string[], request: AgyTurnRequest): string[] {
   if (request.cwd) args.push("--add-dir", request.cwd);
   if (request.conversationId) args.push("--conversation", request.conversationId);
-  if (request.model) args.push("--model", request.model);
-  if (request.effort) args.push("--effort", request.effort);
+  // Newer agy lists effort as a model-id suffix (`gemini-4-argon-high`) and
+  // some models reject a separate `--effort`, so fold effort into the id.
+  if (request.model) {
+    const hasSuffix = /-(low|medium|high)$/i.test(request.model);
+    args.push(
+      "--model",
+      request.effort && !hasSuffix ? `${request.model}-${request.effort}` : request.model,
+    );
+  } else if (request.effort) {
+    args.push("--effort", request.effort);
+  }
   if (request.agent) args.push("--agent", request.agent);
   if (request.mode) args.push("--mode", request.mode);
   return args;
