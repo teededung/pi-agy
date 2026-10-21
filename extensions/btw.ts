@@ -302,7 +302,25 @@ type BtwSessionRuntime = {
   hasExtensions: boolean;
   workspace?: BtwSshWorkspace;
   workspaceIdentity: string;
+  /** Main-session user turns present when this child was seeded; used to flag stale context. */
+  mainTurnsAtSeed: number;
 };
+
+/** Warn once the BTW child is this many main-session user turns behind. */
+const BTW_STALE_TURNS = 3;
+
+function countMainUserTurns(ctx: ExtensionContext | ExtensionCommandContext): number {
+  try {
+    return ctx.sessionManager
+      .getBranch()
+      .filter((entry) => {
+        const e = entry as unknown as { type?: string; message?: { role?: string } };
+        return e.type === "message" && e.message?.role === "user";
+      }).length;
+  } catch {
+    return 0;
+  }
+}
 
 type OverlayRuntime = {
   handle?: OverlayHandle;
@@ -1689,6 +1707,7 @@ export class BtwOverlayComponent extends Container implements Focusable {
     onAbort: () => void = onDismiss,
     getModelLabel: () => string = () => "",
     getOverlayContext: () => ExtensionContext | ExtensionCommandContext | null = () => null,
+    private readonly getStaleNotice: () => string | null = () => null,
   ) {
     super();
     this.tui = tui;
@@ -2114,7 +2133,11 @@ export class BtwOverlayComponent extends Container implements Focusable {
       this.transcript.addChild(new Text(line, 1, 0));
     }
 
-    const baseStatus = currentStatus ?? "Ready. Enter submits; Esc or Alt+m minimizes while working.";
+    // Skip the branch scan while streaming: the notice is hidden then anyway.
+    const staleNotice = currentStatus?.trim().startsWith("⏳") ? null : this.getStaleNotice();
+    const baseStatus = staleNotice
+      ? `${currentStatus ?? "Ready."} ${staleNotice}`
+      : currentStatus ?? "Ready. Enter submits; Esc or Alt+m minimizes while working.";
     const status =
       queuedCount > 0 && !baseStatus.includes("queued")
         ? `${baseStatus} · 📥 ${queuedCount} queued`
@@ -2123,7 +2146,7 @@ export class BtwOverlayComponent extends Container implements Focusable {
     this.statusText.setText(this.statusTextValue);
     this.hintsTextValue = isStreaming
       ? `↑↓ scroll · Alt+m / Esc minimize · Ctrl+C abort · ${BTW_FOCUS_SHORTCUTS_LABEL} focus · Alt+w width`
-      : `↑↓ select/scroll · Tab complete · Enter · Alt+m min · ${BTW_FOCUS_SHORTCUTS_LABEL} focus · Alt+w width · Esc close`;
+      : `↑↓ select/scroll · Alt+m / Esc minimize · ${BTW_FOCUS_SHORTCUTS_LABEL} focus · Alt+w width · Ctrl+C (empty input) close`;
     this.hintsText.setText(this.hintsTextValue);
     this.tui.requestRender();
   }
@@ -2252,8 +2275,10 @@ export default function (pi: ExtensionAPI) {
           const statusColored = working
             ? theme.fg("warning", ` ${statusPreview} `)
             : theme.fg("success", ` ${statusPreview} `);
+          const stale = getBtwStaleNotice();
+          const staleText = stale ? theme.fg("warning", ` ${stale} `) : "";
           const hint = theme.fg("dim", `· Alt+m / ${BTW_FOCUS_SHORTCUTS_LABEL} / /btw to restore`);
-          return [truncateToWidth(`${badge}${statusColored}${hint}`, Math.max(1, width))];
+          return [truncateToWidth(`${badge}${statusColored}${staleText}${hint}`, Math.max(1, width))];
         },
         invalidate() {},
       }));
@@ -2514,11 +2539,13 @@ export default function (pi: ExtensionAPI) {
    * Escape dismisses the overlay immediately.
    */
   async function handleOverlayEscape(ctx?: ExtensionContext | ExtensionCommandContext): Promise<void> {
-    if (isBtwWorking()) {
-      minimizeOverlay(ctx);
+    // After an abort the status says "Press Esc or Ctrl+C again to dismiss",
+    // so Esc still dismisses there. Otherwise Esc minimizes, like Alt+m.
+    if (overlayStatus?.startsWith("⏹")) {
+      await dismissOverlaySession(ctx);
       return;
     }
-    await dismissOverlaySession(ctx);
+    minimizeOverlay(ctx);
   }
 
   /**
@@ -2781,7 +2808,17 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    return { session, mode, subscriptions: new Set(), sideThreadStartIndex, promptQueue: Promise.resolve(), hasExtensions, workspace, workspaceIdentity };
+    return { session, mode, subscriptions: new Set(), sideThreadStartIndex, promptQueue: Promise.resolve(), hasExtensions, workspace, workspaceIdentity, mainTurnsAtSeed: countMainUserTurns(ctx) };
+  }
+
+  /** Notice when the BTW child's seeded main context is several user turns behind the main session. */
+  function getBtwStaleNotice(): string | null {
+    const runtime = activeBtwSession;
+    const ctx = lastUiContext;
+    if (!runtime || !ctx || runtime.mode === "tangent") return null;
+    const behind = countMainUserTurns(ctx) - runtime.mainTurnsAtSeed;
+    if (behind < BTW_STALE_TURNS) return null;
+    return `⚠ BTW context is ${behind} main-chat turns behind · /btw:new to refresh or /btw:clear to reset`;
   }
 
   function ensureBtwSession(ctx: ExtensionCommandContext, mode: BtwThreadMode): Promise<BtwSessionRuntime | null> {
@@ -2970,6 +3007,7 @@ export default function (pi: ExtensionAPI) {
             },
             () => getActiveBtwModelBadge(),
             () => lastUiContext ?? ctx,
+            () => getBtwStaleNotice(),
           );
 
           overlay.focused = runtime.handle?.isFocused() ?? true;
