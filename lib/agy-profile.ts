@@ -1,4 +1,4 @@
-export type AgyExecutionMode = "plan" | "accept-edits";
+export type AgyExecutionMode = "plan" | "accept-edits" | "auto";
 
 export interface AgyProcessProfile {
   agent?: string;
@@ -28,8 +28,8 @@ export function readAgyProcessProfile(env: NodeJS.ProcessEnv = process.env): Agy
   let mode: AgyExecutionMode | undefined;
   if (env.PI_ANTIGRAVITY_MODE !== undefined) {
     const configured = env.PI_ANTIGRAVITY_MODE.trim();
-    if (configured !== "plan" && configured !== "accept-edits") {
-      throw new Error('PI_ANTIGRAVITY_MODE must be exactly "plan" or "accept-edits".');
+    if (configured !== "plan" && configured !== "accept-edits" && configured !== "auto") {
+      throw new Error('PI_ANTIGRAVITY_MODE must be exactly "plan", "accept-edits", or "auto".');
     }
     mode = configured;
   }

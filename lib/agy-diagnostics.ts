@@ -8,6 +8,11 @@ import which from "which";
 import { killAgyTree, trackAgyChild, untrackAgyChild } from "./agy-children.ts";
 
 export const MIN_AGY_VERSION = "1.1.22";
+/** Soft target: includes stall-retry, GIT_EDITOR, empty-file and artifact-path fixes. */
+export const RECOMMENDED_AGY_VERSION = "1.4.3";
+export function isBelowRecommendedAgy(version: string | undefined): boolean {
+  return Boolean(version && valid(version) && !gte(version, RECOMMENDED_AGY_VERSION));
+}
 export const AGY_VERSION_TIMEOUT_MS = 5_000;
 const DIAGNOSTIC_LIMIT = 8_192;
 const COMMAND_OUTPUT_LIMIT = 1024 * 1024;

@@ -626,7 +626,7 @@ export function streamAntigravity(
                 : piHistoryBootstrap(context, turnPrompt.length),
             bootstrapSuffix: isolatedRequest ? undefined : getBootstrapSuffix?.(),
             modelId: effectiveModelId,
-            effort,
+            effort: requestedEffort ? effort : undefined,
             // Custom lean agents (like agy-lean) restrict tools to 4 workspace primitives
             // and strip invoke_subagent/send_message/manage_subagents. Bypass custom agent
             // when Boost orchestration is active so subagent tools are available.

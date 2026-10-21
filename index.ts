@@ -39,7 +39,13 @@ import {
   signalAgyTree,
   signalVerifiedAgyOrphans,
 } from "./lib/agy-children.ts";
-import { checkAgyBinary, MIN_AGY_VERSION, runAgyCommand } from "./lib/agy-diagnostics.ts";
+import {
+  checkAgyBinary,
+  isBelowRecommendedAgy,
+  MIN_AGY_VERSION,
+  RECOMMENDED_AGY_VERSION,
+  runAgyCommand,
+} from "./lib/agy-diagnostics.ts";
 import { parseAgyAgents, readAgyProcessProfile } from "./lib/agy-profile.ts";
 import { pruneBridgeMcpCache, removeMcpCacheEntry } from "./lib/mcp-cache.ts";
 import {
@@ -1584,6 +1590,11 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
           `binary selection: ${binary.selectionReason ?? "compatible candidate"}`,
           `minimum: ${MIN_AGY_VERSION}`,
         );
+        if (isBelowRecommendedAgy(binary.version)) {
+          lines.push(
+            `binary: WARN agy ${binary.version} < recommended ${RECOMMENDED_AGY_VERSION} (stall retry, empty-file and artifact-path fixes); run \`agy update\`.`,
+          );
+        }
       } else {
         lines.push(
           `binary: ERROR [${binary.category}] ${binary.message}`,
@@ -1609,6 +1620,13 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         currentCache = { fetchedAt: Date.now(), source: "live", models: discovered };
         registerAntigravityProvider(discovered);
         lines.push(`models: ${discovered.length} (live)`);
+        const missing = FALLBACK_MODELS.filter((f) => !discovered.some((d) => d.id === f.id));
+        if (missing.length > 0) {
+          const hint = missing.some((m) => /argon/i.test(m.id))
+            ? " (Gemini models may need GEMINI_API_KEY sign-in; fixed in agy 1.4.3)"
+            : "";
+          lines.push(`models: WARN not in live list: ${missing.map((m) => m.id).join(", ")}${hint}`);
+        }
       } catch (error) {
         lines.push(
           `models: ERROR ${error instanceof Error ? error.message : String(error)}; ${currentCache.models.length} cached (${currentCache.source})`,
