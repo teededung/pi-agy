@@ -148,6 +148,20 @@ export function formatReset(iso: string, now: Date = new Date()): string | undef
   return `${time} on ${reset.getDate()} ${reset.toLocaleDateString("en-US", { month: "short" })}`;
 }
 
+/** Time until reset like Antigravity: `3d 22h`, `4h 5m`, `12m`. Undefined once it has passed. */
+export function formatRemaining(iso: string, now: Date = new Date()): string | undefined {
+  const resetMs = new Date(iso).getTime();
+  if (Number.isNaN(resetMs)) return undefined;
+  const totalMinutes = Math.floor((resetMs - now.getTime()) / 60_000);
+  if (totalMinutes <= 0) return undefined;
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+  if (days > 0) return `${days}d ${hours}h`;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  return `${minutes}m`;
+}
+
 export function usageBar(fraction: number, segments = BAR_SEGMENTS): string {
   const filled = Math.round(Math.min(1, Math.max(0, fraction)) * segments);
   return `[${"█".repeat(filled)}${"░".repeat(segments - filled)}]`;
@@ -174,7 +188,8 @@ function formatBucket(bucket: AgyUsageBucket, now: Date): string {
   const percent = remainingPercent(bucket.remainingFraction);
   const parts = [`${usageBar(bucket.remainingFraction)} ${percent}% left`];
   const reset = bucket.resetTime ? formatReset(bucket.resetTime, now) : undefined;
-  if (reset) parts.push(`resets ${reset}`);
+  const remaining = bucket.resetTime ? formatRemaining(bucket.resetTime, now) : undefined;
+  if (reset) parts.push(`resets ${reset}${remaining ? ` (in ${remaining})` : ""}`);
   return `  ${label}${parts.join(" · ")}`;
 }
 

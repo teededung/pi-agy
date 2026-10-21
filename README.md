@@ -69,14 +69,14 @@ agy's interactive `/usage` (alias `/quota`) is a TUI-only slash command — ther
 
 ```text
 Gemini Models
-  5h limit:         [████████████████████] 98% left · resets 19:53
+  5h limit:         [████████████████████] 98% left · resets 19:53 (in 4h 12m)
 
-  Weekly limit:     [███████████████████░] 97% left · resets 09:10 on 4 Sep
+  Weekly limit:     [███████████████████░] 97% left · resets 09:10 on 4 Sep (in 3d 22h)
 
 Claude and GPT models
-  5h limit:         [████████████████████] 100% left · resets 20:08
+  5h limit:         [████████████████████] 100% left · resets 20:08 (in 4h 27m)
 
-  Weekly limit:     [████████████████████] 100% left · resets 15:08 on 4 Sep
+  Weekly limit:     [████████████████████] 100% left · resets 15:08 on 4 Sep (in 4d 4h)
 ```
 
 ## Context and permissions
