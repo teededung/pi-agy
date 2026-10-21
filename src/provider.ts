@@ -691,6 +691,8 @@ export function streamAntigravity(
         // immediately, so pacing never delays real work.
         let pendingThink: string[] = [];
         let dripTimer: ReturnType<typeof setInterval> | undefined;
+        let dripRate = 1; // chars per 16ms tick; constant between enqueues => linear typing
+        let dripAcc = 0;
         const paceThinking = process.env.PI_ANTIGRAVITY_THINKING_PACE !== "0";
         const emitThinkingPiece = (piece: string): void => {
           if (thinkingIndex === null || !piece) return;
@@ -723,15 +725,19 @@ export function streamAntigravity(
           for (const s of new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(delta)) {
             pendingThink.push(s.segment);
           }
+          // Pick one steady rate that drains the current backlog in ~1.5s
+          // (never below ~50 cps, never above ~500 cps) so typing stays linear.
+          dripRate = Math.min(8, Math.max(0.8, pendingThink.length / 94));
           dripTimer ??= setInterval(() => {
             if (thinkingIndex === null || pendingThink.length === 0) {
               pendingThink = thinkingIndex === null ? [] : pendingThink;
               stopDrip();
               return;
             }
-            // Steady 1 char/tick (~60 cps) that speeds up as backlog grows,
-            // draining any backlog in roughly 0.7s.
-            const n = Math.max(1, Math.ceil(pendingThink.length / 40));
+            dripAcc += dripRate;
+            const n = Math.floor(dripAcc);
+            if (n < 1) return;
+            dripAcc -= n;
             emitThinkingPiece(pendingThink.splice(0, n).join(""));
           }, 16);
         };
