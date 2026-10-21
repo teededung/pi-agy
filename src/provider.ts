@@ -686,8 +686,59 @@ export function streamAntigravity(
           thoughtIndex = null;
         };
 
+        // Non-blocking typewriter pacing for thinking text. Text is queued and
+        // dripped by a timer; any other activity (or close) flushes the rest
+        // immediately, so pacing never delays real work.
+        let pendingThink: string[] = [];
+        let dripTimer: ReturnType<typeof setInterval> | undefined;
+        const paceThinking = process.env.PI_ANTIGRAVITY_THINKING_PACE !== "0";
+        const emitThinkingPiece = (piece: string): void => {
+          if (thinkingIndex === null || !piece) return;
+          thinkingBuffer += piece;
+          const block = output.content[thinkingIndex];
+          if (block.type === "thinking") block.thinking = thinkingBuffer;
+          stream.push({
+            type: "thinking_delta",
+            contentIndex: thinkingIndex,
+            delta: piece,
+            partial: output,
+          });
+        };
+        const stopDrip = (): void => {
+          if (dripTimer) clearInterval(dripTimer);
+          dripTimer = undefined;
+        };
+        const flushThinking = (): void => {
+          stopDrip();
+          if (pendingThink.length === 0) return;
+          const rest = pendingThink.join("");
+          pendingThink = [];
+          emitThinkingPiece(rest);
+        };
+        const enqueueThinking = (delta: string): void => {
+          if (!paceThinking) {
+            emitThinkingPiece(delta);
+            return;
+          }
+          for (const s of new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(delta)) {
+            pendingThink.push(s.segment);
+          }
+          dripTimer ??= setInterval(() => {
+            if (thinkingIndex === null || pendingThink.length === 0) {
+              pendingThink = thinkingIndex === null ? [] : pendingThink;
+              stopDrip();
+              return;
+            }
+            // Steady 1 char/tick (~60 cps) that speeds up as backlog grows,
+            // draining any backlog in roughly 0.7s.
+            const n = Math.max(1, Math.ceil(pendingThink.length / 40));
+            emitThinkingPiece(pendingThink.splice(0, n).join(""));
+          }, 16);
+        };
+
         const closeThinking = () => {
           if (thinkingIndex === null) return;
+          flushThinking();
           stream.push({
             type: "thinking_end",
             contentIndex: thinkingIndex,
@@ -998,6 +1049,9 @@ export function streamAntigravity(
 
         while (true) {
           const activity = await controller.next();
+          if (activity === null || (activity.type !== "thinking_delta" && activity.type !== "usage")) {
+            flushThinking();
+          }
           if (activity === null) {
             const ended = turnEndedMessage(controller.closeReason());
             if (!isolatedRequest && emitIncompleteTools() > 0) {
@@ -1082,38 +1136,7 @@ export function streamAntigravity(
               }
               hasRealThinking = true;
               if (activity.stepId !== undefined) realThinkingSteps.add(activity.stepId);
-              {
-                const block = output.content[thinkingIndex];
-                const paceOff = process.env.PI_ANTIGRAVITY_THINKING_PACE === "0";
-                const graphemes = paceOff
-                  ? [activity.delta]
-                  : Array.from(
-                      new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(
-                        activity.delta,
-                      ),
-                      (s) => s.segment,
-                    );
-                // Smooth typewriter: ~8ms/char at 16ms ticks, total capped at 2.5s per
-                // delta (agy delivers thinking in large bursts polled from SQLite).
-                const tickMs = 16;
-                const totalMs = Math.min(graphemes.length * 8, 2500);
-                const ticks = Math.max(1, Math.ceil(totalMs / tickMs));
-                const per = Math.max(1, Math.ceil(graphemes.length / ticks));
-                for (let i = 0; i < graphemes.length; i += per) {
-                  const piece = graphemes.slice(i, i + per).join("");
-                  thinkingBuffer += piece;
-                  if (block.type === "thinking") block.thinking = thinkingBuffer;
-                  stream.push({
-                    type: "thinking_delta",
-                    contentIndex: thinkingIndex,
-                    delta: piece,
-                    partial: output,
-                  });
-                  if (!paceOff && i + per < graphemes.length) {
-                    await new Promise((r) => setTimeout(r, tickMs));
-                  }
-                }
-              }
+              enqueueThinking(activity.delta);
               break;
             }
             case "thought": {
