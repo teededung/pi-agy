@@ -2280,7 +2280,7 @@ export default function (pi: ExtensionAPI) {
             : theme.fg("success", ` ${statusPreview} `);
           const stale = getBtwStaleNotice();
           const staleText = stale ? theme.fg("warning", ` ${stale} `) : "";
-          const hint = theme.fg("dim", `· Alt+m / ${BTW_FOCUS_SHORTCUTS_LABEL} / /btw to restore`);
+          const hint = `${theme.fg("dim", "· ")}${theme.fg("accent", "Alt+m")}${theme.fg("muted", " or ")}${theme.fg("accent", "/btw")}${theme.fg("muted", " to restore")}`;
           return [truncateToWidth(`${badge}${statusColored}${staleText}${hint}`, Math.max(1, width))];
         },
         invalidate() {},
@@ -2355,16 +2355,8 @@ export default function (pi: ExtensionAPI) {
   function toggleOverlayFocus(ctx?: ExtensionContext | ExtensionCommandContext): void {
     const activeCtx = ctx ?? lastUiContext;
     const handle = overlayRuntime?.handle;
-    if (!handle) {
-      if (activeCtx && (pendingThread.length > 0 || activeBtwSession || transcriptState.entries.length > 0)) {
-        overlayMinimized = false;
-        void ensureOverlay(activeCtx);
-      }
-      return;
-    }
-
-    if (overlayMinimized || handle.isHidden()) {
-      restoreOverlay(activeCtx ?? undefined);
+    // Focus shortcuts never restore a minimized/closed overlay; use Alt+m or /btw for that.
+    if (!handle || overlayMinimized || handle.isHidden()) {
       return;
     }
 
@@ -3838,7 +3830,7 @@ export default function (pi: ExtensionAPI) {
 
   for (const shortcut of BTW_FOCUS_SHORTCUTS) {
     pi.registerShortcut(shortcut, {
-      description: "Toggle BTW overlay focus (or restore if minimized).",
+      description: "Toggle BTW overlay focus (does not restore a minimized overlay).",
       handler: async (_ctx) => {
         toggleOverlayFocus();
       },
