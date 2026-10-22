@@ -2162,6 +2162,8 @@ export default function (pi: ExtensionAPI) {
   let overlayDraft = "";
   let overlayWidthMode: BtwOverlayWidthMode = "window";
   let overlayMinimized = false;
+  // Set when a resumed session already has BTW exchanges: show the minimized badge until the overlay opens or is dismissed.
+  let restoredBadge = false;
   let pendingSubmissionsCount = 0;
   let activeBtwExecutions = 0;
   let nextQueuedPromptId = 1;
@@ -2263,7 +2265,8 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    if (overlayMinimized && overlayRuntime && !overlayRuntime.closed) {
+    const overlayOpen = Boolean(overlayRuntime && !overlayRuntime.closed);
+    if ((overlayMinimized && overlayOpen) || (restoredBadge && !overlayOpen)) {
       activeCtx.ui.setWidget("btw", (_tui, theme) => ({
         render(width: number): string[] {
           const working = isBtwWorking();
@@ -2301,6 +2304,7 @@ export default function (pi: ExtensionAPI) {
 
   function dismissOverlay(ctx?: ExtensionContext | ExtensionCommandContext): void {
     overlayMinimized = false;
+    restoredBadge = false;
     overlayRuntime?.close?.();
     overlayRuntime = null;
     syncUi(ctx);
@@ -2939,6 +2943,7 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     lastUiContext = ctx;
+    restoredBadge = false;
 
     if (overlayRuntime?.handle) {
       subscribeOverlayToActiveBtwSession(ctx);
@@ -3445,6 +3450,7 @@ export default function (pi: ExtensionAPI) {
       appendPersistedTranscriptTurn(transcriptState, normalizedDetails);
     }
 
+    restoredBadge = pendingThread.length > 0 && !overlayRuntime;
     syncUi(ctx);
   }
 
