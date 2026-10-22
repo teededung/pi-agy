@@ -175,6 +175,7 @@ export interface AntigravityRuntimeShape {
     readonly effort?: "low" | "medium" | "high";
     readonly agent?: string;
     readonly mode?: AgyExecutionMode;
+    readonly mcpDirectory?: string;
     readonly bridgeRevision?: string;
     readonly signal?: AbortSignal;
     readonly timeoutMs?: number;
@@ -440,6 +441,7 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                 effort: request.effort,
                 agent: request.agent,
                 mode: request.mode,
+                mcpDirectory: request.mcpDirectory,
                 bridgeRevision: request.bridgeRevision,
                 cwd,
                 timeoutMs,

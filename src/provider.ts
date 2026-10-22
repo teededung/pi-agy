@@ -636,6 +636,7 @@ export function streamAntigravity(
             // when Boost orchestration is active so subagent tools are available.
             agent: isBoost ? undefined : processProfile.agent,
             mode: processProfile.mode,
+            mcpDirectory: processProfile.mcpDirectory,
             bridgeRevision,
             signal: options?.signal,
             timeoutMs: isBoost ? 1_800_000 : undefined,
