@@ -568,7 +568,10 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     }
   }
 
-  function getProcessProfile() {
+  function getProcessProfile(isolated = false) {
+    // Disposable turns (/btw, compaction) are not routed through the bridge,
+    // so they keep agy's native tools and never see the private MCP config.
+    if (isolated) return readAgyProcessProfile();
     if (switchingToolMode) {
       throw new Error("antigravity: tool mode is changing; retry when the switch finishes.");
     }

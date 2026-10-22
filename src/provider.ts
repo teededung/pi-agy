@@ -399,7 +399,8 @@ export function streamAntigravity(
   /** Current discovery metadata used to resolve a valid required effort. */
   getModelInfo: (modelId: string) => AgyModelInfo | undefined = () => undefined,
   /** Validated process profile; read per turn so env changes recycle safely. */
-  getProcessProfile: () => AgyProcessProfile = readAgyProcessProfile,
+  getProcessProfile: (isolated?: boolean) => AgyProcessProfile = () =>
+    readAgyProcessProfile(),
   /** Combined bridge registration/catalog revision. */
   getBridgeRevision: () => string | undefined = () => undefined,
   /**
@@ -591,7 +592,7 @@ export function streamAntigravity(
         }
 
         let bridgeRevision: string | undefined;
-        const processProfile: AgyProcessProfile = getProcessProfile();
+        const processProfile: AgyProcessProfile = getProcessProfile(isolatedRequest);
         if (!isolatedRequest) {
           // Refresh and resolve before the driver fingerprint is evaluated.
           // Re-entry into a pending bridge turn returns the existing controller,
