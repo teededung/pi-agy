@@ -30,6 +30,8 @@ export interface AgyTurnRequest {
   effort?: AgyEffort;
   /** Working directory for the agy process. */
   cwd?: string;
+  /** Session-owned MCP discovery directory, added without changing cwd. */
+  mcpDirectory?: string;
   /** Overall turn timeout owned by Pi. One-shot mode also passes --print-timeout. */
   timeoutMs?: number;
   /**
@@ -103,6 +105,7 @@ export class AgyStallError extends Error {
 
 function appendProcessArgs(args: string[], request: AgyTurnRequest): string[] {
   if (request.cwd) args.push("--add-dir", request.cwd);
+  if (request.mcpDirectory) args.push("--add-dir", request.mcpDirectory);
   if (request.conversationId) args.push("--conversation", request.conversationId);
   // Newer agy lists effort as a model-id suffix (`gemini-4-argon-high`) and
   // some models reject a separate `--effort`, so fold effort into the id.

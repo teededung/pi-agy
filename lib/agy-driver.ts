@@ -42,6 +42,7 @@ export type AgyRecycleCause =
   | "agent"
   | "mode"
   | "bridge-catalog"
+  | "mcp-directory"
   | "conversation"
   | "conversation-reset"
   | "session-tree"
@@ -55,6 +56,7 @@ export interface AgyProcessConfigSnapshot {
   binaryVersion?: string;
   binaryRevision?: string;
   cwd?: string;
+  mcpDirectory?: string;
   model?: string;
   effort?: string;
   agent?: string;
@@ -167,6 +169,7 @@ function processConfig(
     binaryVersion,
     binaryRevision,
     cwd: request.cwd,
+    mcpDirectory: request.mcpDirectory,
     model: request.model,
     effort: request.effort,
     agent: request.agent,
@@ -189,6 +192,7 @@ function recycleCause(
   )
     return "binary";
   if (current.cwd !== next.cwd) return "cwd";
+  if (current.mcpDirectory !== next.mcpDirectory) return "mcp-directory";
   if (current.model !== next.model) return "model";
   if (current.effort !== next.effort) return "effort";
   if (current.agent !== next.agent) return "agent";
@@ -449,6 +453,7 @@ export class AgyDriverSession implements AgyTurnExecutor {
           model: request.model,
           effort: request.effort,
           cwd: request.cwd,
+          mcpDirectory: request.mcpDirectory,
           timeoutMs: request.timeoutMs,
           inactivityTimeoutMs: request.inactivityTimeoutMs,
           toolInactivityTimeoutMs: request.toolInactivityTimeoutMs,
