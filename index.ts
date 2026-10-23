@@ -97,7 +97,9 @@ import {
   type PersistedAgyReset,
 } from "./lib/conversation-state.ts";
 import {
+  detachAgyConversationBridgeMetadata,
   readAgyConversationMetadata,
+  sweepStalePiToolsConversations,
   syncAgyConversationTitle,
 } from "./lib/conversation-metadata.ts";
 import { AgyReplayStore, type RecordedAgyTool } from "./lib/replay.ts";
@@ -418,6 +420,31 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
 
   let activeSessionCtx: ExtensionContext | undefined;
   let lastSyncedSessionTitleKey: string | undefined;
+  let trackedConversationId: string | undefined;
+
+  async function captureActiveConversationId(): Promise<string | undefined> {
+    let cid = trackedConversationId;
+    try {
+      const snap = await runAntigravity(runtime, service.snapshot);
+      if (snap.conversationId) cid = snap.conversationId;
+    } catch {
+      // Runtime may already be closed.
+    }
+    return cid;
+  }
+
+  function detachConversationMetadata(conversationId: string | undefined): void {
+    if (!conversationId) return;
+    if (trackedConversationId === conversationId) {
+      trackedConversationId = undefined;
+    }
+    detachAgyConversationBridgeMetadata(conversationId);
+  }
+
+  const detachOnProcessExit = () => {
+    detachConversationMetadata(trackedConversationId);
+  };
+  process.once("exit", detachOnProcessExit);
 
   async function syncSessionNameToAgy(
     ctx: ExtensionContext | undefined = activeSessionCtx,
@@ -465,6 +492,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     const { sessionId, cwd } = probe.value;
     const snapshot = await runAntigravity(runtime, service.snapshot);
     if (!snapshot.conversationId || !snapshot.model || snapshot.cwd !== cwd) return;
+    trackedConversationId = snapshot.conversationId;
     await syncSessionNameToAgy(ctx, snapshot.conversationId);
     const state: PersistedAgyConversation = {
       version: 1,
@@ -591,10 +619,12 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
    * Runs when the session leaves Antigravity models and on shutdown.
    */
   async function teardownBridge(): Promise<void> {
+    const cid = await captureActiveConversationId();
     try {
       await bridgeManager.teardown();
     } finally {
       await piToolsAgent.remove();
+      detachConversationMetadata(cid);
     }
   }
 
@@ -1279,6 +1309,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       (await agyConversationExists(restored.conversationId))
         ? restored
         : undefined;
+    const previousConversationId = await captureActiveConversationId();
     // Fresh instances have new private discovery credentials and server names.
     // Rebuild from Pi history when the saved conversation belongs to another
     // bridge, agent, or tool mode.
@@ -1286,7 +1317,12 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       runtime,
       service.setSession(ctx.cwd, undefined, !compatibleRestore && event.reason !== "new"),
     );
+    if (previousConversationId && previousConversationId !== compatibleRestore?.conversationId) {
+      detachConversationMetadata(previousConversationId);
+    }
+    sweepStalePiToolsConversations();
     if (compatibleRestore) {
+      trackedConversationId = compatibleRestore.conversationId;
       await runAntigravity(
         runtime,
         service.restoreConversation({
@@ -1338,7 +1374,9 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       // again instead of silently resuming stale native history.
       const cwd = probeCtx(() => ctx.cwd);
       if (!cwd.stale) {
+        const previousConversationId = await captureActiveConversationId();
         await runAntigravity(runtime, service.setSession(cwd.value, undefined, true));
+        detachConversationMetadata(previousConversationId);
         observedContextTokens = undefined;
         persistedConversationKey = undefined;
       }
@@ -1372,7 +1410,9 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     // Restart it and bootstrap the selected branch on the next provider call.
     const cwd = probeCtx(() => ctx.cwd);
     if (cwd.stale) return;
+    const previousConversationId = await captureActiveConversationId();
     await runAntigravity(runtime, service.setSession(cwd.value, undefined, true));
+    detachConversationMetadata(previousConversationId);
     appendConversationReset(ctx);
     subagentRoster.clear();
     setAgyTasksWidget(0);
@@ -1440,12 +1480,16 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     }
     // Close the runtime: aborts any in-flight agy child process, then tear
     // down the Effect runtime.
+    const shutdownConversationId = await captureActiveConversationId();
     try {
       await runAntigravity(runtime, service.close);
     } catch {
       // Already closed.
     }
+    process.removeListener("exit", detachOnProcessExit);
+    detachConversationMetadata(shutdownConversationId);
     await teardownBridge();
+    sweepStalePiToolsConversations();
     try {
       tasksUi?.setStatus("antigravity", undefined);
       tasksUi?.setWidget(AGY_STATUS_WIDGET_KEY, undefined);
@@ -1605,7 +1649,9 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     }
     switchingToolMode = true;
     try {
+      const previousConversationId = await captureActiveConversationId();
       await runAntigravity(runtime, service.setSession(session.value.cwd, undefined, true));
+      detachConversationMetadata(previousConversationId);
       appendConversationReset(ctx);
       subagentRoster.clear();
       setAgyTasksWidget(0);
@@ -1647,7 +1693,9 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         ctx.ui.notify('agy-reset: usage "/agy-reset".', "error");
         return;
       }
+      const previousConversationId = await captureActiveConversationId();
       await runAntigravity(runtime, service.reset);
+      detachConversationMetadata(previousConversationId);
       subagentRoster.clear();
       setAgyTasksWidget(0);
       setAgyArtifactsWidget(0);
@@ -1660,7 +1708,9 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   pi.registerCommand("clear", {
     description: "Clear conversation and start a new one",
     handler: async (args, ctx) => {
+      const previousConversationId = await captureActiveConversationId();
       await runAntigravity(runtime, service.reset);
+      detachConversationMetadata(previousConversationId);
       subagentRoster.clear();
       setAgyTasksWidget(0);
       setAgyArtifactsWidget(0);
