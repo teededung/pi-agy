@@ -453,6 +453,8 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
 
   const detachOnProcessExit = () => {
     detachConversationMetadata(trackedConversationId);
+    piToolsAgent.removeSync();
+    mcpConfig.removeSync();
   };
   process.once("exit", detachOnProcessExit);
 
@@ -553,7 +555,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   const mcpConfig = createPrivateMcpConfig();
   const bridge = new AgyPiBridge(mcpConfig.serverName);
   const bridgeToken = randomUUID();
-  const piToolsAgent = createPiToolsAgent();
+  const piToolsAgent = createPiToolsAgent(path.join(mcpConfig.directory, ".agents", "agents"));
   bridge.requireToken(bridgeToken);
   bridge.setOnCall((call) => service.pushBridgeCall(call));
 

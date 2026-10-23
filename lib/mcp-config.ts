@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { rmSync } from "node:fs";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { piConfigDir } from "./config.ts";
@@ -35,6 +36,13 @@ export function createPrivateMcpConfig(root = piConfigDir("antigravity/bridges")
     },
     async remove(): Promise<void> {
       await rm(directory, { recursive: true, force: true });
+    },
+    removeSync(): void {
+      try {
+        rmSync(directory, { recursive: true, force: true });
+      } catch {
+        // Best-effort cleanup on process exit.
+      }
     },
   };
 }

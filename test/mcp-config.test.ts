@@ -39,7 +39,7 @@ test("private MCP configurations isolate credentials and clean up only their own
   assert.equal((await readFile(configFile(b.directory), "utf8")).includes("token-b"), true);
   await a.write("http://127.0.0.1:9012/mcp", "new-token");
   assert.equal((await readFile(configFile(a.directory), "utf8")).includes("new-token"), true);
-  await a.remove();
+  a.removeSync();
   await b.remove();
   assert.deepEqual(await readdir(root), ["foreign.json"]);
 });

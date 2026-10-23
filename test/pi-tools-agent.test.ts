@@ -77,7 +77,7 @@ test("Pi tool agent scopes MCP to its bridge and removes only its own configurat
   }
   await agent.prepare({ ...bridge, url: "http://127.0.0.1:5678/mcp" });
   assert.match(await readFile(agentFile, "utf8"), /5678/);
-  await agent.remove();
+  agent.removeSync();
   await agent.remove();
   assert.equal(agent.isPrepared(), false);
   assert.deepEqual(await readdir(root), ["existing-agent.md"]);

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { rmSync } from "node:fs";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -55,6 +56,14 @@ ${piToolsAgentPrompt(bridge.serverName)}
     async remove(): Promise<void> {
       prepared = false;
       await rm(directory, { recursive: true, force: true });
+    },
+    removeSync(): void {
+      prepared = false;
+      try {
+        rmSync(directory, { recursive: true, force: true });
+      } catch {
+        // Best-effort cleanup on process exit.
+      }
     },
   };
 }
