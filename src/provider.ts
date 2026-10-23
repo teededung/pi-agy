@@ -51,6 +51,9 @@ import {
   BRIDGE_PENDING_TOOL_MESSAGE,
   omittedImagesPrompt,
   restoredPiContextPrompt,
+  TEAMWORK_CONTINUATION_PROMPT,
+  TEAMWORK_DEACTIVATED_PROMPT,
+  TEAMWORK_ORCHESTRATOR_PROMPT,
   WRAPPER_TOOL_NAME,
 } from "../lib/prompt.ts";
 import {
@@ -335,38 +338,59 @@ const SUBAGENT_TOOL_NAMES = new Set([
   "manage_subagents",
 ]);
 
-function contextHasPriorBoostActivity(messages: TranscriptContext["messages"]): boolean {
+function messageUserText(msg: TranscriptContext["messages"][number]): string {
+  if (msg.role !== "user") return "";
+  if (typeof msg.content === "string") return msg.content;
+  if (!Array.isArray(msg.content)) return "";
+  return msg.content
+    .map((p) =>
+      p && typeof p === "object" && "text" in p && typeof p.text === "string" ? p.text : "",
+    )
+    .join("\n");
+}
+
+function subagentToolCallArgs(part: unknown): Record<string, unknown> | undefined {
+  if (!part || typeof part !== "object" || !("type" in part) || part.type !== "toolCall") {
+    return undefined;
+  }
+  const toolName = "name" in part && typeof part.name === "string" ? part.name : "";
+  const args =
+    "arguments" in part && part.arguments && typeof part.arguments === "object"
+      ? (part.arguments as Record<string, unknown>)
+      : undefined;
+  const innerTool = typeof args?.tool === "string" ? args.tool : "";
+  if (!SUBAGENT_TOOL_NAMES.has(toolName) && !SUBAGENT_TOOL_NAMES.has(innerTool)) {
+    return undefined;
+  }
+  return args ?? {};
+}
+
+export function contextHasPriorBoostActivity(messages: TranscriptContext["messages"]): boolean {
   for (const msg of messages) {
-    if (msg.role === "user") {
-      const text =
-        typeof msg.content === "string"
-          ? msg.content
-          : Array.isArray(msg.content)
-            ? msg.content
-                .map((p) =>
-                  p && typeof p === "object" && "text" in p && typeof p.text === "string"
-                    ? p.text
-                    : "",
-                )
-                .join("\n")
-            : "";
-      if (/^\/(?:agy-)?boost\b/i.test(text.trim()) || text.includes("Delegation Routine")) {
-        return true;
-      }
-    } else if (msg.role === "assistant" && Array.isArray(msg.content)) {
+    const text = messageUserText(msg);
+    if (text && (/^\/(?:agy-)?boost\b/i.test(text.trim()) || text.includes("Delegation Routine"))) {
+      return true;
+    }
+    if (msg.role === "assistant" && Array.isArray(msg.content)) {
       for (const part of msg.content) {
-        if (!part || typeof part !== "object") continue;
-        if ("type" in part && part.type === "toolCall") {
-          const toolName = "name" in part && typeof part.name === "string" ? part.name : "";
-          const args =
-            "arguments" in part && part.arguments && typeof part.arguments === "object"
-              ? (part.arguments as Record<string, unknown>)
-              : undefined;
-          const innerTool = typeof args?.tool === "string" ? args.tool : "";
-          if (SUBAGENT_TOOL_NAMES.has(toolName) || SUBAGENT_TOOL_NAMES.has(innerTool)) {
-            return true;
-          }
-        }
+        const args = subagentToolCallArgs(part);
+        if (args && !JSON.stringify(args).includes("teamwork_preview")) return true;
+      }
+    }
+  }
+  return false;
+}
+
+export function contextHasPriorTeamworkActivity(messages: TranscriptContext["messages"]): boolean {
+  for (const msg of messages) {
+    const text = messageUserText(msg);
+    if (text && (/^\/(?:agy-)?teamwork\b/i.test(text.trim()) || text.includes("<TEAMWORK>"))) {
+      return true;
+    }
+    if (msg.role === "assistant" && Array.isArray(msg.content)) {
+      for (const part of msg.content) {
+        const args = subagentToolCallArgs(part);
+        if (args && JSON.stringify(args).includes("teamwork_preview")) return true;
       }
     }
   }
@@ -418,10 +442,14 @@ export function streamAntigravity(
   getAllModels?: () => readonly AgyModelInfo[],
   /** Notifies the extension when a turn executes under a `/m` one-shot consult override. */
   onConsultUsed?: (consult: OneShotConsultOverride) => void,
+  /** Whether Teamwork multi-agent orchestration mode is currently active. */
+  isTeamworkActive?: () => boolean,
 ) {
   let hadBoostInConversation = false;
+  let hadTeamworkInConversation = false;
   let currentTurnBatchStart = -1;
   let currentTurnHadBoostBefore = false;
+  let currentTurnHadTeamworkBefore = false;
 
   return (
     model: Model<string>,
@@ -545,36 +573,62 @@ export function streamAntigravity(
           throw new Error("antigravity: no user text found in the request context.");
         }
         let isBoost = false;
+        let isTeamwork = false;
+        let explicitTeamworkCommand = false;
         if (!isolatedRequest) {
           if (userBatch.start !== currentTurnBatchStart) {
             if (userBatch.start <= 0) {
               hadBoostInConversation = false;
+              hadTeamworkInConversation = false;
             }
             currentTurnBatchStart = userBatch.start;
             currentTurnHadBoostBefore =
               hadBoostInConversation ||
               (userBatch.start > 0 &&
                 contextHasPriorBoostActivity(context.messages.slice(0, userBatch.start)));
+            currentTurnHadTeamworkBefore =
+              hadTeamworkInConversation ||
+              (userBatch.start > 0 &&
+                contextHasPriorTeamworkActivity(context.messages.slice(0, userBatch.start)));
           }
-          if (/^\/(?:agy-)?boost\b/i.test(prompt)) {
+          if (/^\/(?:agy-)?teamwork\b/i.test(prompt)) {
+            isTeamwork = true;
+            explicitTeamworkCommand = true;
+            prompt = prompt.replace(/^\/(?:agy-)?teamwork\s*/i, "").trim();
+            if (!prompt) {
+              prompt =
+                "Teamwork mode is ready. Let's start Step 1: what project or task would you like to build or tackle with the teamwork multi-agent system?";
+            }
+          } else if (/^\/(?:agy-)?boost\b/i.test(prompt)) {
             isBoost = true;
             prompt = prompt.replace(/^\/(?:agy-)?boost\s*/i, "").trim();
             if (!prompt) {
               prompt =
                 "Boost mode is ready. What coding or investigation task would you like to tackle? Please share the details or requirements, and I will orchestrate the work.";
             }
+          } else if (isTeamworkActive?.()) {
+            isTeamwork = true;
           } else if (isBoostActive?.()) {
             isBoost = true;
+          }
+          if (isTeamwork) {
+            hadTeamworkInConversation = true;
           }
           if (isBoost) {
             hadBoostInConversation = true;
           }
         }
-        const turnPrompt = isBoost
-          ? `${BOOST_ORCHESTRATOR_PROMPT}\n\n${prompt}`
-          : !isolatedRequest && currentTurnHadBoostBefore
-            ? `${BOOST_DEACTIVATED_PROMPT}\n\n${prompt}`
-            : prompt;
+        const turnPrompt = isTeamwork
+          ? explicitTeamworkCommand || !currentTurnHadTeamworkBefore
+            ? `${TEAMWORK_ORCHESTRATOR_PROMPT}\n\n${prompt}`
+            : `${TEAMWORK_CONTINUATION_PROMPT}\n\n${prompt}`
+          : isBoost
+            ? `${BOOST_ORCHESTRATOR_PROMPT}\n\n${prompt}`
+            : !isolatedRequest && currentTurnHadTeamworkBefore
+              ? `${TEAMWORK_DEACTIVATED_PROMPT}\n\n${prompt}`
+              : !isolatedRequest && currentTurnHadBoostBefore
+                ? `${BOOST_DEACTIVATED_PROMPT}\n\n${prompt}`
+                : prompt;
 
         if (isolatedRequest) {
           // Pi invokes compaction, branch summarization, and side conversations (/btw)
@@ -632,15 +686,16 @@ export function streamAntigravity(
             bootstrapSuffix: isolatedRequest ? undefined : getBootstrapSuffix?.(),
             modelId: effectiveModelId,
             effort: requestedEffort ? effort : undefined,
-            // Custom lean agents (like agy-lean) restrict tools to 4 workspace primitives
-            // and strip invoke_subagent/send_message/manage_subagents. Bypass custom agent
-            // when Boost orchestration is active so subagent tools are available.
-            agent: isBoost ? undefined : processProfile.agent,
+            // Custom lean agents (like agy-lean or pi-tools) restrict tools and
+            // strip invoke_subagent/send_message/manage_subagents. Bypass custom agent
+            // when Boost or Teamwork orchestration is active so subagent tools are available
+            // alongside the Pi MCP bridge.
+            agent: isBoost || isTeamwork ? undefined : processProfile.agent,
             mode: processProfile.mode,
             mcpDirectory: processProfile.mcpDirectory,
             bridgeRevision,
             signal: options?.signal,
-            timeoutMs: isBoost ? 1_800_000 : undefined,
+            timeoutMs: isTeamwork ? 43_200_000 : isBoost ? 7_200_000 : undefined,
           }),
         );
 

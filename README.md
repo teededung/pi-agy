@@ -59,6 +59,8 @@ pi update git:github.com/teededung/pi-agy
 | `/consult` | Alias for `/m` (also `/agy-consult`) |
 | `/boost` | Toggle Boost multi-agent mode, or run a single task with the orchestrator (`/boost <task>`) |
 | `/agy-boost` | Alias for `/boost` |
+| `/teamwork` | Toggle Teamwork two-phase multi-agent mode (`prompt_draft.md` crafting → `teamwork_preview` orchestration), or start a project (`/teamwork <idea>`) |
+| `/agy-teamwork` | Alias for `/teamwork` |
 | `/clear [prompt]` | Clear the agy conversation and start a fresh Pi session (optionally sending an initial prompt) |
 | `/rename [name]` | Set or view the session display name (alias for `/name`, immediately synced to agy conversation metadata) |
 | `/agy` | Conversation title/status (id, model, turns, process, native context) |

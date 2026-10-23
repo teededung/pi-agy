@@ -9,7 +9,17 @@ import {
   sweepStalePiToolsConversations,
 } from "../lib/conversation-metadata.ts";
 import { createPiToolsAgent } from "../lib/pi-tools-agent.ts";
+import {
+  formatAgySubagentsLivePreviewLines,
+  syncAgySubagentRoster,
+  trackAgySubagent,
+  type AgySubagentEntry,
+} from "../lib/subagents.ts";
 import { readAgyToolMode, resolveAgyToolModeCommand } from "../lib/tool-mode.ts";
+import {
+  contextHasPriorBoostActivity,
+  contextHasPriorTeamworkActivity,
+} from "../src/provider.ts";
 
 test("tool mode defaults to pi and the startup flag overrides the environment", () => {
   assert.equal(readAgyToolMode(undefined, {}), "pi");
@@ -184,4 +194,161 @@ test("detachAgyConversationBridgeMetadata and sweepStalePiToolsConversations str
   const cleanedJson = JSON.parse(await readFile(metaJsonPath, "utf8"));
   assert.equal(cleanedJson.conversations[cid].summary.AgentName, "");
   assert.deepEqual(cleanedJson.conversations[cid].summary.WorkspaceURIs, [projectUri]);
+});
+
+test("formatAgySubagentsLivePreviewLines renders multi-line stack for running /teamwork and /boost subagents", async (t) => {
+  const brainDir = await mkdtemp(path.join(tmpdir(), "pi-agy-subagents-preview-"));
+  t.after(() => rm(brainDir, { recursive: true, force: true }));
+
+  const parentCid = "4103eeef-1a66-4109-a152-81ae20e913f6";
+  const rootCid = "6c181934-1ede-42ae-8aa0-e05325b687ba";
+  const orchCid = "7d95d907-757c-4fc3-b421-379835d6c306";
+  const explorerCid = "8e06e018-868d-4ad4-c532-480946e7d417";
+
+  await mkdir(path.join(brainDir, parentCid, ".system_generated", "subagents"), { recursive: true });
+  await mkdir(path.join(brainDir, rootCid, ".system_generated", "subagents"), { recursive: true });
+  await mkdir(path.join(brainDir, rootCid, ".system_generated", "logs"), { recursive: true });
+  await mkdir(path.join(brainDir, orchCid, ".system_generated", "subagents"), { recursive: true });
+  await mkdir(path.join(brainDir, orchCid, ".system_generated", "logs"), { recursive: true });
+  await mkdir(path.join(brainDir, explorerCid, ".system_generated", "logs"), { recursive: true });
+
+  await writeFile(
+    path.join(brainDir, parentCid, ".system_generated", "subagents", `${rootCid}.json`),
+    JSON.stringify({
+      conversationId: rootCid,
+      subagentDescriptor: {
+        typeName: "teamwork_preview",
+        role: "Sveltekit 3 & Auth/Launcher Audit Team",
+      },
+      state: "SUBAGENT_STATE_ALIVE",
+      spawnStepIndex: 12,
+    }),
+  );
+  await writeFile(
+    path.join(brainDir, rootCid, ".system_generated", "logs", "transcript.jsonl"),
+    `${JSON.stringify({
+      step_index: 5,
+      created_at: "2026-10-23T08:00:00Z",
+      tool_calls: [{ name: "invoke_subagent", args: { toolSummary: "Check orchestrator progress" } }],
+    })}\n`,
+  );
+
+  await writeFile(
+    path.join(brainDir, rootCid, ".system_generated", "subagents", `${orchCid}.json`),
+    JSON.stringify({
+      conversationId: orchCid,
+      subagentDescriptor: {
+        typeName: "teamwork_preview_orchestrator",
+        role: "Project Orchestrator",
+      },
+      state: "SUBAGENT_STATE_ALIVE",
+      spawnStepIndex: 10,
+    }),
+  );
+  await writeFile(
+    path.join(brainDir, orchCid, ".system_generated", "logs", "transcript.jsonl"),
+    `${JSON.stringify({
+      step_index: 3,
+      created_at: "2026-10-23T08:01:00Z",
+    })}\n`,
+  );
+
+  await writeFile(
+    path.join(brainDir, orchCid, ".system_generated", "subagents", `${explorerCid}.json`),
+    JSON.stringify({
+      conversationId: explorerCid,
+      subagentDescriptor: {
+        typeName: "teamwork_preview_explorer",
+        role: "Remediation Explorer",
+      },
+      state: "SUBAGENT_STATE_ALIVE",
+      spawnStepIndex: 14,
+    }),
+  );
+  await writeFile(
+    path.join(brainDir, explorerCid, ".system_generated", "logs", "transcript.jsonl"),
+    `${JSON.stringify({
+      step_index: 7,
+      created_at: "2026-10-23T09:30:00Z",
+      tool_calls: [{ name: "run_command", args: { CommandLine: "bun run check" } }],
+    })}\n`,
+  );
+
+  const roster = new Map<string, AgySubagentEntry>();
+  trackAgySubagent(
+    roster,
+    {
+      type: "tool_start",
+      stepId: 12,
+      name: "invoke_subagent",
+      args: { TypeName: "teamwork_preview", Role: "Sveltekit 3 & Auth/Launcher Audit Team" },
+    },
+    Date.parse("2026-10-23T08:00:00Z"),
+  );
+  await syncAgySubagentRoster(roster, parentCid, brainDir);
+
+  const now = Date.parse("2026-10-23T09:42:19Z");
+  const lines = formatAgySubagentsLivePreviewLines(roster, now);
+  assert.deepEqual(lines, [
+    "• Agent(teamwork_preview_explorer: Remediation Explorer) bun run check • 12m19s",
+    "• Agent(teamwork_preview_orchestrator: Project Orchestrator) Working • 1h41m",
+    "• Agent(teamwork_preview: Sveltekit 3 & Auth/Launcher Audit Team) Check orchestrator progress • 1h42m",
+  ]);
+});
+
+test("contextHasPriorTeamworkActivity and contextHasPriorBoostActivity ignore non-subagent mentions and separate modes", () => {
+  const codeEditAndQuestion = [
+    {
+      role: "user",
+      content: "how does teamwork_preview work with prompt_draft.md?",
+    },
+    {
+      role: "assistant",
+      content: [
+        {
+          type: "toolCall",
+          name: "edit",
+          arguments: { path: "lib/prompt.ts", newText: "teamwork_preview prompt_draft.md" },
+        },
+      ],
+    },
+  ] as unknown as Parameters<typeof contextHasPriorTeamworkActivity>[0];
+
+  assert.equal(contextHasPriorTeamworkActivity(codeEditAndQuestion), false);
+  assert.equal(contextHasPriorBoostActivity(codeEditAndQuestion), false);
+
+  const teamworkInvoke = [
+    {
+      role: "assistant",
+      content: [
+        {
+          type: "toolCall",
+          name: "antigravity",
+          arguments: {
+            tool: "invoke_subagent",
+            input: { TypeName: "teamwork_preview", Prompt: "Build it" },
+          },
+        },
+      ],
+    },
+  ] as unknown as Parameters<typeof contextHasPriorTeamworkActivity>[0];
+
+  assert.equal(contextHasPriorTeamworkActivity(teamworkInvoke), true);
+  assert.equal(contextHasPriorBoostActivity(teamworkInvoke), false);
+
+  const boostInvoke = [
+    {
+      role: "assistant",
+      content: [
+        {
+          type: "toolCall",
+          name: "invoke_subagent",
+          arguments: { TypeName: "implementer", Prompt: "Fix bug" },
+        },
+      ],
+    },
+  ] as unknown as Parameters<typeof contextHasPriorTeamworkActivity>[0];
+
+  assert.equal(contextHasPriorTeamworkActivity(boostInvoke), false);
+  assert.equal(contextHasPriorBoostActivity(boostInvoke), true);
 });

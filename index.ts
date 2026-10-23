@@ -7,6 +7,7 @@
 // Commands:
 //   /m              one-shot model consult: /m <opus|sonnet|argon|flash>[1|2|3] <prompt>
 //   /boost          toggle Boost multi-agent mode or run a task with orchestration
+//   /teamwork       toggle Teamwork two-phase multi-agent mode or start a project
 //   /agy            show agy conversation and persistent-driver status
 //   /agy-tools      toggle Pi tools on/off or show the current mode
 //   /agy-reset      drop the current agy conversation (next turn starts fresh)
@@ -16,6 +17,7 @@
 //   /agy-subagents  list subagent activity observed on the agy stream
 //   /agy-usage      show Antigravity model quotas (weekly and 5-hour limits)
 //   /agy-boost      alias for /boost
+//   /agy-teamwork   alias for /teamwork
 //   /consult        alias for /m
 //   /clear          clear agy conversation and start a new Pi session
 //   /rename         alias for /name (set session display name and sync to agy)
@@ -114,6 +116,7 @@ import {
 } from "./lib/tasks.ts";
 import {
   formatAgySubagents,
+  formatAgySubagentsLivePreviewLines,
   isAgySubagentTool,
   summarizeAgySubagentsWidget,
   syncAgySubagentRoster,
@@ -309,6 +312,9 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   let selectedModelKey: string | undefined;
   let sessionBoostMode = false;
   let oneShotBoost = false;
+  let sessionTeamworkMode = false;
+  let oneShotTeamwork = false;
+  let teamworkLaunchedThisTurn = false;
 
   interface ActiveOneShotConsult extends OneShotConsultOverride {
     restoreModel?: NonNullable<ExtensionContext["model"]>;
@@ -327,16 +333,20 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   }
 
   const isBoostActive = (): boolean => sessionBoostMode || oneShotBoost;
+  const isTeamworkActive = (): boolean => sessionTeamworkMode || oneShotTeamwork;
   const getOneShotConsult = (): OneShotConsultOverride | undefined => oneShotConsult;
 
-  const updateBoostStatus = (ui?: ExtensionContext["ui"]): void => {
+  const updateOrchestrationStatus = (ui?: ExtensionContext["ui"]): void => {
     if (!ui) return;
     try {
-      if (sessionBoostMode) {
-        ui.setStatus("agy-boost", ui.theme.fg("accent", "[boost]\u00A0"));
-      } else {
-        ui.setStatus("agy-boost", undefined);
-      }
+      ui.setStatus(
+        "agy-boost",
+        sessionBoostMode ? ui.theme.fg("accent", "[boost]\u00A0") : undefined,
+      );
+      ui.setStatus(
+        "agy-teamwork",
+        isTeamworkActive() ? ui.theme.fg("accent", "[teamwork]\u00A0") : undefined,
+      );
     } catch {
       // UI may be unavailable (e.g. non-interactive modes).
     }
@@ -810,7 +820,10 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     const liveTasks = Math.max(0, widgetLiveCount);
     const artifacts = Math.max(0, widgetArtifactCount);
     const subagents = subagentRoster.size;
-    const subagentSummary = summarizeAgySubagentsWidget(subagentRoster) ?? "";
+    const now = Date.now();
+    const liveSubSummary = summarizeAgySubagentsWidget(subagentRoster, now);
+    const livePreviewPlain = formatAgySubagentsLivePreviewLines(subagentRoster, now);
+    const subagentSummary = [liveSubSummary ?? "", ...livePreviewPlain].join("\n");
 
     if (
       !force &&
@@ -840,6 +853,11 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         const regions: { x: number; y: number; width: number; command: string }[] = [];
         const widget = {
           render: (width: number) => {
+            const previewLines = formatAgySubagentsLivePreviewLines(
+              subagentRoster,
+              now,
+              theme,
+            ).map((line) => truncateToWidth(line, width, ""));
             const items: string[] = [];
             if (liveTasks > 0) {
               items.push(
@@ -860,7 +878,6 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
               );
             }
             if (subagents > 0) {
-              const liveSubSummary = summarizeAgySubagentsWidget(subagentRoster);
               items.push(
                 theme.fg("accent", "◆ ") +
                   theme.fg(
@@ -873,7 +890,8 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
                   theme.fg("accent", "/agy-subagents"),
               );
             }
-            const lines = packHintItems(items, width, theme);
+            const hintLines = packHintItems(items, width, theme);
+            const lines = [...previewLines, ...hintLines];
             regions.length = 0;
             lines.forEach((line, y) => {
               const plain = stripTerminalSequences(line);
@@ -1026,6 +1044,12 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         activity.type === "tool_error") &&
       isAgySubagentTool(activity.name)
     ) {
+      if (
+        activity.type === "tool_start" &&
+        JSON.stringify(activity.args ?? {}).includes("teamwork_preview")
+      ) {
+        teamworkLaunchedThisTurn = true;
+      }
       renderAgyStatusWidget();
       updateAgyTasksWidget();
     }
@@ -1168,6 +1192,12 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         bridge,
         () => {
           oneShotBoost = false;
+          if (teamworkLaunchedThisTurn) {
+            teamworkLaunchedThisTurn = false;
+            oneShotTeamwork = false;
+            sessionTeamworkMode = false;
+            updateOrchestrationStatus(tasksUi);
+          }
           updateAgyTasksWidget();
         },
         getBootstrapSuffix,
@@ -1187,6 +1217,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
           lastConsultUsed = consult;
           if (tasksUi) updateConsultStatus(tasksUi);
         },
+        isTeamworkActive,
       ),
     });
   };
@@ -1239,6 +1270,13 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
 
   pi.on("agent_settled", async (_event, ctx: ExtensionContext) => {
     oneShotBoost = false;
+    if (teamworkLaunchedThisTurn) {
+      teamworkLaunchedThisTurn = false;
+      oneShotTeamwork = false;
+      sessionTeamworkMode = false;
+      const ui = probeCtx(() => ctx.ui);
+      if (!ui.stale && ui.value) updateOrchestrationStatus(ui.value);
+    }
     const consultRecord = lastConsultUsed ?? oneShotConsult;
     const finishedConsult = oneShotConsult;
     oneShotConsult = undefined;
@@ -1290,6 +1328,13 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     lastSyncedSessionTitleKey = undefined;
     oneShotConsult = undefined;
     lastConsultUsed = undefined;
+    oneShotBoost = false;
+    oneShotTeamwork = false;
+    teamworkLaunchedThisTurn = false;
+    if (event.reason === "new") {
+      sessionBoostMode = false;
+      sessionTeamworkMode = false;
+    }
     ensureSessionNamePolling();
     syncWrapperToolActivation(ctx.model?.provider);
     refreshToolModeStatus(ctx);
@@ -1349,7 +1394,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     updateAgyTasksWidget();
     renderAgyStatusWidget(true);
     if (ctx.hasUI) {
-      updateBoostStatus(ctx.ui);
+      updateOrchestrationStatus(ctx.ui);
       updateConsultStatus(ctx.ui);
     }
     // The pi-tool bridge is only useful while an Antigravity model is
@@ -1388,7 +1433,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       await ensureBridgeRegistered(ui.stale ? undefined : ui.value);
       await refreshStaleModelsWhenSelected();
       if (!ui.stale && ui.value) {
-        updateBoostStatus(ui.value);
+        updateOrchestrationStatus(ui.value);
         updateConsultStatus(ui.value);
       }
     } else {
@@ -1396,6 +1441,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       if (!ui.stale && ui.value) {
         try {
           ui.value.setStatus("agy-boost", undefined);
+          ui.value.setStatus("agy-teamwork", undefined);
           ui.value.setStatus("agy-consult", undefined);
         } catch {
           // Best effort
@@ -1496,6 +1542,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       tasksUi?.setWidget(AGY_TASKS_WIDGET_KEY, undefined);
       tasksUi?.setWidget(AGY_ARTIFACTS_WIDGET_KEY, undefined);
       tasksUi?.setStatus("agy-boost", undefined);
+      tasksUi?.setStatus("agy-teamwork", undefined);
       tasksUi?.setStatus("agy-consult", undefined);
     } catch {
       // UI may already be gone.
@@ -1546,7 +1593,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       if (action === "tools") return handleAgyToolsCommand(rest.join(" "), ctx);
       if (args.trim()) {
         ctx.ui.notify(
-          'antigravity: use "/agy-tools", "/m", "/boost", "/agy-reset", "/agy-models", "/agy-agents", "/agy-doctor", "/agy-subagents", "/agy-tasks", "/agy-artifacts", or "/agy-usage".',
+          'antigravity: use "/agy-tools", "/m", "/boost", "/teamwork", "/agy-reset", "/agy-models", "/agy-agents", "/agy-doctor", "/agy-subagents", "/agy-tasks", "/agy-artifacts", or "/agy-usage".',
           "error",
         );
         return;
@@ -1579,7 +1626,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       try {
         const configured = readAgyProcessProfile();
         const agent = getToolMode() === "pi" ? piToolsAgent.name : configured.agent;
-        const boostState = ` · boost: ${sessionBoostMode ? "ON" : "OFF"}`;
+        const boostState = ` · boost: ${sessionBoostMode ? "ON" : "OFF"} · teamwork: ${isTeamworkActive() ? "ON" : "OFF"}`;
         profile = `agent: ${agent ?? "none"} · mode: ${configured.mode ?? "default"} · tools: ${getToolMode()}${boostState}`;
       } catch (error) {
         profile = `profile error: ${error instanceof Error ? error.message : String(error)}`;
@@ -1696,6 +1743,11 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       const previousConversationId = await captureActiveConversationId();
       await runAntigravity(runtime, service.reset);
       detachConversationMetadata(previousConversationId);
+      oneShotBoost = false;
+      oneShotTeamwork = false;
+      teamworkLaunchedThisTurn = false;
+      sessionTeamworkMode = false;
+      updateOrchestrationStatus(ctx.ui);
       subagentRoster.clear();
       setAgyTasksWidget(0);
       setAgyArtifactsWidget(0);
@@ -1711,6 +1763,11 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       const previousConversationId = await captureActiveConversationId();
       await runAntigravity(runtime, service.reset);
       detachConversationMetadata(previousConversationId);
+      oneShotBoost = false;
+      oneShotTeamwork = false;
+      teamworkLaunchedThisTurn = false;
+      sessionTeamworkMode = false;
+      updateOrchestrationStatus(ctx.ui);
       subagentRoster.clear();
       setAgyTasksWidget(0);
       setAgyArtifactsWidget(0);
@@ -2118,62 +2175,114 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     },
   });
 
-  const handleBoostCommand = async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
+  const toggleCommandCompletions = (prefix: string) =>
+    ["on", "off", "status"]
+      .filter((value) => value.startsWith(prefix))
+      .map((value) => ({ value, label: value }));
+
+  const handleOrchestrationCommand = (
+    mode: "boost" | "teamwork",
+    args: string,
+    ctx: ExtensionCommandContext,
+  ): void => {
     const trimmed = args.trim();
+    const isBoost = mode === "boost";
+    const label = isBoost ? "Boost" : "Teamwork";
+    const enabledMessage = isBoost
+      ? "Boost mode enabled (multi-agent orchestration)."
+      : "Teamwork mode enabled (two-phase prompt crafting + teamwork_preview orchestration).";
+    const getActive = () => (isBoost ? sessionBoostMode : isTeamworkActive());
+    const setActive = (next: boolean) => {
+      if (isBoost) {
+        sessionBoostMode = next;
+        if (next) {
+          sessionTeamworkMode = false;
+          oneShotTeamwork = false;
+        }
+      } else {
+        sessionTeamworkMode = next;
+        if (!next) oneShotTeamwork = false;
+        if (next) sessionBoostMode = false;
+      }
+      updateOrchestrationStatus(ctx.ui);
+    };
+
     if (!trimmed) {
-      sessionBoostMode = !sessionBoostMode;
-      updateBoostStatus(ctx.ui);
-      ctx.ui.notify(
-        sessionBoostMode
-          ? "Boost mode enabled (multi-agent orchestration)."
-          : "Boost mode disabled.",
-        "info",
-      );
+      const next = !getActive();
+      setActive(next);
+      ctx.ui.notify(next ? enabledMessage : `${label} mode disabled.`, "info");
       return;
     }
-
     if (/^(on|enable|true)$/i.test(trimmed)) {
-      sessionBoostMode = true;
-      updateBoostStatus(ctx.ui);
-      ctx.ui.notify("Boost mode enabled (multi-agent orchestration).", "info");
+      setActive(true);
+      ctx.ui.notify(enabledMessage, "info");
       return;
     }
-
     if (/^(off|disable|false)$/i.test(trimmed)) {
-      sessionBoostMode = false;
-      updateBoostStatus(ctx.ui);
-      ctx.ui.notify("Boost mode disabled.", "info");
+      setActive(false);
+      ctx.ui.notify(`${label} mode disabled.`, "info");
       return;
     }
-
     if (/^status$/i.test(trimmed)) {
-      ctx.ui.notify(
-        `Boost mode is currently ${sessionBoostMode ? "ON" : "OFF"}.`,
-        "info",
-      );
+      ctx.ui.notify(`${label} mode is currently ${getActive() ? "ON" : "OFF"}.`, "info");
       return;
     }
 
-    // Argument is a task: run under one-shot boost mode.
-    // Prefix with `/boost ` when queued as a followUp so an in-flight non-boost
-    // turn is unaffected; when idle, also set oneShotBoost (cleared on agent_settled).
-    if (ctx.isIdle()) {
-      oneShotBoost = true;
-      pi.sendUserMessage(trimmed);
-    } else {
-      pi.sendUserMessage(`/boost ${trimmed}`, { deliverAs: "followUp" });
-      ctx.ui.notify("Boost task queued as follow-up.", "info");
+    if (isBoost) {
+      if (ctx.isIdle()) {
+        oneShotBoost = true;
+        pi.sendUserMessage(trimmed);
+      } else {
+        pi.sendUserMessage(`/boost ${trimmed}`, { deliverAs: "followUp" });
+        ctx.ui.notify("Boost task queued as follow-up.", "info");
+      }
+      return;
     }
+
+    // Teamwork project run: keep oneShotTeamwork active across Phase 1 Q&A turns
+    // until Phase 2 invokes `teamwork_preview` and settles.
+    oneShotTeamwork = true;
+    sessionBoostMode = false;
+    updateOrchestrationStatus(ctx.ui);
+    if (ctx.isIdle()) {
+      pi.sendUserMessage(`/teamwork ${trimmed}`);
+    } else {
+      pi.sendUserMessage(`/teamwork ${trimmed}`, { deliverAs: "followUp" });
+      ctx.ui.notify("Teamwork project queued as follow-up.", "info");
+    }
+  };
+
+  const handleBoostCommand = async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
+    handleOrchestrationCommand("boost", args, ctx);
+  };
+  const handleTeamworkCommand = async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
+    handleOrchestrationCommand("teamwork", args, ctx);
   };
 
   pi.registerCommand("boost", {
     description: "Toggle Boost multi-agent mode or execute a task with subagent orchestration",
+    getArgumentCompletions: toggleCommandCompletions,
     handler: handleBoostCommand,
   });
 
   pi.registerCommand("agy-boost", {
     description: "Toggle Boost multi-agent mode or execute a task with subagent orchestration (alias for /boost)",
+    getArgumentCompletions: toggleCommandCompletions,
     handler: handleBoostCommand,
+  });
+
+  pi.registerCommand("teamwork", {
+    description:
+      "Toggle Teamwork two-phase multi-agent mode or start a project with teamwork_preview orchestration",
+    getArgumentCompletions: toggleCommandCompletions,
+    handler: handleTeamworkCommand,
+  });
+
+  pi.registerCommand("agy-teamwork", {
+    description:
+      "Toggle Teamwork two-phase multi-agent mode or start a project with teamwork_preview orchestration (alias for /teamwork)",
+    getArgumentCompletions: toggleCommandCompletions,
+    handler: handleTeamworkCommand,
   });
 
   const listOtherPiModels = (registry: ExtensionContext["modelRegistry"]) => {
