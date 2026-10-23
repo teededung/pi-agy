@@ -21,6 +21,7 @@ import {
   type AgyTurnExecutor,
 } from "../lib/agy-driver.ts";
 import type { AgyExecutionMode } from "../lib/agy-profile.ts";
+import { detachAgyConversationBridgeMetadata } from "../lib/conversation-metadata.ts";
 import type { AgyTurnOutcome, AgyUsage } from "../lib/reducer.ts";
 import { piSystemInstructionsPrompt, stallContinuationPrompt } from "../lib/prompt.ts";
 import { AgyTurnController } from "../lib/turn.ts";
@@ -333,23 +334,11 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                 return active;
               }
               if (active) invalidateActiveTurn();
-              // agy pins a conversation to the workspace and `--agent` profile it
-              // was created with:
-              // - Resuming it from another directory silently writes into the OLD
-              //   workspace (verified 2026-08-21) or rejects writes with
-              //   "not a valid artifact path".
-              // - Resuming a custom `--agent` conversation (`pi-tools-...`) without
-              //   `--agent` (for `/boost` or `/teamwork`) still reuses the stored
-              //   CustomAgentConfig on the backend (`hasExistingCustomAgent`),
-              //   where BuiltinNames (`DeepCoder`, `DeepInvestigator`,
-              //   `teamwork_preview`) are empty. Conversely, passing `--agent` on a
-              //   default-agent conversation permanently binds the custom agent to
-              //   that conversation.
-              // Start fresh with Pi history bootstrap when either binding changes.
-              if (
-                conversationId &&
-                (conversationCwd !== cwd || conversationAgent !== request.agent)
-              ) {
+              // agy pins a conversation to the workspace it was created with:
+              // resuming it from another directory silently writes into the OLD
+              // workspace (verified 2026-08-21) or rejects writes with
+              // "not a valid artifact path".
+              if (conversationId && conversationCwd !== cwd) {
                 conversationId = undefined;
                 conversationUsage = {};
                 conversationCwd = undefined;
@@ -357,6 +346,16 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                 restoreHistoryOnNextConversation = true;
                 restoredConversationPending = false;
                 lastBootstrappedSkillsSuffix = undefined;
+              }
+              // When switching between `pi-tools-*` and default agent (`undefined`
+              // for `/boost` or `/teamwork`), keep `conversationId` and strip
+              // `pi-tools-*` (`field 4` / `field 10`) from `trajectory_metadata_blob`
+              // so `AgyDriverSession` recycles the child process (`cause: "agent"`)
+              // and resumes the SAME conversation with built-in subagents unlocked.
+              const agentSwitchedOnConversation =
+                conversationId !== undefined && conversationAgent !== request.agent;
+              if (agentSwitchedOnConversation && conversationId) {
+                detachAgyConversationBridgeMetadata(conversationId);
               }
               // Keep `conversationId` when switching between Antigravity models
               // (e.g. `/m` one-shot consults or `/model` switches): `agy` natively
@@ -382,7 +381,9 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                 }
               }
               const resumingPersistedConversation =
-                (restoredConversationPending || modelSwitchedOnConversation) &&
+                (restoredConversationPending ||
+                  modelSwitchedOnConversation ||
+                  agentSwitchedOnConversation) &&
                 conversationId !== undefined;
               const historyBootstrap =
                 !conversationId && restoreHistoryOnNextConversation
@@ -479,6 +480,7 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                   conversationId = id;
                   conversationCwd = cwd;
                   conversationAgent = request.agent;
+                  detachAgyConversationBridgeMetadata(id);
                 },
                 onActivity: (activity) => {
                   if (turnGeneration !== generation || turnAbort.signal.aborted) return;
@@ -651,6 +653,7 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                     conversationCwd = cwd;
                     conversationAgent = request.agent;
                     restoreHistoryOnNextConversation = false;
+                    detachAgyConversationBridgeMetadata(outcome.conversationId);
                   }
                   if (outcome.usage) conversationUsage = { ...outcome.usage };
                   restoredConversationPending = false;
@@ -669,6 +672,7 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                     request.signal?.removeEventListener("abort", requestAbortHandler);
                   }
                   if (activeTurnAbort === turnAbort) activeTurnAbort = undefined;
+                  if (conversationId) detachAgyConversationBridgeMetadata(conversationId);
                 });
               return controller;
             }),
@@ -679,6 +683,7 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
         // Called only when Pi has consumed the final result (or an error),
         // never for the toolUse handoff that must keep this controller alive.
         active = undefined;
+        if (conversationId) detachAgyConversationBridgeMetadata(conversationId);
       }),
 
       pushBridgeCall: (call) => {

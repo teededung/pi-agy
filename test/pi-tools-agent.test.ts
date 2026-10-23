@@ -391,7 +391,7 @@ test("read_file, edit_file, and write_file render with Pi native read:start-end 
   assert.equal(isAgyEditTool("write_file"), true);
 });
 
-test("AntigravityRuntime starts a fresh conversation with historyBootstrap when switching between pi-tools custom agent and Boost/Teamwork default agent", async () => {
+test("AntigravityRuntime keeps the same conversationId when switching between pi-tools custom agent and Boost/Teamwork default agent", async () => {
   const seenRequests: Array<{
     conversationId?: string;
     agent?: string;
@@ -451,7 +451,7 @@ test("AntigravityRuntime starts a fresh conversation with historyBootstrap when 
     }
     await runtime.runPromise(service.finishTurn);
 
-    // Turn 2: /boost turn drops custom agent (agent: undefined) -> must start conv-2 with historyBootstrap
+    // Turn 2: /boost turn drops custom agent (agent: undefined) while keeping conv-1
     const c2 = await runtime.runPromise(
       service.beginStreamTurn({
         prompt: "BOOST_PROMPT\n\ninvestigate auth",
@@ -475,7 +475,7 @@ test("AntigravityRuntime starts a fresh conversation with historyBootstrap when 
     }
     await runtime.runPromise(service.finishTurn);
 
-    // Turn 3: next normal turn restores pi-tools custom agent -> must start conv-3 with historyBootstrap
+    // Turn 3: next normal turn restores pi-tools custom agent while still keeping conv-1
     const c3 = await runtime.runPromise(
       service.beginStreamTurn({
         prompt: "back to normal",
@@ -497,13 +497,13 @@ test("AntigravityRuntime starts a fresh conversation with historyBootstrap when 
     assert.equal(seenRequests[1].agent, "pi-tools-test");
     assert.equal(seenRequests[1].prompt.includes("HIST_1B"), false);
 
-    assert.equal(seenRequests[2].conversationId, undefined);
+    assert.equal(seenRequests[2].conversationId, "conv-1");
     assert.equal(seenRequests[2].agent, undefined);
-    assert.equal(seenRequests[2].prompt.includes("HIST_BEFORE_BOOST"), true);
+    assert.equal(seenRequests[2].prompt.includes("HIST_BEFORE_BOOST"), false);
 
-    assert.equal(seenRequests[3].conversationId, undefined);
+    assert.equal(seenRequests[3].conversationId, "conv-1");
     assert.equal(seenRequests[3].agent, "pi-tools-test");
-    assert.equal(seenRequests[3].prompt.includes("HIST_AFTER_BOOST"), true);
+    assert.equal(seenRequests[3].prompt.includes("HIST_AFTER_BOOST"), false);
   } finally {
     await runtime.dispose();
   }

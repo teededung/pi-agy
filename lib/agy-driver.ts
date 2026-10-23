@@ -14,6 +14,7 @@ import {
   untrackAgyChild,
 } from "./agy-children.ts";
 import { AgyCompatibilityError, checkAgyBinary } from "./agy-diagnostics.ts";
+import { detachAgyConversationBridgeMetadata } from "./conversation-metadata.ts";
 import { parseAgyLine } from "./events.ts";
 import { AGY_PARKED_TURN_ERROR } from "./prompt.ts";
 import {
@@ -396,8 +397,16 @@ export class AgyDriverSession implements AgyTurnExecutor {
     const nextConfig = processConfig(request, binary, checked?.version, checked?.revision);
     if (this.#child) {
       const cause = recycleCause(request, this.#config, nextConfig, this.#boundConversationId);
-      if (cause) await this.close("recycle", cause);
-      else this.#reusedTurns += 1;
+      if (cause) {
+        const previousCid = this.#boundConversationId ?? request.conversationId;
+        await this.close("recycle", cause);
+        if (previousCid) detachAgyConversationBridgeMetadata(previousCid);
+      } else {
+        this.#reusedTurns += 1;
+      }
+    }
+    if (request.conversationId && !request.agent) {
+      detachAgyConversationBridgeMetadata(request.conversationId);
     }
     if (request.signal?.aborted) return abortOutcome();
     if (this.#shutdown) throw new AgySpawnError("agy driver is shut down.", this.#stderrTail);
@@ -1177,6 +1186,8 @@ export class AgyDriverSession implements AgyTurnExecutor {
     turn.parkedWatchTimer = undefined;
     if (turn.abortHandler) turn.request.signal?.removeEventListener("abort", turn.abortHandler);
     this.#active = undefined;
+    const settledCid = turn.outcome.conversationId ?? this.#boundConversationId;
+    if (settledCid) detachAgyConversationBridgeMetadata(settledCid);
     const child = this.#child;
     // Both successful and failed terminal results can leave ACTIVE tools.
     // Quarantine this process immediately, but let outstanding commands handle
