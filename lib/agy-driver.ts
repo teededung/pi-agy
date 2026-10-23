@@ -591,8 +591,10 @@ export class AgyDriverSession implements AgyTurnExecutor {
     });
   }
 
-  #armTurnTimers(turn: ActiveTurn): void {
+  #armOverallTimer(turn: ActiveTurn): void {
     const overallMs = turn.request.timeoutMs ?? 1_800_000;
+    turn.deadlineAt = performance.now() + overallMs;
+    if (turn.overallTimer) clearTimeout(turn.overallTimer);
     turn.overallTimer = setTimeout(() => {
       if (this.#active !== turn || !this.#child) return;
       void this.#terminateTurn(turn, {
@@ -602,6 +604,10 @@ export class AgyDriverSession implements AgyTurnExecutor {
         ),
       });
     }, overallMs);
+  }
+
+  #armTurnTimers(turn: ActiveTurn): void {
+    this.#armOverallTimer(turn);
 
     turn.thoughtPollTimer = setInterval(() => {
       if (this.#active !== turn) return;
@@ -850,6 +856,7 @@ export class AgyDriverSession implements AgyTurnExecutor {
         turn.lastSubagentUpdateMs = subagents.newestUpdateMs;
         turn.stallGraces = 0;
         turn.silenceMs = 0;
+        this.#armOverallTimer(turn);
         this.#log(`stall:subagents-alive:progress:${subagents.aliveCount}`);
         this.#scheduleGraceCheck(turn, this.#stallBudgetMs(turn), epoch);
         return;

@@ -30,6 +30,7 @@ export interface AgySubagentWorkerEntry {
   durationSeconds?: number;
   spawnStepIndex?: number;
   lastActivity?: string;
+  lastAction?: string;
   lastStepIndex?: number;
   lastUpdatedAtMs?: number;
 }
@@ -38,6 +39,8 @@ export interface AgySubagentEntry {
   key: string;
   /** Subagent name from the call args, or the tool name when absent. */
   name: string;
+  /** Underlying subagent typeName (e.g. `teamwork_preview`, `DeepCoder`, `DeepInvestigator`). */
+  typeName?: string;
   /** Tool that produced the entry (`invoke_subagent`, `run_subagent`, …). */
   tool: string;
   status: AgySubagentStatus;
@@ -50,6 +53,8 @@ export interface AgySubagentEntry {
   detail?: string;
   /** Latest observed step/tool progress from subagent (or nested worker) transcript. */
   lastActivity?: string;
+  /** Latest observed action on this root subagent's own transcript. */
+  ownLastAction?: string;
   /** Latest observed step index in the active subagent/worker transcript. */
   lastStepIndex?: number;
   /** Timestamp (ms) of the latest transcript/db update in the subagent subtree. */
@@ -131,6 +136,24 @@ function pickName(args: Record<string, unknown>, tool: string): string {
       "role",
     ]) ?? tool
   );
+}
+
+function pickTypeName(args: Record<string, unknown>): string | undefined {
+  const sub = pickSubagentRecord(args);
+  if (sub) {
+    const typeName = pickArg(sub, ["TypeName", "typeName", "Type", "type", "Subagent", "subagent"]);
+    if (typeName) return typeName;
+  }
+  return pickArg(args, [
+    "TypeName",
+    "typeName",
+    "Type",
+    "type",
+    "Subagent",
+    "subagent",
+    "subagent_name",
+    "SubagentName",
+  ]);
 }
 
 function pickDetail(args: Record<string, unknown>): string | undefined {
@@ -291,9 +314,11 @@ export function trackAgySubagent(
   const key = agyToolStepKey({ stepId: activity.stepId, name: `${tool}:${pickName(args, tool)}` });
   if (activity.type === "tool_start") {
     if (!roster.has(key)) {
+      const typeName = pickTypeName(args);
       roster.set(key, {
         key,
         name: pickName(args, tool),
+        ...(typeName ? { typeName } : {}),
         tool,
         status: "running",
         startedAtMs: now,
@@ -385,13 +410,16 @@ function describeTranscriptToolCall(toolCall: Record<string, unknown>): string |
   if (action) {
     return `${name}: ${action.slice(0, 72)}`;
   }
+  const commandLine = cleanTranscriptString(args.CommandLine);
+  if (commandLine) {
+    return `${name}: ${commandLine.slice(0, 60)}`;
+  }
   const target =
     cleanTranscriptString(args.AbsolutePath) ??
     cleanTranscriptString(args.TargetFile) ??
     cleanTranscriptString(args.DirectoryPath) ??
     cleanTranscriptString(args.SearchPath) ??
-    cleanTranscriptString(args.Query) ??
-    cleanTranscriptString(args.CommandLine);
+    cleanTranscriptString(args.Query);
   if (target) {
     const shortTarget = target.includes("/") ? path.basename(target) || target : target;
     return `${name}: ${shortTarget.slice(0, 60)}`;
@@ -662,6 +690,14 @@ export async function syncAgySubagentRoster(
             entry.conversationId = cid;
             changed = true;
           }
+          if (typeName && entry.typeName !== typeName) {
+            entry.typeName = typeName;
+            changed = true;
+          }
+          if (role && entry.name === typeName && role !== typeName) {
+            entry.name = role;
+            changed = true;
+          }
         } else {
           const name = role ?? typeName ?? "subagent";
           const key = agyToolStepKey({
@@ -671,6 +707,7 @@ export async function syncAgySubagentRoster(
           roster.set(key, {
             key,
             name,
+            ...(typeName ? { typeName } : {}),
             tool: "invoke_subagent",
             status: "running",
             startedAtMs: mtimeMs,
@@ -709,7 +746,7 @@ export async function syncAgySubagentRoster(
       { latestServerRestartMs: number; completedByMessage: Map<string, number> }
     >();
 
-    while (queue.length > 0 && visited.size < 32) {
+    while (queue.length > 0 && visited.size < 128) {
       const current = queue.shift()!;
       if (visited.has(current.cid)) continue;
       visited.add(current.cid);
@@ -723,8 +760,14 @@ export async function syncAgySubagentRoster(
       );
       const snap = await readTranscriptTailSnapshot(transcriptPath, current.cid, current.role);
       if (snap) {
-        if (current.cid === rootCid && snap.firstStepMs && snap.firstStepMs < entry.startedAtMs) {
-          entry.startedAtMs = snap.firstStepMs;
+        if (current.cid === rootCid) {
+          if (snap.firstStepMs && snap.firstStepMs < entry.startedAtMs) {
+            entry.startedAtMs = snap.firstStepMs;
+          }
+          if (snap.lastAction && entry.ownLastAction !== snap.lastAction) {
+            entry.ownLastAction = snap.lastAction;
+            changed = true;
+          }
         }
         newestUpdateMs = Math.max(newestUpdateMs, snap.lastStepMs);
         if (
@@ -771,6 +814,7 @@ export async function syncAgySubagentRoster(
               : Math.max(0, ((resolved.endMs ?? workerNewestMs) - workerStartedMs) / 1000),
           spawnStepIndex: current.spawnStepIndex,
           lastActivity: workerActivity,
+          lastAction: snap?.lastAction,
           lastStepIndex: snap?.lastStepIndex,
           lastUpdatedAtMs: workerNewestMs,
         });
@@ -830,9 +874,15 @@ export async function syncAgySubagentRoster(
             // ignore
           }
         }
-        childItems.sort(
-          (a, b) => (a.spawnStepIndex ?? Number.MAX_SAFE_INTEGER) - (b.spawnStepIndex ?? Number.MAX_SAFE_INTEGER),
-        );
+        childItems.sort((a, b) => {
+          const aAlive = a.state === "SUBAGENT_STATE_ALIVE" ? 0 : 1;
+          const bAlive = b.state === "SUBAGENT_STATE_ALIVE" ? 0 : 1;
+          if (aAlive !== bAlive) return aAlive - bAlive;
+          return (
+            (a.spawnStepIndex ?? Number.MAX_SAFE_INTEGER) -
+            (b.spawnStepIndex ?? Number.MAX_SAFE_INTEGER)
+          );
+        });
         for (const item of childItems) {
           queue.push({ ...item, parentCid: current.cid });
         }
@@ -1434,6 +1484,69 @@ export function summarizeAgySubagentsWidget(
     latest.durationSeconds ?? Math.max(0, (now - latest.startedAtMs) / 1000),
   );
   return `${entries.length} tracked (${latest.status} · ${elapsed})`;
+}
+
+function formatAgentPreviewLabel(name: string, typeName?: string): string {
+  const trimmedName = name.trim() || "subagent";
+  const trimmedType = typeName?.trim();
+  if (trimmedType && trimmedType.toLowerCase() !== trimmedName.toLowerCase()) {
+    return `Agent(${trimmedType}: ${trimmedName})`;
+  }
+  return `Agent(${trimmedName})`;
+}
+
+function cleanAgentPreviewAction(raw?: string): string {
+  if (!raw) return "Working";
+  const strippedStep = raw
+    .replace(/^(?:worker\s+[0-9a-f-]+\s*·\s*)?(?:step\s+\d+\s*(?:·\s*)?)?/i, "")
+    .trim();
+  const strippedTool = strippedStep.replace(/^[a-z0-9_]+:\s+/i, "").trim();
+  return strippedTool || strippedStep || "Working";
+}
+
+/**
+ * Multi-line live preview rows for running subagents and nested workers
+ * (used by both `/boost` and `/teamwork` in the main session widget),
+ * matching agy native's `• Agent(typeName: Role) <action> • <elapsed>` stack.
+ */
+export function formatAgySubagentsLivePreviewLines(
+  roster: Map<string, AgySubagentEntry>,
+  now = Date.now(),
+  theme?: { fg(color: string, text: string): string },
+): string[] {
+  const lines: string[] = [];
+  const pushRow = (
+    name: string,
+    typeName: string | undefined,
+    rawAction: string | undefined,
+    startedAtMs: number,
+  ) => {
+    const label = formatAgentPreviewLabel(name, typeName);
+    const action = cleanAgentPreviewAction(rawAction);
+    const elapsed = formatSubagentElapsed(Math.max(0, (now - startedAtMs) / 1000));
+    lines.push(
+      theme
+        ? `${theme.fg("accent", "• ")}${theme.fg("text", label)} ${theme.fg("dim", `${action} • ${elapsed}`)}`
+        : `• ${label} ${action} • ${elapsed}`,
+    );
+  };
+  for (const entry of roster.values()) {
+    const runningWorkers = (entry.workers ?? []).filter((w) => w.status === "running");
+    // Render deepest/newest workers first so the stack matches agy native's TUI.
+    for (let i = runningWorkers.length - 1; i >= 0; i -= 1) {
+      const w = runningWorkers[i]!;
+      pushRow(w.name, w.typeName, w.lastAction ?? w.lastActivity, w.startedAtMs);
+    }
+    if (entry.status === "running") {
+      pushRow(
+        entry.name,
+        entry.typeName,
+        entry.ownLastAction ?? entry.lastActivity ?? entry.detail,
+        entry.startedAtMs,
+      );
+    }
+  }
+  return lines;
 }
 
 /** One line per entry plus a header; empty roster returns undefined. */
