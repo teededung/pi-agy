@@ -42,6 +42,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { loadBtwExtensionResources, readBtwExtensionSources, readBtwWorkspaceMode } from "./btw-extension-tools.ts";
 import { createBtwSshWorkspace, type BtwSshWorkspace } from "./btw-ssh-workspace.ts";
+import { AGY_BTW_INTERCEPT_EVENT, type AgyBtwInterceptPayload } from "../lib/subagents.ts";
 
 export const BTW_COMMANDS = [
   { name: "btw", description: "Continue a side conversation in a focused BTW modal. Add --save to also persist a visible note." },
@@ -3826,6 +3827,20 @@ export default function (pi: ExtensionAPI) {
     invalidateBtwLifecycle();
     await disposeBtwSession();
     dismissOverlay();
+  });
+
+  pi.events.on(AGY_BTW_INTERCEPT_EVENT, (raw) => {
+    const payload = raw as AgyBtwInterceptPayload<ExtensionContext> | undefined;
+    if (!payload?.text || !payload.ctx) return;
+    payload.handled = true;
+    if (overlayMinimized) {
+      if (overlayRuntime?.handle) {
+        restoreOverlay(payload.ctx);
+      } else {
+        overlayMinimized = false;
+      }
+    }
+    payload.promise = submitFromOverlay(payload.ctx, payload.text);
   });
 
   for (const shortcut of BTW_FOCUS_SHORTCUTS) {

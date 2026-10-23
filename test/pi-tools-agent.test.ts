@@ -14,6 +14,7 @@ import { createPiToolsAgent } from "../lib/pi-tools-agent.ts";
 import { formatAgyCall } from "../lib/render.ts";
 import {
   formatAgySubagentsLivePreviewLines,
+  shouldInterceptSubagentSteerInput,
   syncAgySubagentRoster,
   trackAgySubagent,
   type AgySubagentEntry,
@@ -23,6 +24,7 @@ import {
   contextHasPriorBoostActivity,
   contextHasPriorTeamworkActivity,
 } from "../src/provider.ts";
+import { AntigravityRuntime, createAntigravityRuntime } from "../src/runtime.ts";
 
 test("tool mode defaults to pi and the startup flag overrides the environment", () => {
   assert.equal(readAgyToolMode(undefined, {}), "pi");
@@ -388,4 +390,189 @@ test("read_file, edit_file, and write_file render with Pi native read:start-end 
   assert.equal(isAgyEditTool("edit_file"), true);
   assert.equal(isAgyEditTool("write_file"), true);
 });
+
+test("AntigravityRuntime starts a fresh conversation with historyBootstrap when switching between pi-tools custom agent and Boost/Teamwork default agent", async () => {
+  const seenRequests: Array<{
+    conversationId?: string;
+    agent?: string;
+    prompt: string;
+  }> = [];
+
+  let nextId = 1;
+  const runtime = createAntigravityRuntime(async (request) => {
+    seenRequests.push({
+      conversationId: request.conversationId,
+      agent: request.agent,
+      prompt: request.prompt,
+    });
+    const cid = request.conversationId ?? `conv-${nextId++}`;
+    request.onConversation?.(cid);
+    request.onActivity?.({
+      type: "result",
+      status: "OK",
+      conversationId: cid,
+    });
+    return {
+      status: "OK",
+      conversationId: cid,
+      text: "done",
+      steps: [],
+      usage: { input_tokens: 10, output_tokens: 5 },
+    };
+  });
+
+  try {
+    const service = runtime.runSync(AntigravityRuntime);
+
+    // Turn 1: normal pi-tools custom agent turn creates conv-1
+    const c1 = await runtime.runPromise(
+      service.beginStreamTurn({
+        prompt: "hello",
+        modelId: "claude-opus-4-6-thinking",
+        agent: "pi-tools-test",
+      }),
+    );
+    while (!c1.isClosed() || c1.hasPending()) {
+      await c1.next();
+    }
+    await runtime.runPromise(service.finishTurn);
+
+    // Turn 1b: continuing with the same pi-tools agent reuses conv-1
+    const c1b = await runtime.runPromise(
+      service.beginStreamTurn({
+        prompt: "follow up",
+        historyBootstrap: "HIST_1B",
+        modelId: "claude-opus-4-6-thinking",
+        agent: "pi-tools-test",
+      }),
+    );
+    while (!c1b.isClosed() || c1b.hasPending()) {
+      await c1b.next();
+    }
+    await runtime.runPromise(service.finishTurn);
+
+    // Turn 2: /boost turn drops custom agent (agent: undefined) -> must start conv-2 with historyBootstrap
+    const c2 = await runtime.runPromise(
+      service.beginStreamTurn({
+        prompt: "BOOST_PROMPT\n\ninvestigate auth",
+        historyBootstrap: "HIST_BEFORE_BOOST",
+        modelId: "claude-opus-4-6-thinking",
+        agent: undefined,
+      }),
+    );
+    // Re-attaching with identical prompt (simulating mid-turn tool step) returns the same controller
+    const c2Reattached = await runtime.runPromise(
+      service.beginStreamTurn({
+        prompt: "BOOST_PROMPT\n\ninvestigate auth",
+        historyBootstrap: "HIST_BEFORE_BOOST",
+        modelId: "claude-opus-4-6-thinking",
+        agent: undefined,
+      }),
+    );
+    assert.equal(c2Reattached, c2);
+    while (!c2.isClosed() || c2.hasPending()) {
+      await c2.next();
+    }
+    await runtime.runPromise(service.finishTurn);
+
+    // Turn 3: next normal turn restores pi-tools custom agent -> must start conv-3 with historyBootstrap
+    const c3 = await runtime.runPromise(
+      service.beginStreamTurn({
+        prompt: "back to normal",
+        historyBootstrap: "HIST_AFTER_BOOST",
+        modelId: "claude-opus-4-6-thinking",
+        agent: "pi-tools-test",
+      }),
+    );
+    while (!c3.isClosed() || c3.hasPending()) {
+      await c3.next();
+    }
+    await runtime.runPromise(service.finishTurn);
+
+    assert.equal(seenRequests.length, 4);
+    assert.equal(seenRequests[0].conversationId, undefined);
+    assert.equal(seenRequests[0].agent, "pi-tools-test");
+
+    assert.equal(seenRequests[1].conversationId, "conv-1");
+    assert.equal(seenRequests[1].agent, "pi-tools-test");
+    assert.equal(seenRequests[1].prompt.includes("HIST_1B"), false);
+
+    assert.equal(seenRequests[2].conversationId, undefined);
+    assert.equal(seenRequests[2].agent, undefined);
+    assert.equal(seenRequests[2].prompt.includes("HIST_BEFORE_BOOST"), true);
+
+    assert.equal(seenRequests[3].conversationId, undefined);
+    assert.equal(seenRequests[3].agent, "pi-tools-test");
+    assert.equal(seenRequests[3].prompt.includes("HIST_AFTER_BOOST"), true);
+  } finally {
+    await runtime.dispose();
+  }
+});
+
+test("shouldInterceptSubagentSteerInput routes interactive Enter steer to /btw only during active Boost/Teamwork/subagent turns", () => {
+  const base = {
+    source: "interactive",
+    streamingBehavior: "steer",
+    text: "  what does this helper do?  ",
+    hasImages: false,
+    provider: "antigravity",
+    agyAgentActive: true,
+    isBoostActive: true,
+    isTeamworkActive: false,
+    subagentSpawnedThisTurn: false,
+  };
+
+  assert.equal(shouldInterceptSubagentSteerInput(base), "what does this helper do?");
+  assert.equal(
+    shouldInterceptSubagentSteerInput({
+      ...base,
+      isBoostActive: false,
+      isTeamworkActive: true,
+    }),
+    "what does this helper do?",
+  );
+  assert.equal(
+    shouldInterceptSubagentSteerInput({
+      ...base,
+      isBoostActive: false,
+      subagentSpawnedThisTurn: true,
+    }),
+    "what does this helper do?",
+  );
+
+  // Alt+Enter follow-up still queues for the main session
+  assert.equal(
+    shouldInterceptSubagentSteerInput({ ...base, streamingBehavior: "followUp" }),
+    undefined,
+  );
+  // Idle submission (streamingBehavior undefined) goes to main session
+  assert.equal(
+    shouldInterceptSubagentSteerInput({ ...base, streamingBehavior: undefined }),
+    undefined,
+  );
+  // Ordinary non-Boost/non-Teamwork/non-subagent turns keep normal steer behavior
+  assert.equal(
+    shouldInterceptSubagentSteerInput({ ...base, isBoostActive: false }),
+    undefined,
+  );
+  // Slash commands, bash commands, images, and non-interactive inputs are never intercepted
+  assert.equal(
+    shouldInterceptSubagentSteerInput({ ...base, text: "/agy-subagents" }),
+    undefined,
+  );
+  assert.equal(
+    shouldInterceptSubagentSteerInput({ ...base, text: "!git status" }),
+    undefined,
+  );
+  assert.equal(
+    shouldInterceptSubagentSteerInput({ ...base, hasImages: true }),
+    undefined,
+  );
+  assert.equal(
+    shouldInterceptSubagentSteerInput({ ...base, source: "extension" }),
+    undefined,
+  );
+});
+
+
 

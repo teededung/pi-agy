@@ -1599,3 +1599,52 @@ export function formatAgySubagents(
   }
   return lines.join("\n");
 }
+
+export const AGY_BTW_INTERCEPT_EVENT = "antigravity:btw-intercept";
+
+export interface AgyBtwInterceptPayload<TCtx = unknown> {
+  text: string;
+  ctx: TCtx;
+  handled?: boolean;
+  promise?: Promise<void>;
+}
+
+export interface SubagentSteerInterceptCheck {
+  source: string;
+  streamingBehavior?: string;
+  text: string;
+  hasImages?: boolean;
+  provider?: string;
+  agyAgentActive: boolean;
+  isBoostActive: boolean;
+  isTeamworkActive: boolean;
+  subagentSpawnedThisTurn: boolean;
+}
+
+/**
+ * Return trimmed text when an interactive Enter ("steer") submission during an
+ * active Antigravity Boost/Teamwork/subagent turn should be routed to /btw
+ * instead of stalling in Pi's steer queue until all subagents finish.
+ */
+export function shouldInterceptSubagentSteerInput(
+  check: SubagentSteerInterceptCheck,
+): string | undefined {
+  if (check.source !== "interactive" || check.streamingBehavior !== "steer") {
+    return undefined;
+  }
+  if (check.hasImages) {
+    return undefined;
+  }
+  if (check.provider !== "antigravity" || !check.agyAgentActive) {
+    return undefined;
+  }
+  if (!check.isBoostActive && !check.isTeamworkActive && !check.subagentSpawnedThisTurn) {
+    return undefined;
+  }
+  const trimmed = check.text.trim();
+  if (!trimmed || trimmed.startsWith("/") || trimmed.startsWith("!")) {
+    return undefined;
+  }
+  return trimmed;
+}
+

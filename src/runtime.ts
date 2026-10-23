@@ -219,6 +219,8 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
     let conversationUsage: AgyUsage = {};
     /** The cwd the conversation was created in — agy pins conversations to their workspace. */
     let conversationCwd: string | undefined;
+    /** The `--agent` profile the conversation was created with — agy pins custom agent specs per conversation. */
+    let conversationAgent: string | undefined;
     let model: string | undefined;
     // pi loads extensions with the session directory as process cwd; session_start
     // refreshes this, but the default keeps print mode and early turns correct.
@@ -285,6 +287,7 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                 conversationId = undefined;
                 conversationUsage = {};
                 conversationCwd = undefined;
+                conversationAgent = undefined;
                 turns = 0;
                 restoreHistoryOnNextConversation = true;
                 restoredConversationPending = false;
@@ -302,6 +305,7 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
               conversationId = state.conversationId;
               conversationUsage = { ...state.usage };
               conversationCwd = state.cwd;
+              conversationAgent = undefined;
               model = state.modelId;
               cwd = state.cwd;
               turns = state.turns;
@@ -329,15 +333,27 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                 return active;
               }
               if (active) invalidateActiveTurn();
-              // agy pins a conversation to the workspace it was created in:
-              // resuming it from another directory silently writes into the
-              // OLD workspace (verified 2026-08-21) or rejects writes with
-              // "not a valid artifact path". Start fresh when the project
-              // changed instead of carrying a stale workspace binding.
-              if (conversationId && conversationCwd !== cwd) {
+              // agy pins a conversation to the workspace and `--agent` profile it
+              // was created with:
+              // - Resuming it from another directory silently writes into the OLD
+              //   workspace (verified 2026-08-21) or rejects writes with
+              //   "not a valid artifact path".
+              // - Resuming a custom `--agent` conversation (`pi-tools-...`) without
+              //   `--agent` (for `/boost` or `/teamwork`) still reuses the stored
+              //   CustomAgentConfig on the backend (`hasExistingCustomAgent`),
+              //   where BuiltinNames (`DeepCoder`, `DeepInvestigator`,
+              //   `teamwork_preview`) are empty. Conversely, passing `--agent` on a
+              //   default-agent conversation permanently binds the custom agent to
+              //   that conversation.
+              // Start fresh with Pi history bootstrap when either binding changes.
+              if (
+                conversationId &&
+                (conversationCwd !== cwd || conversationAgent !== request.agent)
+              ) {
                 conversationId = undefined;
                 conversationUsage = {};
                 conversationCwd = undefined;
+                conversationAgent = undefined;
                 restoreHistoryOnNextConversation = true;
                 restoredConversationPending = false;
                 lastBootstrappedSkillsSuffix = undefined;
@@ -462,6 +478,7 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                   // resolve, and /agy-tasks needs the id meanwhile.
                   conversationId = id;
                   conversationCwd = cwd;
+                  conversationAgent = request.agent;
                 },
                 onActivity: (activity) => {
                   if (turnGeneration !== generation || turnAbort.signal.aborted) return;
@@ -498,6 +515,7 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                   conversationId = undefined;
                   conversationUsage = {};
                   conversationCwd = undefined;
+                  conversationAgent = undefined;
                   restoredConversationPending = false;
                   restoreHistoryOnNextConversation = true;
                   lastSentSystemPrompt = undefined;
@@ -593,6 +611,7 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                         conversationId = undefined;
                         conversationUsage = {};
                         conversationCwd = undefined;
+                        conversationAgent = undefined;
                         restoredConversationPending = false;
                         restoreHistoryOnNextConversation = true;
                         lastSentSystemPrompt = undefined;
@@ -629,6 +648,8 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                   turns += 1;
                   if (outcome.conversationId) {
                     conversationId = outcome.conversationId;
+                    conversationCwd = cwd;
+                    conversationAgent = request.agent;
                     restoreHistoryOnNextConversation = false;
                   }
                   if (outcome.usage) conversationUsage = { ...outcome.usage };
@@ -673,6 +694,7 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
             conversationId = undefined;
             conversationUsage = {};
             conversationCwd = undefined;
+            conversationAgent = undefined;
             turns = 0;
             restoreHistoryOnNextConversation = false;
             restoredConversationPending = false;
@@ -703,6 +725,7 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
               conversationId = undefined;
               conversationUsage = {};
               conversationCwd = undefined;
+              conversationAgent = undefined;
               restoredConversationPending = false;
               lastBootstrappedSkillsSuffix = undefined;
               await recycle("shutdown");
