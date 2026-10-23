@@ -90,7 +90,8 @@ const LIMIT_KEYS = ["limit", "Limit"] as const;
  */
 export function mapAgyToolToNative(tool: string, args: JsonObject): NativeToolCall | undefined {
   switch (tool) {
-    case "view_file": {
+    case "view_file":
+    case "read_file": {
       if (
         !onlyKeys(args, [
           ...VIEW_PATH_KEYS,

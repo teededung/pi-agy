@@ -415,6 +415,8 @@ function describeTranscriptToolCall(toolCall: Record<string, unknown>): string |
     return `${name}: ${commandLine.slice(0, 60)}`;
   }
   const target =
+    cleanTranscriptString(args.Path) ??
+    cleanTranscriptString(args.path) ??
     cleanTranscriptString(args.AbsolutePath) ??
     cleanTranscriptString(args.TargetFile) ??
     cleanTranscriptString(args.DirectoryPath) ??
@@ -1073,13 +1075,14 @@ function renderThemedToolCard(
       const secs =
         durationSeconds !== undefined ? theme.fg("muted", `(${durationSeconds.toFixed(2)}s)`) : "";
 
-      if (toolName === "view_file" && !isError) {
-        const rangeMatch = body.match(/Showing lines (\d+) to (\d+)/i);
+      if ((toolName === "view_file" || toolName === "read_file") && !isError) {
+        const rangeMatch = body.match(/Showing lines (\d+)(?: to |-)\s*(\d+)(?: of (\d+))?/i);
         const totalMatch = body.match(/Total Lines:\s*(\d+)/i);
+        const totalLines = rangeMatch?.[3] ?? totalMatch?.[1];
         const countLabel = rangeMatch
-          ? `lines ${rangeMatch[1]}–${rangeMatch[2]}${totalMatch ? ` of ${totalMatch[1]}` : ""}`
-          : totalMatch
-            ? `${totalMatch[1]} lines`
+          ? `lines ${rangeMatch[1]}–${rangeMatch[2]}${totalLines ? ` of ${totalLines}` : ""}`
+          : totalLines
+            ? `${totalLines} lines`
             : "";
         const statusParts = [icon, countLabel ? theme.fg("muted", countLabel) : "", secs].filter(
           Boolean,

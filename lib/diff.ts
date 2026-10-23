@@ -15,7 +15,9 @@ function resolvePath(filePath: string, cwd: string): string {
 const EDIT_TOOLS = new Set([
   "replace_file_content",
   "multi_replace_file_content",
+  "edit_file",
   "write_to_file",
+  "write_file",
   "sed_file",
 ]);
 
@@ -113,6 +115,8 @@ const FILE_PATH_KEYS = [
 ];
 
 const TARGET_CONTENT_KEYS = [
+  "Target",
+  "target",
   "TargetContent",
   "target_content",
   "oldText",
@@ -122,6 +126,8 @@ const TARGET_CONTENT_KEYS = [
 ];
 
 const REPLACEMENT_CONTENT_KEYS = [
+  "Replacement",
+  "replacement",
   "ReplacementContent",
   "replacement_content",
   "newText",
@@ -397,7 +403,7 @@ export async function computeAgyToolDiff(
   const replacementContent = pickString(args, REPLACEMENT_CONTENT_KEYS);
   const startLine = pickNumber(args, START_LINE_KEYS);
 
-  if (tool === "replace_file_content" || tool === "sed_file") {
+  if (tool === "replace_file_content" || tool === "edit_file" || tool === "sed_file") {
     // 1. Try computing precise diff from full file on disk
     const diskDiff = await computeSingleReplaceDiff(
       filePath,
@@ -448,7 +454,7 @@ export async function computeAgyToolDiff(
     }
   }
 
-  if (tool === "write_to_file") {
+  if (tool === "write_to_file" || tool === "write_file") {
     if (replacementContent !== undefined) {
       const diskDiff = await computeWriteToFileDiff(
         filePath,

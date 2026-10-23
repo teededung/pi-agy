@@ -14,9 +14,12 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 const LABELS: Record<string, string> = {
   run_command: "bash",
   view_file: "read",
+  read_file: "read",
   write_to_file: "write",
+  write_file: "write",
   replace_file_content: "edit",
   multi_replace_file_content: "edit",
+  edit_file: "edit",
   sed_file: "edit",
   list_dir: "ls",
   find_by_name: "find",
@@ -155,7 +158,8 @@ export function formatAgyCall(tool: string, input: unknown, theme: Theme): strin
       }
       return formatted.join("\n");
     }
-    case "view_file": {
+    case "view_file":
+    case "read_file": {
       const startArg = pickNum(args, ["StartLine", "start_line", "startLine", "offset", "Offset"]);
       const end = pickNum(args, ["EndLine", "end_line", "endLine"]);
       const limit = pickNum(args, ["limit", "Limit"]);
@@ -169,8 +173,10 @@ export function formatAgyCall(tool: string, input: unknown, theme: Theme): strin
       return `${label} ${path(invalid)}${lineText}`;
     }
     case "write_to_file":
+    case "write_file":
     case "replace_file_content":
     case "multi_replace_file_content":
+    case "edit_file":
     case "sed_file":
     case "list_dir":
       return `${label} ${path(invalid)}`;

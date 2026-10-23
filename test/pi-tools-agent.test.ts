@@ -8,7 +8,10 @@ import {
   detachAgyConversationBridgeMetadata,
   sweepStalePiToolsConversations,
 } from "../lib/conversation-metadata.ts";
+import { isAgyEditTool } from "../lib/diff.ts";
+import { mapAgyToolToNative } from "../lib/native-tools.ts";
 import { createPiToolsAgent } from "../lib/pi-tools-agent.ts";
+import { formatAgyCall } from "../lib/render.ts";
 import {
   formatAgySubagentsLivePreviewLines,
   syncAgySubagentRoster,
@@ -352,3 +355,37 @@ test("contextHasPriorTeamworkActivity and contextHasPriorBoostActivity ignore no
   assert.equal(contextHasPriorTeamworkActivity(boostInvoke), false);
   assert.equal(contextHasPriorBoostActivity(boostInvoke), true);
 });
+
+test("read_file, edit_file, and write_file render with Pi native read:start-end warning range and edit/write labels", () => {
+  const mockTheme = {
+    fg: (color: string, text: string) => `<${color}>${text}</${color}>`,
+    bold: (text: string) => `<b>${text}</b>`,
+  } as unknown as Parameters<typeof formatAgyCall>[2];
+
+  assert.equal(
+    formatAgyCall(
+      "read_file",
+      { EndLine: 490, Path: "/tmp/runtime.ts", StartLine: 390 },
+      mockTheme,
+    ),
+    "<toolTitle><b>read</b></toolTitle> <accent>/tmp/runtime.ts</accent><warning>:390-490</warning>",
+  );
+  assert.equal(
+    formatAgyCall("edit_file", { Path: "/tmp/runtime.ts", Target: "a", Replacement: "b" }, mockTheme),
+    "<toolTitle><b>edit</b></toolTitle> <accent>/tmp/runtime.ts</accent>",
+  );
+  assert.equal(
+    formatAgyCall("write_file", { Path: "/tmp/runtime.ts", Content: "abc" }, mockTheme),
+    "<toolTitle><b>write</b></toolTitle> <accent>/tmp/runtime.ts</accent>",
+  );
+  assert.deepEqual(
+    mapAgyToolToNative("read_file", { EndLine: 490, Path: "/tmp/runtime.ts", StartLine: 390 }),
+    {
+      tool: "read",
+      args: { path: "/tmp/runtime.ts", offset: 390, limit: 101 },
+    },
+  );
+  assert.equal(isAgyEditTool("edit_file"), true);
+  assert.equal(isAgyEditTool("write_file"), true);
+});
+
