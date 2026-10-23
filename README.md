@@ -10,6 +10,8 @@ Use **Google Antigravity** (`agy`) models inside the [pi coding agent](https://p
 - [Features](#features)
   - [Consult another model (`/m`)](#consult-another-model-m)
   - [Boost mode (`/boost`)](#boost-mode-boost)
+  - [Teamwork mode (`/teamwork`)](#teamwork-mode-teamwork)
+  - [Side conversations (`/btw`)](#side-conversations-btw)
   - [Pi tools mode (`/agy-tools`)](#pi-tools-mode-agy-tools)
   - [Private MCP discovery](#private-mcp-discovery)
   - [MCP adapter migration](#mcp-adapter-migration)
@@ -20,7 +22,6 @@ Use **Google Antigravity** (`agy`) models inside the [pi coding agent](https://p
 - [Configuration flags](#configuration-flags)
 - [Terms of Service & account safety](#terms-of-service--account-safety)
 - [How it works](#how-it-works)
-- [Development](#development)
 - [Release notes](#release-notes)
 
 ## Installation
@@ -40,27 +41,29 @@ pi update git:github.com/teededung/pi-agy
 | Feature | What you get |
 | --- | --- |
 | **Persistent stream driver** | Ordinary user turns reuse one healthy `agy` process. Conversation, model, workspace, agent, mode, and bridge changes recycle it safely. |
-| **One-shot consult** (`/m`) | Ask another Antigravity model, at another thinking effort, for a single turn without changing your session model. |
-| **Boost** (`/boost`) | Multi-agent orchestration with `DeepCoder` and `DeepInvestigator` subagents. |
+| **One-shot consult** (`/m`) | Ask another Antigravity model or any configured Pi `provider/model` at another thinking effort for a single turn without changing your session model. |
+| **Boost & Teamwork** (`/boost`, `/teamwork`) | Multi-agent orchestration with `DeepCoder` / `DeepInvestigator` subagents (`/boost`), or two-phase collaborative planning and autonomous team execution (`/teamwork`). |
+| **Side conversations** (`/btw`) | Non-blocking side thread overlay (`Esc` / `Alt+m` to minimize) that runs in an isolated runtime without interrupting or polluting the main session. |
 | **Live thinking stream** (`/clear`) | Real-time reasoning traces from agy's state database. `/clear` resets the agy conversation and the Pi session together. |
 | **Diagnostics** (`/agy-doctor`) | Executable selection, version checks, driver counters, bridge revision, and conversation database, without spending model tokens. |
-| **Native rendering** | agy's read-only tools (`view_file`, `grep_search`, `find_by_name`, `list_dir`) re-run as real pi builtins (`read` / `grep` / `find` / `ls`) with live, accurate output. Everything else renders through one display-only `antigravity` wrapper. |
+| **Native rendering** | agy's read-only tools (`view_file`, `read_file`, `grep_search`, `find_by_name`, `list_dir`) re-run as real pi builtins (`read` / `grep` / `find` / `ls`) with live output, and file edits (`replace_file_content`, `edit_file`, `write_to_file`, `write_file`) render with unified diff previews. |
 | **Skills & MCP bridge** | Pi-private skills and Pi's MCP servers are reachable from agy under Pi's permissions, hooks, and rendering. |
 | **Pi tools mode** (`/agy-tools`) | agy works only through your active Pi tools. |
 | **Background tasks** (`/agy-tasks`) | Dashboard of long-running agy commands: status, pids, and log. |
-| **Artifacts & subagents** | `/agy-artifacts` lists generated files, media, and uploads. `/agy-subagents` inspects live workers and logs. |
+| **Artifacts & subagents** | `/agy-artifacts` lists generated files, media, and uploads. `/agy-subagents` inspects live workers and logs with a real-time progress stack above the editor. |
 | **Model quotas** (`/agy-usage`) | Weekly and 5-hour remaining bars per model group, refreshed without spending tokens. |
 
 ## Commands
 
 | Command | What it does |
 | --- | --- |
-| `/m <spec> <msg>` | One-shot model & effort consult: `/m <opus\|sonnet\|argon\|flash>[1\|2\|3] <prompt>` (`1`=low, `2`=mid, `3`=high) |
+| `/m <spec> <msg>` | One-shot model & effort consult: `/m <opus\|sonnet\|argon\|flash\|provider/model>[1\|2\|3] <prompt>` (`1`=low, `2`=mid, `3`=high) |
 | `/consult` | Alias for `/m` (also `/agy-consult`) |
 | `/boost` | Toggle Boost multi-agent mode, or run a single task with the orchestrator (`/boost <task>`) |
 | `/agy-boost` | Alias for `/boost` |
 | `/teamwork` | Toggle Teamwork two-phase multi-agent mode (`prompt_draft.md` crafting → `teamwork_preview` orchestration), or start a project (`/teamwork <idea>`) |
 | `/agy-teamwork` | Alias for `/teamwork` |
+| `/btw [prompt]` | Open or ask in a non-blocking side-conversation overlay (alias `/side`, subcommands `/btw:model`, `/btw:thinking`, `/btw:copy`, `/btw:new`) |
 | `/clear [prompt]` | Clear the agy conversation and start a fresh Pi session (optionally sending an initial prompt) |
 | `/rename [name]` | Set or view the session display name (alias for `/name`, immediately synced to agy conversation metadata) |
 | `/agy` | Conversation title/status (id, model, turns, process, native context) |
@@ -69,7 +72,7 @@ pi update git:github.com/teededung/pi-agy
 | `/agy-models` | Re-discover models and re-register the provider |
 | `/agy-agents` | List configured custom agy agents without inference |
 | `/agy-doctor` | Diagnose all binary candidates/selection, models, driver spawn/recycle counters, bridge, and conversation state |
-| `/agy-subagents` | Interactive dashboard of agy subagents & Boost workers (`list` for text summary) |
+| `/agy-subagents` | Interactive dashboard of agy subagents & Boost/Teamwork workers (`list` for text summary) |
 | `/agy-tasks` | Background-task dashboard (`stop <task-id>\|all` for scripts) |
 | `/agy-artifacts` | Artifact browser (`open <name>` for scripts) |
 | `/agy-usage` | Interactive model quotas dashboard (weekly and 5-hour remaining per group) |
@@ -78,11 +81,12 @@ pi update git:github.com/teededung/pi-agy
 
 ### Consult another model (`/m`)
 
-Consult another Antigravity model and thinking effort for one turn only. Your session model does not change, and the message shows a `Consulted <Model> (<effort>)` badge.
+Consult another Antigravity model (or any configured Pi `provider/model`) and thinking effort for one turn only. Your session model does not change, and the message shows a `Consulted <Model> (<effort>)` badge.
 
 ```text
 /m opus3 review this diff
 /m flash1 quick check
+/m provider/model2 second opinion
 ```
 
 ### Boost mode (`/boost`)
@@ -103,13 +107,30 @@ Ways to use it:
 
 When Boost is toggled off, Solo mode is restored automatically (`BOOST_DEACTIVATED_PROMPT`), and hallucinated `<MESSAGE_RECEIVED>` turn boundaries are stripped.
 
+### Teamwork mode (`/teamwork`)
+
+Port of Antigravity's native `/teamwork` two-phase workflow:
+
+1. **Phase 1 — Prompt crafting**: Collaboratively refines requirements into a `prompt_draft.md` artifact and asks for confirmation before launching agents.
+2. **Phase 2 — Autonomous team orchestration**: Once approved, delegates across specialized teammates (`define_subagent` / `invoke_subagent`) to implement and verify the plan end-to-end.
+
+Use `/teamwork <idea>` to start a project, or `/teamwork` (`on` / `off` / `status`) to control session-wide Teamwork mode (`[teamwork]` in the status bar).
+
+### Side conversations (`/btw`)
+
+Ask tangential questions without interrupting a running main turn or polluting the main conversation context:
+
+- `/btw <question>` opens the side-conversation overlay (or queues the question) using an isolated runtime.
+- Press `Esc` or `Alt+m` while streaming to minimize `/btw` into a compact status bar above the editor and keep working in the main session; press `Alt+m`, `Alt+/`, or `/btw` to restore.
+- Prefix a prompt with `@<model>[1|2|3]` or use `/btw:model` (`Alt+p`) to pick a specific model and thinking effort for the side thread.
+
 ### Pi tools mode (`/agy-tools`)
 
 Pi tools mode is the default (turn it off with `/agy-tools off`).
 
 | Mode | Behavior |
 | --- | --- |
-| **Native** | agy uses its own tools for files, shell, and web. Extension tools from other Pi packages (such as `pi-web-access`) stay on the Pi side and agy does not see them. |
+| **Native** | agy uses its own tools for files, shell, and web. Extension tools from other Pi packages stay on the Pi side and agy does not see them. |
 | **Pi** | agy runs through a session-owned agent with no native tools. It sees every active Pi builtin, extension (for example `web_search`, `fetch_content`), and MCP tool under an MCP prefix (`pi__read`, `pi__web_search`, ...). Pi runs each call, so hooks and permissions apply. |
 
 Controls:
@@ -187,7 +208,7 @@ Long-running commands (dev servers, watchers) become agy background tasks. A hin
 
 ### Artifacts and subagents
 
-Images and files agy creates land in a per-conversation artifact store, browsed with `/agy-artifacts`. Subagents invoked during orchestration or `/boost` are tracked from the stream and inspected with `/agy-subagents`. A hint appears when either exists:
+Images and files agy creates land in a per-conversation artifact store, browsed with `/agy-artifacts`. Subagents invoked during orchestration, `/boost`, or `/teamwork` are tracked from the stream (with a live multi-line status stack while workers are running) and inspected with `/agy-subagents`. A hint appears when either exists:
 
 ```text
 ◆ 1 agy artifact • /agy-artifacts to view
@@ -316,10 +337,6 @@ flowchart TB
     Prov -- "result back to agy" --> Bridge
     Skills -- "pi-private skills become\npi__activate_skill" --> Bridge
 ```
-
-## Development
-
-Reference: [Pi-cursor-sdk](https://github.com/fitchmultz/pi-cursor-sdk)
 
 ## Release notes
 
