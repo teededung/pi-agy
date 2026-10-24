@@ -391,21 +391,61 @@ test("read_file, edit_file, and write_file render with Pi native read:start-end 
   assert.equal(isAgyEditTool("write_file"), true);
 });
 
-test("AntigravityRuntime keeps the same conversationId when switching between pi-tools custom agent and Boost/Teamwork default agent", async () => {
+test("AntigravityRuntime keeps the same conversationId and attaches/detaches pi-tools metadata when switching between pi-tools custom agent and Boost/Teamwork default agent", async (t) => {
+  const home = await mkdtemp(path.join(tmpdir(), "pi-agy-switch-home-"));
+  const prevHome = process.env.HOME;
+  process.env.HOME = home;
+  t.after(async () => {
+    process.env.HOME = prevHome;
+    await rm(home, { recursive: true, force: true });
+  });
+
+  const convDir = path.join(home, ".gemini", "antigravity-cli", "conversations");
+  await mkdir(convDir, { recursive: true });
+  const conv1 = "11111111-2222-4333-8444-555555555555";
+  const convDbPath = path.join(convDir, `${conv1}.db`);
+
+  const readHasPiTools = (): boolean => {
+    const db = new DatabaseSync(convDbPath, { readOnly: true });
+    try {
+      const row = db
+        .prepare("SELECT data FROM trajectory_metadata_blob WHERE id = 'main'")
+        .get() as { data?: Uint8Array } | undefined;
+      return row?.data ? Buffer.from(row.data).includes("pi-tools-test") : false;
+    } finally {
+      db.close();
+    }
+  };
+
   const seenRequests: Array<{
     conversationId?: string;
     agent?: string;
     prompt: string;
+    hasPiToolsInDb: boolean;
   }> = [];
 
-  let nextId = 1;
   const runtime = createAntigravityRuntime(async (request) => {
+    const cid = request.conversationId ?? conv1;
+    if (!request.conversationId) {
+      const db = new DatabaseSync(convDbPath);
+      db.exec("CREATE TABLE IF NOT EXISTS trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB)");
+      const initialBlob = Buffer.concat([
+        pbField(1, "file:///Users/test/repo/lani-web"),
+        pbField(4, "pi-tools-test"),
+        pbField(6, cid),
+        pbField(10, "file:///Users/test/.agents/agents/pi-tools-test/agent.md"),
+      ]);
+      db.prepare("INSERT OR REPLACE INTO trajectory_metadata_blob (id, data) VALUES ('main', ?)").run(
+        initialBlob,
+      );
+      db.close();
+    }
     seenRequests.push({
       conversationId: request.conversationId,
       agent: request.agent,
       prompt: request.prompt,
+      hasPiToolsInDb: readHasPiTools(),
     });
-    const cid = request.conversationId ?? `conv-${nextId++}`;
     request.onConversation?.(cid);
     request.onActivity?.({
       type: "result",
@@ -424,7 +464,7 @@ test("AntigravityRuntime keeps the same conversationId when switching between pi
   try {
     const service = runtime.runSync(AntigravityRuntime);
 
-    // Turn 1: normal pi-tools custom agent turn creates conv-1
+    // Turn 1: normal pi-tools custom agent turn creates conv1
     const c1 = await runtime.runPromise(
       service.beginStreamTurn({
         prompt: "hello",
@@ -436,8 +476,9 @@ test("AntigravityRuntime keeps the same conversationId when switching between pi
       await c1.next();
     }
     await runtime.runPromise(service.finishTurn);
+    assert.equal(readHasPiTools(), false);
 
-    // Turn 1b: continuing with the same pi-tools agent reuses conv-1
+    // Turn 1b: continuing with the same pi-tools agent reuses conv1 and re-attaches metadata
     const c1b = await runtime.runPromise(
       service.beginStreamTurn({
         prompt: "follow up",
@@ -450,8 +491,9 @@ test("AntigravityRuntime keeps the same conversationId when switching between pi
       await c1b.next();
     }
     await runtime.runPromise(service.finishTurn);
+    assert.equal(readHasPiTools(), false);
 
-    // Turn 2: /boost turn drops custom agent (agent: undefined) while keeping conv-1
+    // Turn 2: /boost turn drops custom agent (agent: undefined) while keeping conv1
     const c2 = await runtime.runPromise(
       service.beginStreamTurn({
         prompt: "BOOST_PROMPT\n\ninvestigate auth",
@@ -474,8 +516,9 @@ test("AntigravityRuntime keeps the same conversationId when switching between pi
       await c2.next();
     }
     await runtime.runPromise(service.finishTurn);
+    assert.equal(readHasPiTools(), false);
 
-    // Turn 3: next normal turn restores pi-tools custom agent while still keeping conv-1
+    // Turn 3: next normal turn restores pi-tools custom agent on conv1 with metadata re-attached
     const c3 = await runtime.runPromise(
       service.beginStreamTurn({
         prompt: "back to normal",
@@ -488,22 +531,27 @@ test("AntigravityRuntime keeps the same conversationId when switching between pi
       await c3.next();
     }
     await runtime.runPromise(service.finishTurn);
+    assert.equal(readHasPiTools(), false);
 
     assert.equal(seenRequests.length, 4);
     assert.equal(seenRequests[0].conversationId, undefined);
     assert.equal(seenRequests[0].agent, "pi-tools-test");
+    assert.equal(seenRequests[0].hasPiToolsInDb, true);
 
-    assert.equal(seenRequests[1].conversationId, "conv-1");
+    assert.equal(seenRequests[1].conversationId, conv1);
     assert.equal(seenRequests[1].agent, "pi-tools-test");
     assert.equal(seenRequests[1].prompt.includes("HIST_1B"), false);
+    assert.equal(seenRequests[1].hasPiToolsInDb, true);
 
-    assert.equal(seenRequests[2].conversationId, "conv-1");
+    assert.equal(seenRequests[2].conversationId, conv1);
     assert.equal(seenRequests[2].agent, undefined);
     assert.equal(seenRequests[2].prompt.includes("HIST_BEFORE_BOOST"), false);
+    assert.equal(seenRequests[2].hasPiToolsInDb, false);
 
-    assert.equal(seenRequests[3].conversationId, "conv-1");
+    assert.equal(seenRequests[3].conversationId, conv1);
     assert.equal(seenRequests[3].agent, "pi-tools-test");
     assert.equal(seenRequests[3].prompt.includes("HIST_AFTER_BOOST"), false);
+    assert.equal(seenRequests[3].hasPiToolsInDb, true);
   } finally {
     await runtime.dispose();
   }

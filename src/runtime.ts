@@ -21,7 +21,10 @@ import {
   type AgyTurnExecutor,
 } from "../lib/agy-driver.ts";
 import type { AgyExecutionMode } from "../lib/agy-profile.ts";
-import { detachAgyConversationBridgeMetadata } from "../lib/conversation-metadata.ts";
+import {
+  detachAgyConversationBridgeMetadata,
+  prepareAgyConversationBridgeMetadata,
+} from "../lib/conversation-metadata.ts";
 import type { AgyTurnOutcome, AgyUsage } from "../lib/reducer.ts";
 import { piSystemInstructionsPrompt, stallContinuationPrompt } from "../lib/prompt.ts";
 import { AgyTurnController } from "../lib/turn.ts";
@@ -207,7 +210,29 @@ export type AgyTurnRunner = (request: AgyTurnRequest) => Promise<AgyTurnOutcome>
 
 function runnerExecutor(turnRunner: AgyTurnRunner): AgyTurnExecutor {
   return {
-    run: turnRunner,
+    run: async (request) => {
+      if (request.conversationId) {
+        prepareAgyConversationBridgeMetadata(
+          request.conversationId,
+          request.agent,
+          request.mcpDirectory,
+        );
+      }
+      let settledCid = request.conversationId;
+      try {
+        const outcome = await turnRunner({
+          ...request,
+          onConversation: (id) => {
+            settledCid = id;
+            request.onConversation?.(id);
+          },
+        });
+        settledCid = outcome.conversationId ?? settledCid;
+        return outcome;
+      } finally {
+        if (settledCid) detachAgyConversationBridgeMetadata(settledCid);
+      }
+    },
     snapshot: () => ({ mode: "one-shot", state: "idle", lifecycle: [] }),
     close: async () => {},
   };
@@ -348,15 +373,12 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                 lastBootstrappedSkillsSuffix = undefined;
               }
               // When switching between `pi-tools-*` and default agent (`undefined`
-              // for `/boost` or `/teamwork`), keep `conversationId` and strip
-              // `pi-tools-*` (`field 4` / `field 10`) from `trajectory_metadata_blob`
-              // so `AgyDriverSession` recycles the child process (`cause: "agent"`)
-              // and resumes the SAME conversation with built-in subagents unlocked.
+              // for `/boost` or `/teamwork`), keep `conversationId`. The executor
+              // attaches or detaches `pi-tools-*` (`field 4` / `field 10`) in
+              // `trajectory_metadata_blob` before spawning so the same conversation
+              // resumes with the requested agent profile.
               const agentSwitchedOnConversation =
                 conversationId !== undefined && conversationAgent !== request.agent;
-              if (agentSwitchedOnConversation && conversationId) {
-                detachAgyConversationBridgeMetadata(conversationId);
-              }
               // Keep `conversationId` when switching between Antigravity models
               // (e.g. `/m` one-shot consults or `/model` switches): `agy` natively
               // supports switching `--model` on the same `--conversation <id>`,
@@ -480,7 +502,6 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                   conversationId = id;
                   conversationCwd = cwd;
                   conversationAgent = request.agent;
-                  detachAgyConversationBridgeMetadata(id);
                 },
                 onActivity: (activity) => {
                   if (turnGeneration !== generation || turnAbort.signal.aborted) return;
@@ -653,7 +674,6 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                     conversationCwd = cwd;
                     conversationAgent = request.agent;
                     restoreHistoryOnNextConversation = false;
-                    detachAgyConversationBridgeMetadata(outcome.conversationId);
                   }
                   if (outcome.usage) conversationUsage = { ...outcome.usage };
                   restoredConversationPending = false;
@@ -672,7 +692,6 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                     request.signal?.removeEventListener("abort", requestAbortHandler);
                   }
                   if (activeTurnAbort === turnAbort) activeTurnAbort = undefined;
-                  if (conversationId) detachAgyConversationBridgeMetadata(conversationId);
                 });
               return controller;
             }),
@@ -683,7 +702,6 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
         // Called only when Pi has consumed the final result (or an error),
         // never for the toolUse handoff that must keep this controller alive.
         active = undefined;
-        if (conversationId) detachAgyConversationBridgeMetadata(conversationId);
       }),
 
       pushBridgeCall: (call) => {

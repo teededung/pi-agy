@@ -12,6 +12,10 @@ import { spawn } from "node:child_process";
 import { killAgyTree, trackAgyChild, untrackAgyChild } from "./agy-children.ts";
 import { getAgyBinary } from "./agy-diagnostics.ts";
 import type { AgyExecutionMode } from "./agy-profile.ts";
+import {
+  detachAgyConversationBridgeMetadata,
+  prepareAgyConversationBridgeMetadata,
+} from "./conversation-metadata.ts";
 import { parseAgyLine } from "./events.ts";
 import { trackActiveToolStep } from "./tool-steps.ts";
 import { applyEvent, newTurnOutcome, type AgyActivity, type AgyTurnOutcome } from "./reducer.ts";
@@ -182,6 +186,13 @@ export async function runAgyTurn(request: AgyTurnRequest): Promise<AgyTurnOutcom
       return;
     }
     const thoughtTracker = new AgyThoughtTracker(request.conversationId);
+    if (request.conversationId) {
+      prepareAgyConversationBridgeMetadata(
+        request.conversationId,
+        request.agent,
+        request.mcpDirectory,
+      );
+    }
     const doSpawn = request.spawnOverride ?? spawn;
     const child = doSpawn(binary, buildOneShotAgyArgs(request), {
       cwd: request.cwd,
@@ -223,6 +234,8 @@ export async function runAgyTurn(request: AgyTurnRequest): Promise<AgyTurnOutcom
       }
       thoughtTracker.close();
       if (abortHandler) request.signal?.removeEventListener("abort", abortHandler);
+      const settledCid = outcome.conversationId ?? request.conversationId;
+      if (settledCid) detachAgyConversationBridgeMetadata(settledCid);
       fn();
     };
 
@@ -381,6 +394,8 @@ export async function runAgyTurn(request: AgyTurnRequest): Promise<AgyTurnOutcom
         handleParsed(parseAgyLine(stdoutBuf));
       }
       untrack();
+      const settledCid = outcome.conversationId ?? request.conversationId;
+      if (settledCid) detachAgyConversationBridgeMetadata(settledCid);
       finishLogical(() => {
         if (outcome.finished) {
           resolve(outcome);

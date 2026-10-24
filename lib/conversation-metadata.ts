@@ -2,7 +2,8 @@ import { existsSync, promises as fs, readFileSync, writeFileSync } from "node:fs
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { PI_TOOLS_AGENT_DESCRIPTION } from "./prompt.ts";
 
 export const AGY_METADATA_MAX_BYTES = 5 * 1024 * 1024;
 
@@ -402,21 +403,46 @@ function bridgeDirStillExists(uri: string): boolean {
   }
 }
 
-/**
- * Strip session-owned `pi-tools-*` custom agent fields (4, 10) and private
- * `/antigravity/bridges/<instance>` workspace fields (1, 7) from a
- * `TrajectoryMetadata` protobuf blob so standalone `agy --resume` can continue
- * the conversation with native agy tools.
- */
-export function stripAgyTrajectoryBridgeMetadata(buf: Uint8Array): Buffer {
+const detachedTrajectoryBridgeFields = new Map<string, Buffer>();
+
+function rememberDetachedBridgeFields(conversationId: string, fields: Buffer): void {
+  if (fields.length === 0) return;
+  detachedTrajectoryBridgeFields.delete(conversationId);
+  detachedTrajectoryBridgeFields.set(conversationId, fields);
+  while (detachedTrajectoryBridgeFields.size > 64) {
+    const oldest = detachedTrajectoryBridgeFields.keys().next().value;
+    if (!oldest) break;
+    detachedTrajectoryBridgeFields.delete(oldest);
+  }
+}
+
+function pbVarintField(fieldNumber: number, value: number): Buffer {
+  return Buffer.concat([encodeVarint((fieldNumber << 3) | 0), encodeVarint(value)]);
+}
+
+function pbBytesField(fieldNumber: number, payload: string | Uint8Array): Buffer {
+  const bytes =
+    typeof payload === "string"
+      ? Buffer.from(payload, "utf-8")
+      : Buffer.isBuffer(payload)
+        ? payload
+        : Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength);
+  return Buffer.concat([encodeVarint((fieldNumber << 3) | 2), encodeVarint(bytes.length), bytes]);
+}
+
+function splitAgyTrajectoryBridgeMetadata(buf: Uint8Array): {
+  cleaned: Buffer;
+  stripped: Buffer;
+} {
   const source = Buffer.isBuffer(buf) ? buf : Buffer.from(buf.buffer, buf.byteOffset, buf.byteLength);
-  const chunks: Buffer[] = [];
+  const cleanedChunks: Buffer[] = [];
+  const strippedChunks: Buffer[] = [];
   let offset = 0;
 
   while (offset < source.length) {
     const fieldStart = offset;
     const tagInfo = readVarint(source, offset);
-    if (!tagInfo) return source;
+    if (!tagInfo) return { cleaned: source, stripped: Buffer.alloc(0) };
     const tag = tagInfo.value;
     const fieldNumber = tag >>> 3;
     const wireType = tag & 0x07;
@@ -424,43 +450,179 @@ export function stripAgyTrajectoryBridgeMetadata(buf: Uint8Array): Buffer {
 
     if (wireType === 0) {
       const val = readVarint(source, offset);
-      if (!val) return source;
+      if (!val) return { cleaned: source, stripped: Buffer.alloc(0) };
       offset = val.next;
-      chunks.push(source.subarray(fieldStart, offset));
+      cleanedChunks.push(source.subarray(fieldStart, offset));
     } else if (wireType === 1) {
-      if (offset + 8 > source.length) return source;
+      if (offset + 8 > source.length) return { cleaned: source, stripped: Buffer.alloc(0) };
       offset += 8;
-      chunks.push(source.subarray(fieldStart, offset));
+      cleanedChunks.push(source.subarray(fieldStart, offset));
     } else if (wireType === 5) {
-      if (offset + 4 > source.length) return source;
+      if (offset + 4 > source.length) return { cleaned: source, stripped: Buffer.alloc(0) };
       offset += 4;
-      chunks.push(source.subarray(fieldStart, offset));
+      cleanedChunks.push(source.subarray(fieldStart, offset));
     } else if (wireType === 2) {
       const lenInfo = readVarint(source, offset);
-      if (!lenInfo || lenInfo.next + lenInfo.value > source.length) return source;
+      if (!lenInfo || lenInfo.next + lenInfo.value > source.length) {
+        return { cleaned: source, stripped: Buffer.alloc(0) };
+      }
       const bodyStart = lenInfo.next;
       const bodyEnd = bodyStart + lenInfo.value;
       offset = bodyEnd;
       const body = source.subarray(bodyStart, bodyEnd);
       if (
-        (fieldNumber === 4 || fieldNumber === 10) &&
-        body.includes(PI_TOOLS_AGENT_MARKER)
+        ((fieldNumber === 4 || fieldNumber === 10) && body.includes(PI_TOOLS_AGENT_MARKER)) ||
+        ((fieldNumber === 1 || fieldNumber === 7) && body.includes(BRIDGE_PATH_MARKER))
       ) {
+        strippedChunks.push(source.subarray(fieldStart, bodyEnd));
         continue;
       }
-      if (
-        (fieldNumber === 1 || fieldNumber === 7) &&
-        body.includes(BRIDGE_PATH_MARKER)
-      ) {
-        continue;
-      }
-      chunks.push(source.subarray(fieldStart, bodyEnd));
+      cleanedChunks.push(source.subarray(fieldStart, bodyEnd));
     } else {
-      return source;
+      return { cleaned: source, stripped: Buffer.alloc(0) };
     }
   }
 
-  return Buffer.concat(chunks);
+  return {
+    cleaned: Buffer.concat(cleanedChunks),
+    stripped: Buffer.concat(strippedChunks),
+  };
+}
+
+/**
+ * Strip session-owned `pi-tools-*` custom agent fields (4, 10) and private
+ * `/antigravity/bridges/<instance>` workspace fields (1, 7) from a
+ * `TrajectoryMetadata` protobuf blob so standalone `agy --resume` can continue
+ * the conversation with native agy tools.
+ */
+export function stripAgyTrajectoryBridgeMetadata(buf: Uint8Array): Buffer {
+  return splitAgyTrajectoryBridgeMetadata(buf).cleaned;
+}
+
+export function buildPiToolsTrajectoryMetadataFields(
+  agentName: string,
+  mcpDirectory?: string,
+): Buffer {
+  const effectiveDir = mcpDirectory ?? path.join(os.homedir(), ".pi", "agent", "antigravity", "bridges", "default");
+  const bridgeUri = pathToFileURL(effectiveDir).href;
+  const agentFilePath = path.join(effectiveDir, ".agents", "agents", agentName, "agent.md");
+  const agentUri = pathToFileURL(agentFilePath).href;
+
+  let description = PI_TOOLS_AGENT_DESCRIPTION;
+  let promptBody = "You are the agent for the current Pi coding session. Complete the user request using Pi tools.";
+  let mcpServers: Array<{ name: string; serverUrl: string; headers?: Record<string, string> }> = [];
+
+  if (mcpDirectory && existsSync(agentFilePath)) {
+    try {
+      const raw = readFileSync(agentFilePath, "utf-8");
+      const match = raw.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
+      if (match) {
+        const parsed = record(JSON.parse(match[1]!));
+        if (typeof parsed?.description === "string" && parsed.description.trim()) {
+          description = parsed.description;
+        }
+        if (Array.isArray(parsed?.mcpServers)) {
+          mcpServers = parsed.mcpServers
+            .map((item) => record(item))
+            .filter(
+              (item): item is Record<string, unknown> =>
+                typeof item?.name === "string" && typeof item?.serverUrl === "string",
+            )
+            .map((item) => ({
+              name: String(item.name),
+              serverUrl: String(item.serverUrl),
+              headers: record(item.headers) as Record<string, string> | undefined,
+            }));
+        }
+        if (match[2]?.trim()) {
+          promptBody = match[2].trim();
+        }
+      }
+    } catch {
+      // Fall back to default agent prompt/description if frontmatter cannot be read
+    }
+  }
+
+  const sections = [
+    pbBytesField(1, Buffer.concat([pbBytesField(1, "System Prompt"), pbBytesField(2, promptBody)])),
+    ...[
+      "user_information",
+      "mcp_servers",
+      "user_rules",
+      "skills",
+      "messaging",
+      "artifacts",
+      "guidelines",
+      "communication_style",
+    ].map((section) => pbBytesField(2, section)),
+  ].map((inner) => pbBytesField(2, inner));
+
+  const checks = [
+    "message_continue_check",
+    "terminal_step_check",
+    "max_generator_invocations_check",
+    "empty_output_continuation_check",
+    "force_invocation",
+    "no_tool_call_check",
+  ].map((checkName) => pbBytesField(5, Buffer.concat([pbBytesField(1, checkName), pbVarintField(2, 1)])));
+
+  const mcpServerFields = mcpServers.map((server) => {
+    const headerFields = Object.entries(server.headers ?? {}).map(([key, val]) =>
+      pbBytesField(9, Buffer.concat([pbBytesField(1, key), pbBytesField(2, String(val))])),
+    );
+    return pbBytesField(
+      3,
+      Buffer.concat([
+        pbVarintField(1, 0),
+        pbBytesField(
+          2,
+          Buffer.concat([
+            pbBytesField(1, server.name),
+            pbBytesField(6, server.serverUrl),
+            ...headerFields,
+          ]),
+        ),
+      ]),
+    );
+  });
+
+  const f18 = pbBytesField(
+    18,
+    Buffer.concat([
+      pbBytesField(1, Buffer.concat([...sections, ...checks])),
+      pbBytesField(
+        4,
+        Buffer.concat([
+          pbBytesField(1, pbVarintField(2, 0)),
+          pbBytesField(2, pbVarintField(1, 0)),
+          ...mcpServerFields,
+          pbBytesField(4, pbVarintField(1, 0)),
+          pbBytesField(7, pbVarintField(1, 0)),
+          pbBytesField(8, agentUri),
+          pbBytesField(9, pbVarintField(1, 0)),
+        ]),
+      ),
+    ]),
+  );
+
+  const field1 = pbBytesField(1, Buffer.concat([pbBytesField(1, bridgeUri), pbBytesField(3, Buffer.alloc(0))]));
+  const field4 = pbBytesField(
+    4,
+    Buffer.concat([
+      pbBytesField(1, agentName),
+      pbBytesField(8, description),
+      pbVarintField(12, 0),
+      pbVarintField(13, 1),
+      pbBytesField(7, f18),
+    ]),
+  );
+  const field7 = pbBytesField(7, bridgeUri);
+  const field10 = pbBytesField(
+    10,
+    Buffer.concat([pbBytesField(17, pbBytesField(16, agentUri)), f18]),
+  );
+
+  return Buffer.concat([field1, field4, field7, field10]);
 }
 
 /**
@@ -551,7 +713,8 @@ export function detachAgyConversationBridgeMetadata(
       if (row?.data) {
         const current = Buffer.from(row.data);
         if (current.includes(PI_TOOLS_AGENT_MARKER) || current.includes(BRIDGE_PATH_MARKER)) {
-          const cleaned = stripAgyTrajectoryBridgeMetadata(current);
+          const { cleaned, stripped } = splitAgyTrajectoryBridgeMetadata(current);
+          rememberDetachedBridgeFields(conversationId, stripped);
           if (!cleaned.equals(current)) {
             db.prepare("UPDATE trajectory_metadata_blob SET data = ? WHERE id = 'main'").run(cleaned);
             modified = true;
@@ -661,6 +824,94 @@ export function detachAgyConversationBridgeMetadata(
   }
 
   return modified;
+}
+
+/**
+ * Re-attach the `pi-tools-*` custom agent and bridge workspace fields to
+ * `trajectory_metadata_blob` right before spawning a new `agy` process on an
+ * existing conversation in `pi-tools` mode. When `agy` resumes `--conversation`,
+ * it ignores `--agent` and only reads `trajectory_metadata_blob` (`field 4` / `field 10`).
+ */
+export function attachAgyConversationBridgeMetadata(
+  conversationId: string | undefined,
+  agentName: string | undefined,
+  mcpDirectory?: string,
+  homeDirectory = os.homedir(),
+): boolean {
+  if (
+    !conversationId ||
+    !/^[0-9a-f-]{36}$/i.test(conversationId) ||
+    !isPiToolsAgentName(agentName)
+  ) {
+    return false;
+  }
+  const convDbPath = path.join(
+    homeDirectory,
+    ".gemini",
+    "antigravity-cli",
+    "conversations",
+    `${conversationId}.db`,
+  );
+  if (!existsSync(convDbPath)) return false;
+
+  let db: DatabaseSync | undefined;
+  try {
+    db = new DatabaseSync(convDbPath);
+    db.exec("PRAGMA busy_timeout = 2000;");
+    const row = db
+      .prepare("SELECT data FROM trajectory_metadata_blob WHERE id = 'main'")
+      .get() as { data?: Uint8Array } | undefined;
+    if (!row?.data) return false;
+    const current = Buffer.from(row.data);
+    const { cleaned, stripped } = splitAgyTrajectoryBridgeMetadata(current);
+    rememberDetachedBridgeFields(conversationId, stripped);
+
+    const cached = detachedTrajectoryBridgeFields.get(conversationId);
+    const agentMarker = Buffer.from(agentName, "utf-8");
+    const fieldsToAttach =
+      cached && cached.includes(agentMarker)
+        ? cached
+        : buildPiToolsTrajectoryMetadataFields(agentName, mcpDirectory);
+    rememberDetachedBridgeFields(conversationId, fieldsToAttach);
+
+    const next = Buffer.concat([cleaned, fieldsToAttach]);
+    if (!next.equals(current)) {
+      db.prepare("UPDATE trajectory_metadata_blob SET data = ? WHERE id = 'main'").run(next);
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      // Ignore close errors
+    }
+  }
+}
+
+/**
+ * Prepare `trajectory_metadata_blob` before spawning `agy` on an existing
+ * conversation: attach `pi-tools-*` fields when `agentName` is a `pi-tools-*`
+ * agent, or detach them when running with the default agent (`/boost` / `/teamwork`).
+ */
+export function prepareAgyConversationBridgeMetadata(
+  conversationId: string | undefined,
+  agentName: string | undefined,
+  mcpDirectory?: string,
+  homeDirectory = os.homedir(),
+): boolean {
+  if (!conversationId) return false;
+  if (isPiToolsAgentName(agentName)) {
+    return attachAgyConversationBridgeMetadata(
+      conversationId,
+      agentName,
+      mcpDirectory,
+      homeDirectory,
+    );
+  }
+  return detachAgyConversationBridgeMetadata(conversationId, homeDirectory);
 }
 
 /**

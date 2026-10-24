@@ -475,7 +475,6 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     const conversationId =
       knownConversationId ?? (await runAntigravity(runtime, service.snapshot)).conversationId;
     if (!conversationId) return;
-    detachAgyConversationBridgeMetadata(conversationId);
     const titleKey = `${conversationId}:${probe.value.sessionName}`;
     if (titleKey === lastSyncedSessionTitleKey) return;
     if (await syncAgyConversationTitle(conversationId, probe.value.sessionName)) {
@@ -511,7 +510,6 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     const snapshot = await runAntigravity(runtime, service.snapshot);
     if (!snapshot.conversationId || !snapshot.model || snapshot.cwd !== cwd) return;
     trackedConversationId = snapshot.conversationId;
-    detachAgyConversationBridgeMetadata(snapshot.conversationId);
     await syncSessionNameToAgy(ctx, snapshot.conversationId);
     const state: PersistedAgyConversation = {
       version: 1,
