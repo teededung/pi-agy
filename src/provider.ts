@@ -312,19 +312,23 @@ function turnEndedMessage(closeReason: string | undefined): string {
 }
 
 /**
- * True for agy `call_mcp_tool` steps that target our own bridge server.
+ * True for agy MCP steps that target our own bridge server (`call_mcp_tool` for
+ * lazy tools or `mcp_<serverName>_pi__*` for eager tools).
  * Those calls surface as synthetic bridge_call activities (emitted as the
- * real pi tool), so the raw call_mcp_tool step must not render a duplicate
+ * real pi tool), so the raw MCP step must not render a duplicate
  * display-only card. MCP calls against OTHER servers render normally.
  */
-function isBridgedMcpStep(
+export function isBridgedMcpStep(
   activity: {
     name: string;
     args: Record<string, unknown>;
   },
   serverName: string,
 ): boolean {
-  return activity.name === "call_mcp_tool" && activity.args?.ServerName === serverName;
+  if (activity.name === "call_mcp_tool" && activity.args?.ServerName === serverName) {
+    return true;
+  }
+  return Boolean(serverName && activity.name.startsWith(`mcp_${serverName}_pi__`));
 }
 
 export interface OneShotConsultOverride {

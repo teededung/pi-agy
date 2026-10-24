@@ -4,6 +4,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { PI_TOOLS_AGENT_DESCRIPTION } from "./prompt.ts";
+import { EAGER_PI_BRIDGE_TOOLS } from "./pi-tools-agent.ts";
 
 export const AGY_METADATA_MAX_BYTES = 5 * 1024 * 1024;
 
@@ -579,11 +580,12 @@ export function buildPiToolsTrajectoryMetadataFields(
             .map((item) => record(item))
             .filter(
               (item): item is Record<string, unknown> =>
-                typeof item?.name === "string" && typeof item?.serverUrl === "string",
+                typeof item?.name === "string" &&
+                (typeof item?.url === "string" || typeof item?.serverUrl === "string"),
             )
             .map((item) => ({
               name: String(item.name),
-              serverUrl: String(item.serverUrl),
+              serverUrl: String(item.url ?? item.serverUrl),
               headers: record(item.headers) as Record<string, string> | undefined,
             }));
         }
@@ -623,6 +625,12 @@ export function buildPiToolsTrajectoryMetadataFields(
     const headerFields = Object.entries(server.headers ?? {}).map(([key, val]) =>
       pbBytesField(9, Buffer.concat([pbBytesField(1, key), pbBytesField(2, String(val))])),
     );
+    const toolConfigFields = EAGER_PI_BRIDGE_TOOLS.map((toolName) =>
+      pbBytesField(
+        14,
+        Buffer.concat([pbBytesField(1, toolName), pbBytesField(2, pbVarintField(2, 1))]),
+      ),
+    );
     return pbBytesField(
       3,
       Buffer.concat([
@@ -633,6 +641,7 @@ export function buildPiToolsTrajectoryMetadataFields(
             pbBytesField(1, server.name),
             pbBytesField(6, server.serverUrl),
             ...headerFields,
+            ...toolConfigFields,
           ]),
         ),
       ]),

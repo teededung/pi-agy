@@ -13,7 +13,10 @@ import {
 import { installSessionSelectorDeletePatch } from "../index.ts";
 import { isAgyEditTool } from "../lib/diff.ts";
 import { mapAgyToolToNative } from "../lib/native-tools.ts";
-import { createPiToolsAgent } from "../lib/pi-tools-agent.ts";
+import {
+  createPiToolsAgent,
+  EAGER_PI_BRIDGE_TOOLS_CONFIG,
+} from "../lib/pi-tools-agent.ts";
 import { formatAgyCall } from "../lib/render.ts";
 import {
   formatAgySubagentsLivePreviewLines,
@@ -26,6 +29,7 @@ import { readAgyToolMode, resolveAgyToolModeCommand } from "../lib/tool-mode.ts"
 import {
   contextHasPriorBoostActivity,
   contextHasPriorTeamworkActivity,
+  isBridgedMcpStep,
 } from "../src/provider.ts";
 import { AntigravityRuntime, createAntigravityRuntime } from "../src/runtime.ts";
 
@@ -76,10 +80,33 @@ test("Pi tool agent scopes MCP to its bridge and removes only its own configurat
   assert.deepEqual(definition.mcpServers, [
     {
       name: bridge.serverName,
+      url: bridge.url,
       serverUrl: bridge.url,
       headers: { "x-pi-bridge-token": bridge.token },
+      tools: EAGER_PI_BRIDGE_TOOLS_CONFIG,
     },
   ]);
+  assert.equal(
+    isBridgedMcpStep(
+      { name: "call_mcp_tool", args: { ServerName: bridge.serverName, ToolName: "pi__read" } },
+      bridge.serverName,
+    ),
+    true,
+  );
+  assert.equal(
+    isBridgedMcpStep(
+      { name: `mcp_${bridge.serverName}_pi__read`, args: { path: "/tmp/file" } },
+      bridge.serverName,
+    ),
+    true,
+  );
+  assert.equal(
+    isBridgedMcpStep(
+      { name: "mcp_other-server_some_tool", args: {} },
+      bridge.serverName,
+    ),
+    false,
+  );
   if (process.platform !== "win32") {
     assert.equal((await stat(agentFile)).mode & 0o777, 0o600);
   }

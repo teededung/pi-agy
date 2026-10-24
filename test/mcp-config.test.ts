@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createPrivateMcpConfig } from "../lib/mcp-config.ts";
+import { EAGER_PI_BRIDGE_TOOLS_CONFIG } from "../lib/pi-tools-agent.ts";
 
 // The actual private workspace format is consumed by both native and Pi agy agents.
 test("private MCP configurations isolate credentials and clean up only their own directory", async (t) => {
@@ -22,8 +23,10 @@ test("private MCP configurations isolate credentials and clean up only their own
   assert.deepEqual(JSON.parse(await readFile(configFile(a.directory), "utf8")), {
     mcpServers: {
       [a.serverName]: {
+        url: "http://127.0.0.1:1234/mcp",
         serverUrl: "http://127.0.0.1:1234/mcp",
         headers: { "x-pi-bridge-token": "token-a" },
+        tools: EAGER_PI_BRIDGE_TOOLS_CONFIG,
       },
     },
   });

@@ -3,6 +3,7 @@ import { rmSync } from "node:fs";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { piConfigDir } from "./config.ts";
+import { EAGER_PI_BRIDGE_TOOLS_CONFIG } from "./pi-tools-agent.ts";
 
 /** One process's workspace MCP discovery, passed only to its agy children. */
 export function createPrivateMcpConfig(root = piConfigDir("antigravity/bridges")) {
@@ -23,8 +24,10 @@ export function createPrivateMcpConfig(root = piConfigDir("antigravity/bridges")
           {
             mcpServers: {
               [serverName]: {
+                url,
                 serverUrl: url,
                 headers: { "x-pi-bridge-token": token },
+                tools: EAGER_PI_BRIDGE_TOOLS_CONFIG,
               },
             },
           },

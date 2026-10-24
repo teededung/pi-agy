@@ -5,6 +5,19 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { PI_TOOLS_AGENT_DESCRIPTION, piToolsAgentPrompt } from "./prompt.ts";
 
+/** Core Pi tools marked eager so agy registers them as direct native tool declarations without lazy schema reads. */
+export const EAGER_PI_BRIDGE_TOOLS = [
+  "pi__read",
+  "pi__bash",
+  "pi__edit",
+  "pi__write",
+  "pi__ask_user_question",
+] as const;
+
+export const EAGER_PI_BRIDGE_TOOLS_CONFIG: Record<string, { eager: true }> = Object.fromEntries(
+  EAGER_PI_BRIDGE_TOOLS.map((toolName) => [toolName, { eager: true as const }]),
+);
+
 export interface PiToolsAgentBridge {
   serverName: string;
   url: string;
@@ -34,8 +47,10 @@ export function createPiToolsAgent(
         mcpServers: [
           {
             name: bridge.serverName,
+            url: bridge.url,
             serverUrl: bridge.url,
             headers: { "x-pi-bridge-token": bridge.token },
+            tools: EAGER_PI_BRIDGE_TOOLS_CONFIG,
           },
         ],
       };
