@@ -97,6 +97,12 @@ import {
   type AgyCompactionMarker,
 } from "./lib/agy-compaction.ts";
 import {
+  computeSessionUsageSnapshot,
+  renderFooterLines,
+  resolveAgyBranchContextTokens,
+  type SessionUsageSnapshot,
+} from "./lib/footer.ts";
+import {
   AGY_CONVERSATION_STATE_ENTRY,
   agyConversationExists,
   restorableAgyConversation,
@@ -497,6 +503,90 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   let activeSessionCtx: ExtensionContext | undefined;
   let lastSyncedSessionTitleKey: string | undefined;
   let trackedConversationId: string | undefined;
+  let requestFooterRender: (() => void) | undefined;
+
+  function installAgyFooter(ctx: ExtensionContext): void {
+    if (process.env.PI_ANTIGRAVITY_CUSTOM_FOOTER === "0") return;
+    probeCtx(() => {
+      if (!ctx.hasUI || typeof ctx.ui.setFooter !== "function") return;
+      let cachedKey = "";
+      let cachedSnapshot: SessionUsageSnapshot = {
+        usageTotals: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+      };
+      let cachedBranchAgyTokens: number | undefined;
+
+      ctx.ui.setFooter((tui, theme, footerData) => {
+        requestFooterRender = () => tui.requestRender();
+        const unsubBranch = footerData.onBranchChange(() => tui.requestRender());
+        return {
+          dispose() {
+            unsubBranch();
+            if (requestFooterRender) requestFooterRender = undefined;
+          },
+          invalidate() {
+            cachedKey = "";
+          },
+          render(width: number): string[] {
+            const state = probeCtx(() => {
+              const sm = ctx.sessionManager as {
+                getSessionId(): string;
+                getLeafId?(): string | null;
+                getEntryCount?(): number;
+                getEntries?(): unknown[];
+                getBranch(): unknown[];
+                getCwd?(): string;
+                getSessionName?(): string | undefined;
+              };
+              const sessionId = sm.getSessionId();
+              const leafId = sm.getLeafId?.() ?? "";
+              const branch = sm.getBranch();
+              const entries = sm.getEntries?.() ?? branch;
+              const entryCount = sm.getEntryCount?.() ?? entries.length;
+              const key = `${sessionId}:${leafId}:${entryCount}`;
+              if (key !== cachedKey) {
+                cachedKey = key;
+                cachedSnapshot = computeSessionUsageSnapshot(entries);
+                cachedBranchAgyTokens = resolveAgyBranchContextTokens(branch);
+              }
+              return {
+                cwd: sm.getCwd?.() ?? ctx.cwd,
+                sessionName: sm.getSessionName?.()?.trim(),
+                model: ctx.model,
+                thinkingLevel: pi.getThinkingLevel?.() ?? "off",
+                contextUsage:
+                  ctx.model?.provider === "antigravity"
+                    ? undefined
+                    : ctx.getContextUsage?.(),
+              };
+            });
+            if (state.stale) return [];
+            const { cwd, sessionName, model, thinkingLevel, contextUsage } = state.value;
+            const effectiveAgyTokens =
+              model?.provider === "antigravity"
+                ? (observedContextTokens ?? cachedBranchAgyTokens)
+                : undefined;
+            return renderFooterLines({
+              width,
+              cwd,
+              gitBranch: footerData.getGitBranch(),
+              sessionName,
+              provider: model?.provider,
+              modelId: model?.id,
+              reasoning: model?.reasoning,
+              thinkingLevel,
+              availableProviderCount: footerData.getAvailableProviderCount(),
+              agyContextTokens: effectiveAgyTokens,
+              contextUsage,
+              usageTotals: cachedSnapshot.usageTotals,
+              latestCacheHitRate: cachedSnapshot.latestCacheHitRate,
+              extensionStatuses: footerData.getExtensionStatuses(),
+              theme,
+            });
+          },
+        };
+      });
+    });
+  }
 
   async function captureActiveConversationId(): Promise<string | undefined> {
     let cid = trackedConversationId;
@@ -1104,6 +1194,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       persistedConversationKey = undefined;
       subagentRoster.clear();
       renderAgyStatusWidget(true);
+      requestFooterRender?.();
       return;
     }
     trackAgySubagent(subagentRoster, activity);
@@ -1138,6 +1229,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         }
       }
       observedContextTokens = nextContextTokens;
+      requestFooterRender?.();
       return;
     }
     if (
@@ -1502,6 +1594,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     updateAgyTasksWidget();
     renderAgyStatusWidget(true);
     if (ctx.hasUI) {
+      installAgyFooter(ctx);
       updateOrchestrationStatus(ctx.ui);
       updateConsultStatus(ctx.ui);
     }
@@ -1514,9 +1607,14 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     }
   });
 
+  pi.on("thinking_level_select", async () => {
+    requestFooterRender?.();
+  });
+
   pi.on("model_select", async (event, ctx) => {
     syncWrapperToolActivation(event.model?.provider);
     refreshToolModeStatus(ctx);
+    requestFooterRender?.();
     const nextModelKey = event.model ? `${event.model.provider}:${event.model.id}` : undefined;
     if (
       selectedModelKey?.startsWith("antigravity:") &&

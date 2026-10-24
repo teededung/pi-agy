@@ -17,6 +17,12 @@ import {
   createPiToolsAgent,
   EAGER_PI_BRIDGE_TOOLS_CONFIG,
 } from "../lib/pi-tools-agent.ts";
+import {
+  AGY_EFFECTIVE_CONTEXT_LIMIT,
+  computeSessionUsageSnapshot,
+  renderFooterLines,
+  resolveAgyBranchContextTokens,
+} from "../lib/footer.ts";
 import { formatAgyCall } from "../lib/render.ts";
 import {
   formatAgySubagentsLivePreviewLines,
@@ -740,6 +746,68 @@ test("installSessionSelectorDeletePatch and deleteAgyConversationsForSessionFile
   ) as { conversations: Record<string, unknown> };
   assert.equal(cid in metaJson.conversations, false);
 });
+
+test("renderFooterLines renders 2-row footer with agy 300k context bar and filters redundant agy-context status", () => {
+  const plainTheme = {
+    fg: (_color: string, text: string) => text,
+  };
+  const branch = [
+    {
+      type: "message",
+      message: {
+        role: "assistant",
+        provider: "antigravity",
+        usage: { input: 2_000, output: 500, cacheRead: 226_000, cost: { total: 11.138 } },
+      },
+    },
+    // Multi-step final delta with cacheRead subtracted to 0 must not overwrite the 228k footprint.
+    {
+      type: "message",
+      message: {
+        role: "assistant",
+        provider: "antigravity",
+        usage: { input: 1_500, output: 300, cacheRead: 0, cost: { total: 0.02 } },
+      },
+    },
+  ];
+  const agyTokens = resolveAgyBranchContextTokens(branch);
+  assert.equal(agyTokens, 228_000);
+  assert.equal(AGY_EFFECTIVE_CONTEXT_LIMIT, 300_000);
+
+  const snapshot = computeSessionUsageSnapshot(branch);
+  const statuses = new Map<string, string>([
+    ["0-tps", "[42.0 tok/s]"],
+    ["agy-context", "agy context ~228k"],
+    ["antigravity", "pi-tools:on"],
+    ["ponytail", "○ 🐴 ponytail: 🌱 LITE"],
+  ]);
+
+  const lines = renderFooterLines({
+    width: 120,
+    cwd: "/Users/rongmauhong/Documents/Repo/ragnarok",
+    home: "/Users/rongmauhong",
+    gitBranch: "main",
+    sessionName: "pi-agy",
+    provider: "antigravity",
+    modelId: "gemini-4-argon",
+    reasoning: true,
+    thinkingLevel: "medium",
+    availableProviderCount: 2,
+    agyContextTokens: agyTokens,
+    usageTotals: snapshot.usageTotals,
+    latestCacheHitRate: 98.7,
+    extensionStatuses: statuses,
+    theme: plainTheme,
+  });
+
+  assert.equal(lines.length, 2);
+  assert.match(lines[0]!, /~\/Documents\/Repo\/ragnarok \(⎇ main\) • pi-agy/);
+  assert.match(lines[0]!, /\(antigravity\) gemini-4-argon • medium$/);
+  assert.match(lines[1]!, /^\[█+░+\] ~228k\/300k \(76%\) │ ↑3\.5k ↓800 R226k CH98\.7% \$11\.16/);
+  assert.match(lines[1]!, /\[42\.0 tok\/s\] pi-tools:on ○ 🐴 ponytail: 🌱 LITE$/);
+  assert.equal(lines[1]!.includes("agy context"), false);
+});
+
 
 
 
