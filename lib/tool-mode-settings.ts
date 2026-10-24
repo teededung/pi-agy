@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import lockfile from "proper-lockfile";
+import type { AgyFooterMode } from "./footer.ts";
 import type { AgyToolMode } from "./tool-mode.ts";
 
 function settingsPath(): string {
@@ -40,8 +41,21 @@ export function loadSavedAgyToolMode(file = settingsPath()): AgyToolMode | undef
   return mode;
 }
 
-/** Merge under the same file lock Pi uses, preserving other sessions' settings. */
-export async function saveAgyToolMode(mode: AgyToolMode, file = settingsPath()): Promise<void> {
+/** Read the saved 2-row custom footer preference ("on" | "off"). */
+export function loadSavedAgyFooterMode(file = settingsPath()): AgyFooterMode | undefined {
+  const settings = readDocument(file).antigravity as Record<string, unknown> | undefined;
+  const mode = settings?.footer;
+  if (mode === undefined) return undefined;
+  if (mode === "on" || mode === true) return "on";
+  if (mode === "off" || mode === false) return "off";
+  throw new Error('Pi settings antigravity.footer must be exactly "on" or "off".');
+}
+
+async function saveAntigravitySetting(
+  key: "toolMode" | "footer",
+  value: string,
+  file = settingsPath(),
+): Promise<void> {
   await withFileMutationQueue(file, async () => {
     mkdirSync(path.dirname(file), { recursive: true });
     const release = lockfile.lockSync(file, { realpath: false });
@@ -50,7 +64,7 @@ export async function saveAgyToolMode(mode: AgyToolMode, file = settingsPath()):
       const document = readDocument(file);
       document.antigravity = {
         ...(document.antigravity as Record<string, unknown> | undefined),
-        toolMode: mode,
+        [key]: value,
       };
       writeFileSync(temporary, `${JSON.stringify(document, null, 2)}\n`, {
         flag: "wx",
@@ -65,4 +79,14 @@ export async function saveAgyToolMode(mode: AgyToolMode, file = settingsPath()):
       }
     }
   });
+}
+
+/** Merge under the same file lock Pi uses, preserving other sessions' settings. */
+export async function saveAgyToolMode(mode: AgyToolMode, file = settingsPath()): Promise<void> {
+  await saveAntigravitySetting("toolMode", mode, file);
+}
+
+/** Persist the custom footer preference ("on" | "off") under antigravity.footer. */
+export async function saveAgyFooterMode(mode: AgyFooterMode, file = settingsPath()): Promise<void> {
+  await saveAntigravitySetting("footer", mode, file);
 }

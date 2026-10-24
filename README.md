@@ -68,6 +68,7 @@ pi update git:github.com/teededung/pi-agy
 | `/rename [name]` | Set or view the session display name (alias for `/name`, immediately synced to agy conversation metadata) |
 | `/agy` | Conversation title/status (id, model, turns, process, native context) |
 | `/agy-tools` | Toggle and save Pi tools mode; `on`, `off`, or `status`; `/agy tools …` is equivalent |
+| `/agy-footer` | Toggle and save the 2-row custom footer (`on` by default); `on`, `off`, or `status`; `/agy footer …` is equivalent |
 | `/agy-reset` | Drop the agy conversation and driver; next turn starts fresh |
 | `/agy-models` | Re-discover models and re-register the provider |
 | `/agy-agents` | List configured custom agy agents without inference |
@@ -265,6 +266,7 @@ Summarization requests keep their own caller instructions untouched.
 | --- | --- |
 | `PI_ANTIGRAVITY_PI_TOOL_BRIDGE=0` | Turn the bridge off. Pi-private skills become unavailable to agy (a one-time warning); shared `.agents` skills still reach agy natively. |
 | `PI_ANTIGRAVITY_TOOLS=native\|pi` | Select the tool mode at startup; overridden by `--agy-tools`. Pi mode runs work through the session's Pi tools. |
+| `PI_ANTIGRAVITY_FOOTER=on\|off` | Enable or disable the 2-row custom footer at startup (defaults to `on`; overridden by `--agy-footer` and saved in `settings.json` as `antigravity.footer`). Set to `off` when using another plugin's custom footer. |
 | `PI_ANTIGRAVITY_AGENT=<name>` | Select a custom agy agent in native tool mode. Empty, control-character-containing, and overlong values are rejected before spawn. |
 | `PI_ANTIGRAVITY_MODE=plan\|accept-edits\|auto` | Select agy's stable CLI execution mode. Other values fail before spawn. |
 | `PI_ANTIGRAVITY_HIDDEN_MODELS=<models>` | Comma- or space-separated model IDs/prefixes to hide from Pi (defaults to `gemini-3.6, gemini-3.7, gpt-oss`). Set to `""` to show all models. |

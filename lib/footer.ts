@@ -12,6 +12,63 @@ export const AGY_EFFECTIVE_CONTEXT_LIMIT = 300_000;
 export const DEFAULT_CONTEXT_BAR_WIDTH = 16;
 export const MIN_CONTEXT_BAR_WIDTH = 6;
 
+export type AgyFooterMode = "on" | "off";
+
+/** No argument toggles; explicit on/off commands are idempotent. */
+export function resolveAgyFooterModeCommand(
+  args: string,
+  current: AgyFooterMode,
+): AgyFooterMode | "status" | undefined {
+  switch (args.trim().toLowerCase()) {
+    case "":
+      return current === "on" ? "off" : "on";
+    case "on":
+      return "on";
+    case "off":
+      return "off";
+    case "status":
+      return "status";
+    default:
+      return undefined;
+  }
+}
+
+function parseFooterModeValue(raw: unknown): AgyFooterMode | undefined {
+  if (typeof raw === "boolean") return raw ? "on" : "off";
+  if (typeof raw !== "string") return undefined;
+  switch (raw.trim().toLowerCase()) {
+    case "on":
+    case "1":
+    case "true":
+      return "on";
+    case "off":
+    case "0":
+    case "false":
+      return "off";
+    default:
+      return undefined;
+  }
+}
+
+/** CLI and environment overrides take precedence over the saved user preference (default: "on"). */
+export function readAgyFooterMode(
+  flag: unknown = undefined,
+  env: NodeJS.ProcessEnv = process.env,
+  savedMode: AgyFooterMode | undefined = undefined,
+): AgyFooterMode {
+  const raw =
+    flag ??
+    env.PI_ANTIGRAVITY_FOOTER ??
+    env.PI_ANTIGRAVITY_CUSTOM_FOOTER ??
+    savedMode ??
+    "on";
+  const parsed = parseFooterModeValue(raw);
+  if (!parsed) {
+    throw new Error('--agy-footer / PI_ANTIGRAVITY_FOOTER must be "on" or "off".');
+  }
+  return parsed;
+}
+
 export interface FooterThemeLike {
   fg(color: string, text: string): string;
 }

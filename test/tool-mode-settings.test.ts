@@ -4,7 +4,13 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { SettingsManager } from "@earendil-works/pi-coding-agent";
-import { loadSavedAgyToolMode, saveAgyToolMode } from "../lib/tool-mode-settings.ts";
+import { readAgyFooterMode, resolveAgyFooterModeCommand } from "../lib/footer.ts";
+import {
+  loadSavedAgyFooterMode,
+  loadSavedAgyToolMode,
+  saveAgyFooterMode,
+  saveAgyToolMode,
+} from "../lib/tool-mode-settings.ts";
 
 test("saved tool mode survives new readers and Pi's own settings writes", async (t) => {
   const dir = await mkdtemp(path.join(tmpdir(), "agy-tool-settings-"));
@@ -40,4 +46,32 @@ test("malformed settings are preserved when saving fails", async (t) => {
   }
   await writeFile(file, '{"antigravity":{"toolMode":"broken"}}');
   assert.throws(() => loadSavedAgyToolMode(file), /antigravity.toolMode/);
+});
+
+test("footer mode defaults to on, respects CLI/env/saved precedence, and persists in settings.json", async (t) => {
+  const dir = await mkdtemp(path.join(tmpdir(), "agy-footer-settings-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "settings.json");
+
+  assert.equal(loadSavedAgyFooterMode(file), undefined);
+  assert.equal(readAgyFooterMode(undefined, {}, undefined), "on");
+  assert.equal(readAgyFooterMode(undefined, {}, "off"), "off");
+  assert.equal(readAgyFooterMode(undefined, { PI_ANTIGRAVITY_FOOTER: "off" }, "on"), "off");
+  assert.equal(readAgyFooterMode(undefined, { PI_ANTIGRAVITY_CUSTOM_FOOTER: "0" }, "on"), "off");
+  assert.equal(readAgyFooterMode("on", { PI_ANTIGRAVITY_FOOTER: "off" }, "off"), "on");
+
+  assert.equal(resolveAgyFooterModeCommand("", "on"), "off");
+  assert.equal(resolveAgyFooterModeCommand("", "off"), "on");
+  assert.equal(resolveAgyFooterModeCommand("on", "off"), "on");
+  assert.equal(resolveAgyFooterModeCommand("off", "on"), "off");
+  assert.equal(resolveAgyFooterModeCommand("status", "on"), "status");
+  assert.equal(resolveAgyFooterModeCommand("invalid", "on"), undefined);
+
+  await saveAgyToolMode("pi", file);
+  await saveAgyFooterMode("off", file);
+  assert.equal(loadSavedAgyFooterMode(file), "off");
+  assert.equal(loadSavedAgyToolMode(file), "pi");
+  assert.deepEqual(JSON.parse(await readFile(file, "utf8")), {
+    antigravity: { toolMode: "pi", footer: "off" },
+  });
 });

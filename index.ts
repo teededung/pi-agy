@@ -10,6 +10,7 @@
 //   /teamwork       toggle Teamwork two-phase multi-agent mode or start a project
 //   /agy            show agy conversation and persistent-driver status
 //   /agy-tools      toggle Pi tools on/off or show the current mode
+//   /agy-footer     toggle 2-row custom footer on/off or show status
 //   /agy-reset      drop the current agy conversation (next turn starts fresh)
 //   /agy-models     re-discover models from `agy models` and re-register
 //   /agy-agents     list configured custom agents
@@ -57,7 +58,12 @@ import {
 import { parseAgyAgents, readAgyProcessProfile } from "./lib/agy-profile.ts";
 import { createPiToolsAgent } from "./lib/pi-tools-agent.ts";
 import { readAgyToolMode, resolveAgyToolModeCommand, type AgyToolMode } from "./lib/tool-mode.ts";
-import { loadSavedAgyToolMode, saveAgyToolMode } from "./lib/tool-mode-settings.ts";
+import {
+  loadSavedAgyFooterMode,
+  loadSavedAgyToolMode,
+  saveAgyFooterMode,
+  saveAgyToolMode,
+} from "./lib/tool-mode-settings.ts";
 import { removeMcpCacheEntry } from "./lib/mcp-cache.ts";
 import { createPrivateMcpConfig } from "./lib/mcp-config.ts";
 import { AgyPiBridge, selectBridgedTools, type PiToolInfo } from "./lib/bridge.ts";
@@ -98,8 +104,11 @@ import {
 } from "./lib/agy-compaction.ts";
 import {
   computeSessionUsageSnapshot,
+  readAgyFooterMode,
   renderFooterLines,
   resolveAgyBranchContextTokens,
+  resolveAgyFooterModeCommand,
+  type AgyFooterMode,
   type SessionUsageSnapshot,
 } from "./lib/footer.ts";
 import {
@@ -361,11 +370,29 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     description: "Antigravity tool mode: native or pi (execute work through Pi tools)",
     type: "string",
   });
+  pi.registerFlag("agy-footer", {
+    description: "Antigravity 2-row custom footer: on or off (default: on)",
+    type: "string",
+  });
   // Flags are not populated while the extension factory runs.
   let toolMode: AgyToolMode | undefined;
   const getToolMode = () =>
     (toolMode ??= readAgyToolMode(pi.getFlag("agy-tools"), process.env, loadSavedAgyToolMode()));
   let switchingToolMode = false;
+  let footerMode: AgyFooterMode | undefined;
+  const getFooterMode = (): AgyFooterMode => {
+    if (footerMode) return footerMode;
+    try {
+      footerMode = readAgyFooterMode(
+        pi.getFlag("agy-footer"),
+        process.env,
+        loadSavedAgyFooterMode(),
+      );
+    } catch {
+      footerMode = "on";
+    }
+    return footerMode;
+  };
 
   installMarkedBrTagPatch();
   installSessionSelectorDeletePatch();
@@ -504,9 +531,21 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   let lastSyncedSessionTitleKey: string | undefined;
   let trackedConversationId: string | undefined;
   let requestFooterRender: (() => void) | undefined;
+  let agyFooterInstalled = false;
+
+  function uninstallAgyFooter(ctx: ExtensionContext): void {
+    probeCtx(() => {
+      if (!ctx.hasUI || typeof ctx.ui.setFooter !== "function") return;
+      if (agyFooterInstalled) {
+        ctx.ui.setFooter(undefined);
+      }
+      agyFooterInstalled = false;
+      requestFooterRender = undefined;
+    });
+  }
 
   function installAgyFooter(ctx: ExtensionContext): void {
-    if (process.env.PI_ANTIGRAVITY_CUSTOM_FOOTER === "0") return;
+    if (getFooterMode() === "off") return;
     probeCtx(() => {
       if (!ctx.hasUI || typeof ctx.ui.setFooter !== "function") return;
       let cachedKey = "";
@@ -516,11 +555,13 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       let cachedBranchAgyTokens: number | undefined;
 
       ctx.ui.setFooter((tui, theme, footerData) => {
+        agyFooterInstalled = true;
         requestFooterRender = () => tui.requestRender();
         const unsubBranch = footerData.onBranchChange(() => tui.requestRender());
         return {
           dispose() {
             unsubBranch();
+            agyFooterInstalled = false;
             if (requestFooterRender) requestFooterRender = undefined;
           },
           invalidate() {
@@ -1789,17 +1830,28 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("agy", {
-    description: "Show agy status, or persistently toggle Pi tools with tools [on|off|status]",
+    description:
+      "Show agy status, or persistently toggle Pi tools / custom footer with tools|footer [on|off|status]",
     getArgumentCompletions: (prefix) =>
-      ["tools", "tools on", "tools off", "tools status"]
+      [
+        "tools",
+        "tools on",
+        "tools off",
+        "tools status",
+        "footer",
+        "footer on",
+        "footer off",
+        "footer status",
+      ]
         .filter((value) => value.startsWith(prefix))
         .map((value) => ({ value, label: value })),
     handler: async (args, ctx) => {
       const [action, ...rest] = args.trim().split(/\s+/);
       if (action === "tools") return handleAgyToolsCommand(rest.join(" "), ctx);
+      if (action === "footer") return handleAgyFooterCommand(rest.join(" "), ctx);
       if (args.trim()) {
         ctx.ui.notify(
-          'antigravity: use "/agy-tools", "/m", "/boost", "/teamwork", "/agy-reset", "/agy-models", "/agy-agents", "/agy-doctor", "/agy-subagents", "/agy-tasks", "/agy-artifacts", or "/agy-usage".',
+          'antigravity: use "/agy-tools", "/agy-footer", "/m", "/boost", "/teamwork", "/agy-reset", "/agy-models", "/agy-agents", "/agy-doctor", "/agy-subagents", "/agy-tasks", "/agy-artifacts", or "/agy-usage".',
           "error",
         );
         return;
@@ -1833,7 +1885,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         const configured = readAgyProcessProfile();
         const agent = getToolMode() === "pi" ? piToolsAgent.name : configured.agent;
         const boostState = ` · boost: ${sessionBoostMode ? "ON" : "OFF"} · teamwork: ${isTeamworkActive() ? "ON" : "OFF"}`;
-        profile = `agent: ${agent ?? "none"} · mode: ${configured.mode ?? "default"} · tools: ${getToolMode()}${boostState}`;
+        profile = `agent: ${agent ?? "none"} · mode: ${configured.mode ?? "default"} · tools: ${getToolMode()} · footer: ${getFooterMode()}${boostState}`;
       } catch (error) {
         profile = `profile error: ${error instanceof Error ? error.message : String(error)}`;
       }
@@ -1843,6 +1895,55 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       );
     },
   });
+
+  pi.registerCommand("agy-footer", {
+    description: "Toggle and save the 2-row custom footer, or use on, off, or status",
+    getArgumentCompletions: (prefix) =>
+      ["on", "off", "status"]
+        .filter((value) => value.startsWith(prefix))
+        .map((value) => ({ value, label: value })),
+    handler: handleAgyFooterCommand,
+  });
+
+  async function handleAgyFooterCommand(
+    args: string,
+    ctx: ExtensionCommandContext,
+  ): Promise<void> {
+    const current = getFooterMode();
+    const action = resolveAgyFooterModeCommand(args, current);
+    const notifyStatus = () => {
+      ctx.ui.notify(
+        `antigravity: custom footer ${getFooterMode().toUpperCase()}.`,
+        "info",
+      );
+    };
+    if (action === undefined) {
+      ctx.ui.notify(
+        'agy-footer: usage "/agy-footer [on|off|status]"; no argument toggles the footer.',
+        "error",
+      );
+      return;
+    }
+    if (action === "status") {
+      notifyStatus();
+      return;
+    }
+    footerMode = action;
+    if (action === "on") {
+      installAgyFooter(ctx);
+    } else {
+      uninstallAgyFooter(ctx);
+    }
+    try {
+      await saveAgyFooterMode(action);
+      notifyStatus();
+    } catch (error) {
+      ctx.ui.notify(
+        `antigravity: could not save footer mode (${error instanceof Error ? error.message : String(error)}).`,
+        "error",
+      );
+    }
+  }
 
   pi.registerCommand("agy-tools", {
     description: "Toggle and save Pi tools, or use on, off, or status",
