@@ -5,9 +5,12 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import {
+  deleteAgyConversationsForSessionFile,
   detachAgyConversationBridgeMetadata,
+  extractAgyConversationIdsFromSessionFile,
   sweepStalePiToolsConversations,
 } from "../lib/conversation-metadata.ts";
+import { installSessionSelectorDeletePatch } from "../index.ts";
 import { isAgyEditTool } from "../lib/diff.ts";
 import { mapAgyToolToNative } from "../lib/native-tools.ts";
 import { createPiToolsAgent } from "../lib/pi-tools-agent.ts";
@@ -621,6 +624,96 @@ test("shouldInterceptSubagentSteerInput routes interactive Enter steer to /btw o
     undefined,
   );
 });
+
+test("installSessionSelectorDeletePatch and deleteAgyConversationsForSessionFile delete linked agy conversations on /resume Ctrl+D", async (t) => {
+  const home = await mkdtemp(path.join(tmpdir(), "pi-agy-resume-del-"));
+  t.after(async () => {
+    await rm(home, { recursive: true, force: true });
+  });
+
+  const cid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+  const agyBase = path.join(home, ".gemini", "antigravity-cli");
+  await mkdir(path.join(agyBase, "conversations"), { recursive: true });
+  await mkdir(path.join(agyBase, "annotations"), { recursive: true });
+  await mkdir(path.join(agyBase, "presence"), { recursive: true });
+  await mkdir(path.join(agyBase, "implicit"), { recursive: true });
+  await mkdir(path.join(agyBase, "brain", cid), { recursive: true });
+  await mkdir(path.join(agyBase, "cache"), { recursive: true });
+
+  await writeFile(path.join(agyBase, "conversations", `${cid}.db`), "db");
+  await writeFile(path.join(agyBase, "annotations", `${cid}.pbtxt`), 'title:"test"');
+  await writeFile(path.join(agyBase, "presence", `${cid}.lock`), "lock");
+  await writeFile(path.join(agyBase, "implicit", `${cid}.pb`), "pb");
+  await writeFile(path.join(agyBase, "brain", cid, "task.md"), "task");
+  await writeFile(
+    path.join(agyBase, "cache", "conversation_metadata.json"),
+    JSON.stringify({ conversations: { [cid]: { summary: { Title: "test" } } } }),
+  );
+
+  const summariesDbPath = path.join(agyBase, "conversation_summaries.db");
+  const db = new DatabaseSync(summariesDbPath);
+  db.exec(
+    "CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT)",
+  );
+  db.prepare("INSERT INTO conversation_summaries (conversation_id, title) VALUES (?, ?)").run(
+    cid,
+    "test",
+  );
+  db.close();
+
+  const sessionPath = path.join(home, "session.jsonl");
+  await writeFile(
+    sessionPath,
+    `${JSON.stringify({
+      type: "custom",
+      customType: "pi-agy-conversation-state",
+      data: { version: 1, kind: "conversation", conversationId: cid },
+    })}\n`,
+  );
+
+  assert.deepEqual(extractAgyConversationIdsFromSessionFile(sessionPath), [cid]);
+
+  const deletedOrder: string[] = [];
+  class FakeSessionSelector {
+    sessionList = {
+      onDeleteSession: async (targetPath: string) => {
+        deletedOrder.push(`pi:${targetPath}`);
+        await rm(targetPath, { force: true });
+      },
+    };
+    handleInput(_data: string): void {}
+    cancelLoads(): void {}
+  }
+
+  installSessionSelectorDeletePatch(FakeSessionSelector, async (targetPath) => {
+    deletedOrder.push(`agy:${targetPath}`);
+    await deleteAgyConversationsForSessionFile(targetPath, home);
+  });
+
+  const selector = new FakeSessionSelector();
+  selector.handleInput("\x04");
+  await selector.sessionList.onDeleteSession(sessionPath);
+
+  assert.deepEqual(deletedOrder, [`agy:${sessionPath}`, `pi:${sessionPath}`]);
+  await assert.rejects(stat(path.join(agyBase, "conversations", `${cid}.db`)));
+  await assert.rejects(stat(path.join(agyBase, "annotations", `${cid}.pbtxt`)));
+  await assert.rejects(stat(path.join(agyBase, "presence", `${cid}.lock`)));
+  await assert.rejects(stat(path.join(agyBase, "implicit", `${cid}.pb`)));
+  await assert.rejects(stat(path.join(agyBase, "brain", cid)));
+
+  const checkDb = new DatabaseSync(summariesDbPath, { readOnly: true });
+  const remaining = checkDb
+    .prepare("SELECT count(*) as c FROM conversation_summaries WHERE conversation_id = ?")
+    .get(cid) as { c: number };
+  checkDb.close();
+  assert.equal(remaining.c, 0);
+
+  const metaJson = JSON.parse(
+    await readFile(path.join(agyBase, "cache", "conversation_metadata.json"), "utf8"),
+  ) as { conversations: Record<string, unknown> };
+  assert.equal(cid in metaJson.conversations, false);
+});
+
 
 
 

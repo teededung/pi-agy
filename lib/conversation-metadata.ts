@@ -332,15 +332,39 @@ export async function syncAgyConversationTitle(
 }
 
 /**
- * Remove a disposable agy conversation created solely for Pi's internal
- * compaction / branch-summary requests so it never pollutes `agy -c` or
- * evicts the user's real conversations.
+ * Extract all Antigravity conversation IDs (`conversationId` UUIDs) referenced in a
+ * Pi session `.jsonl` file on disk.
+ */
+export function extractAgyConversationIdsFromSessionFile(
+  sessionFilePath: string | undefined,
+): string[] {
+  if (!sessionFilePath || !existsSync(sessionFilePath)) return [];
+  const ids = new Set<string>();
+  try {
+    const content = readFileSync(sessionFilePath, "utf-8");
+    const regex = /"conversationId"\s*:\s*"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"/g;
+    let match: RegExpExecArray | null;
+    while ((match = regex.exec(content)) !== null) {
+      if (match[1]) ids.add(match[1].toLowerCase());
+    }
+  } catch {
+    // Best-effort
+  }
+  return Array.from(ids);
+}
+
+/**
+ * Remove an agy conversation completely from disk (`conversations/<id>.db*`,
+ * `annotations/<id>.pbtxt`, `presence/<id>.lock`, `implicit/<id>.pb`,
+ * `brain/<id>`, `conversation_summaries.db`, and `cache/conversation_metadata.json`)
+ * so it never pollutes `agy -c` / `agy --resume`.
  */
 export async function deleteDisposableAgyConversation(
   conversationId: string | undefined,
   homeDirectory = os.homedir(),
 ): Promise<void> {
   if (!conversationId || !/^[0-9a-f-]{36}$/i.test(conversationId)) return;
+  detachedTrajectoryBridgeFields.delete(conversationId);
   const baseDir = path.join(homeDirectory, ".gemini", "antigravity-cli");
   const removals = [
     path.join(baseDir, "conversations", `${conversationId}.db`),
@@ -348,29 +372,58 @@ export async function deleteDisposableAgyConversation(
     path.join(baseDir, "conversations", `${conversationId}.db-shm`),
     path.join(baseDir, "annotations", `${conversationId}.pbtxt`),
     path.join(baseDir, "presence", `${conversationId}.lock`),
+    path.join(baseDir, "implicit", `${conversationId}.pb`),
     path.join(baseDir, "brain", conversationId),
   ];
   await Promise.all(
     removals.map((target) => fs.rm(target, { recursive: true, force: true }).catch(() => {})),
   );
-  try {
-    const dbPath = path.join(baseDir, "conversation_summaries.db");
-    const { execFile } = await import("node:child_process");
-    const sqlId = conversationId.replace(/'/g, "''");
-    await new Promise<void>((resolve) => {
-      execFile(
-        "sqlite3",
-        [
-          dbPath,
-          `PRAGMA busy_timeout = 2000; DELETE FROM conversation_summaries WHERE conversation_id = '${sqlId}';`,
-        ],
-        { timeout: 3000 },
-        () => resolve(),
+  const dbPath = path.join(baseDir, "conversation_summaries.db");
+  if (existsSync(dbPath)) {
+    let db: DatabaseSync | undefined;
+    try {
+      db = new DatabaseSync(dbPath);
+      db.exec("PRAGMA busy_timeout = 2000;");
+      db.prepare("DELETE FROM conversation_summaries WHERE conversation_id = ?").run(
+        conversationId,
       );
-    });
-  } catch {
-    // Best-effort
+    } catch {
+      // Best-effort
+    } finally {
+      try {
+        db?.close();
+      } catch {
+        // Ignore close errors
+      }
+    }
   }
+  const metadataPath = agyConversationMetadataPath(homeDirectory);
+  if (existsSync(metadataPath)) {
+    try {
+      const parsed = JSON.parse(readFileSync(metadataPath, "utf-8")) as Record<string, unknown>;
+      const conversations = record(parsed.conversations);
+      if (conversations && conversationId in conversations) {
+        delete conversations[conversationId];
+        writeFileSync(metadataPath, JSON.stringify(parsed), "utf-8");
+      }
+    } catch {
+      // Best-effort
+    }
+  }
+}
+
+/**
+ * Clean up all Antigravity conversations linked to a Pi session `.jsonl` file.
+ */
+export async function deleteAgyConversationsForSessionFile(
+  sessionFilePath: string | undefined,
+  homeDirectory = os.homedir(),
+): Promise<string[]> {
+  const ids = extractAgyConversationIdsFromSessionFile(sessionFilePath);
+  for (const id of ids) {
+    await deleteDisposableAgyConversation(id, homeDirectory);
+  }
+  return ids;
 }
 
 const PI_TOOLS_AGENT_MARKER = Buffer.from("pi-tools-", "utf-8");

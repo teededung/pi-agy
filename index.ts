@@ -29,7 +29,12 @@ import type {
   ExtensionUIContext,
   ProviderModelConfig,
 } from "@earendil-works/pi-coding-agent";
-import { getDocsPath, getExamplesPath, getReadmePath } from "@earendil-works/pi-coding-agent";
+import {
+  getDocsPath,
+  getExamplesPath,
+  getReadmePath,
+  SessionSelectorComponent,
+} from "@earendil-works/pi-coding-agent";
 import { Marked, stripTerminalSequences, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
@@ -99,6 +104,7 @@ import {
   type PersistedAgyReset,
 } from "./lib/conversation-state.ts";
 import {
+  deleteAgyConversationsForSessionFile,
   detachAgyConversationBridgeMetadata,
   readAgyConversationMetadata,
   sweepStalePiToolsConversations,
@@ -289,6 +295,61 @@ function installMarkedBrTagPatch(): void {
 
 installMarkedBrTagPatch();
 
+const SESSION_SELECTOR_DELETE_PATCH_SYMBOL = Symbol.for("pi-agy.session-selector-delete-patch");
+
+/**
+ * Patch Pi's interactive `/resume` (`SessionSelectorComponent`) so pressing
+ * `Ctrl+D` to delete a Pi session `.jsonl` file also deletes all linked
+ * Antigravity (`agy`) conversations before the `.jsonl` is moved to trash or
+ * unlinked (matching `/nix quit` and `/session-cleanup`).
+ */
+export function installSessionSelectorDeletePatch(
+  SelectorClass: unknown = SessionSelectorComponent,
+  cleanupSessionFile: (sessionPath: string) => Promise<unknown> = deleteAgyConversationsForSessionFile,
+): void {
+  try {
+    const proto = (SelectorClass as { prototype?: Record<string | symbol, unknown> })?.prototype;
+    if (!proto || proto[SESSION_SELECTOR_DELETE_PATCH_SYMBOL]) return;
+    const origCancelLoads = proto.cancelLoads;
+    const origHandleInput = proto.handleInput;
+    if (typeof origCancelLoads !== "function" && typeof origHandleInput !== "function") return;
+
+    const wrapSessionListDelete = (instance: unknown): void => {
+      const list = (instance as { sessionList?: Record<string | symbol, unknown> })?.sessionList;
+      if (!list || list[SESSION_SELECTOR_DELETE_PATCH_SYMBOL]) return;
+      const origOnDelete = list.onDeleteSession;
+      if (typeof origOnDelete !== "function") return;
+      list.onDeleteSession = async (sessionPath: string) => {
+        try {
+          await cleanupSessionFile(sessionPath);
+        } catch {
+          // Best-effort cleanup before Pi removes the session file.
+        }
+        return await (origOnDelete as (p: string) => Promise<unknown>).call(list, sessionPath);
+      };
+      list[SESSION_SELECTOR_DELETE_PATCH_SYMBOL] = true;
+    };
+
+    if (typeof origCancelLoads === "function") {
+      proto.cancelLoads = function patchedCancelLoads(this: unknown, ...args: unknown[]) {
+        wrapSessionListDelete(this);
+        return origCancelLoads.apply(this, args);
+      };
+    }
+    if (typeof origHandleInput === "function") {
+      proto.handleInput = function patchedHandleInput(this: unknown, ...args: unknown[]) {
+        wrapSessionListDelete(this);
+        return origHandleInput.apply(this, args);
+      };
+    }
+    proto[SESSION_SELECTOR_DELETE_PATCH_SYMBOL] = true;
+  } catch {
+    // Best-effort patch for interactive `/resume` selector.
+  }
+}
+
+installSessionSelectorDeletePatch();
+
 export default function antigravityExtension(pi: ExtensionAPI): void {
   pi.registerFlag("agy-tools", {
     description: "Antigravity tool mode: native or pi (execute work through Pi tools)",
@@ -301,6 +362,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   let switchingToolMode = false;
 
   installMarkedBrTagPatch();
+  installSessionSelectorDeletePatch();
   installAgyDeathHooks();
   const runtime = createAntigravityRuntime();
   const service = runtime.runSync(AntigravityRuntime);
