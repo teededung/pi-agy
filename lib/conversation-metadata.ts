@@ -427,6 +427,25 @@ export async function deleteAgyConversationsForSessionFile(
   return ids;
 }
 
+/**
+ * Sync a session title to all Antigravity conversations linked to a Pi session `.jsonl` file.
+ */
+export async function renameAgyConversationsForSessionFile(
+  sessionFilePath: string | undefined,
+  title: string,
+  homeDirectory = os.homedir(),
+): Promise<string[]> {
+  const normalized = title.replace(/[\r\n\t]+/g, " ").trim();
+  if (!normalized) return [];
+  const ids = extractAgyConversationIdsFromSessionFile(sessionFilePath);
+  for (const id of ids) {
+    if (await syncAgyConversationTitle(id, normalized, homeDirectory)) {
+      detachAgyConversationBridgeMetadata(id, homeDirectory);
+    }
+  }
+  return ids;
+}
+
 const PI_TOOLS_AGENT_MARKER = Buffer.from("pi-tools-", "utf-8");
 const BRIDGE_PATH_MARKER = Buffer.from("/antigravity/bridges/", "utf-8");
 

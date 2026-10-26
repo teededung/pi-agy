@@ -8,6 +8,7 @@ import {
   deleteAgyConversationsForSessionFile,
   detachAgyConversationBridgeMetadata,
   extractAgyConversationIdsFromSessionFile,
+  renameAgyConversationsForSessionFile,
   sweepStalePiToolsConversations,
 } from "../lib/conversation-metadata.ts";
 import { installSessionSelectorDeletePatch } from "../index.ts";
@@ -686,12 +687,11 @@ test("installSessionSelectorDeletePatch and deleteAgyConversationsForSessionFile
   const summariesDbPath = path.join(agyBase, "conversation_summaries.db");
   const db = new DatabaseSync(summariesDbPath);
   db.exec(
-    "CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT)",
+    "CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT, raw_summary BLOB)",
   );
-  db.prepare("INSERT INTO conversation_summaries (conversation_id, title) VALUES (?, ?)").run(
-    cid,
-    "test",
-  );
+  db.prepare(
+    "INSERT INTO conversation_summaries (conversation_id, title, raw_summary) VALUES (?, ?, ?)",
+  ).run(cid, "test", null);
   db.close();
 
   const sessionPath = path.join(home, "session.jsonl");
@@ -706,28 +706,59 @@ test("installSessionSelectorDeletePatch and deleteAgyConversationsForSessionFile
 
   assert.deepEqual(extractAgyConversationIdsFromSessionFile(sessionPath), [cid]);
 
-  const deletedOrder: string[] = [];
+  const eventsOrder: string[] = [];
   class FakeSessionSelector {
     sessionList = {
       onDeleteSession: async (targetPath: string) => {
-        deletedOrder.push(`pi:${targetPath}`);
+        eventsOrder.push(`pi-delete:${targetPath}`);
         await rm(targetPath, { force: true });
       },
+    };
+    renameSession = async (targetPath: string, nextName: string) => {
+      eventsOrder.push(`pi-rename:${targetPath}:${nextName}`);
     };
     handleInput(_data: string): void {}
     cancelLoads(): void {}
   }
 
-  installSessionSelectorDeletePatch(FakeSessionSelector, async (targetPath) => {
-    deletedOrder.push(`agy:${targetPath}`);
-    await deleteAgyConversationsForSessionFile(targetPath, home);
-  });
+  installSessionSelectorDeletePatch(
+    FakeSessionSelector,
+    async (targetPath) => {
+      eventsOrder.push(`agy-delete:${targetPath}`);
+      await deleteAgyConversationsForSessionFile(targetPath, home);
+    },
+    async (targetPath, nextName) => {
+      eventsOrder.push(`agy-rename:${targetPath}:${nextName}`);
+      await renameAgyConversationsForSessionFile(targetPath, nextName, home);
+    },
+  );
 
   const selector = new FakeSessionSelector();
+  selector.handleInput("\x12");
+  await selector.renameSession(sessionPath, "Renamed From Resume");
+
+  assert.deepEqual(eventsOrder, [
+    `pi-rename:${sessionPath}:Renamed From Resume`,
+    `agy-rename:${sessionPath}:Renamed From Resume`,
+  ]);
+  const renamedPbtxt = await readFile(path.join(agyBase, "annotations", `${cid}.pbtxt`), "utf8");
+  assert.match(renamedPbtxt, /title:"Renamed From Resume"/);
+  const renamedDb = new DatabaseSync(summariesDbPath, { readOnly: true });
+  const renamedRow = renamedDb
+    .prepare("SELECT title FROM conversation_summaries WHERE conversation_id = ?")
+    .get(cid) as { title: string };
+  renamedDb.close();
+  assert.equal(renamedRow.title, "Renamed From Resume");
+  const renamedMetaJson = JSON.parse(
+    await readFile(path.join(agyBase, "cache", "conversation_metadata.json"), "utf8"),
+  ) as { conversations: Record<string, { summary?: { Title?: string } }> };
+  assert.equal(renamedMetaJson.conversations[cid]?.summary?.Title, "Renamed From Resume");
+
+  eventsOrder.length = 0;
   selector.handleInput("\x04");
   await selector.sessionList.onDeleteSession(sessionPath);
 
-  assert.deepEqual(deletedOrder, [`agy:${sessionPath}`, `pi:${sessionPath}`]);
+  assert.deepEqual(eventsOrder, [`agy-delete:${sessionPath}`, `pi-delete:${sessionPath}`]);
   await assert.rejects(stat(path.join(agyBase, "conversations", `${cid}.db`)));
   await assert.rejects(stat(path.join(agyBase, "annotations", `${cid}.pbtxt`)));
   await assert.rejects(stat(path.join(agyBase, "presence", `${cid}.lock`)));

@@ -122,6 +122,7 @@ import {
   deleteAgyConversationsForSessionFile,
   detachAgyConversationBridgeMetadata,
   readAgyConversationMetadata,
+  renameAgyConversationsForSessionFile,
   sweepStalePiToolsConversations,
   syncAgyConversationTitle,
 } from "./lib/conversation-metadata.ts";
@@ -311,16 +312,35 @@ function installMarkedBrTagPatch(): void {
 installMarkedBrTagPatch();
 
 const SESSION_SELECTOR_DELETE_PATCH_SYMBOL = Symbol.for("pi-agy.session-selector-delete-patch");
+const SESSION_SELECTOR_RENAME_PATCH_SYMBOL = Symbol.for("pi-agy.session-selector-rename-patch");
+const sessionSelectorRenameListeners = new Set<
+  (sessionPath: string, nextName: string) => Promise<void> | void
+>();
 
 /**
- * Patch Pi's interactive `/resume` (`SessionSelectorComponent`) so pressing
- * `Ctrl+D` to delete a Pi session `.jsonl` file also deletes all linked
- * Antigravity (`agy`) conversations before the `.jsonl` is moved to trash or
- * unlinked (matching `/nix quit` and `/session-cleanup`).
+ * Patch Pi's interactive `/resume` (`SessionSelectorComponent`) so:
+ * - pressing `Ctrl+D` to delete a Pi session `.jsonl` file also deletes all
+ *   linked Antigravity (`agy`) conversations before the `.jsonl` is moved to
+ *   trash or unlinked (matching `/nix quit` and `/session-cleanup`), and
+ * - pressing `Ctrl+R` to rename a Pi session `.jsonl` file also syncs the new
+ *   title to all linked Antigravity (`agy`) conversations immediately.
  */
 export function installSessionSelectorDeletePatch(
   SelectorClass: unknown = SessionSelectorComponent,
   cleanupSessionFile: (sessionPath: string) => Promise<unknown> = deleteAgyConversationsForSessionFile,
+  renameSessionFile: (
+    sessionPath: string,
+    nextName: string,
+  ) => Promise<unknown> = async (sessionPath, nextName) => {
+    await renameAgyConversationsForSessionFile(sessionPath, nextName);
+    for (const listener of sessionSelectorRenameListeners) {
+      try {
+        await listener(sessionPath, nextName);
+      } catch {
+        // Best-effort active session sync.
+      }
+    }
+  },
 ): void {
   try {
     const proto = (SelectorClass as { prototype?: Record<string | symbol, unknown> })?.prototype;
@@ -329,31 +349,55 @@ export function installSessionSelectorDeletePatch(
     const origHandleInput = proto.handleInput;
     if (typeof origCancelLoads !== "function" && typeof origHandleInput !== "function") return;
 
-    const wrapSessionListDelete = (instance: unknown): void => {
-      const list = (instance as { sessionList?: Record<string | symbol, unknown> })?.sessionList;
-      if (!list || list[SESSION_SELECTOR_DELETE_PATCH_SYMBOL]) return;
-      const origOnDelete = list.onDeleteSession;
-      if (typeof origOnDelete !== "function") return;
-      list.onDeleteSession = async (sessionPath: string) => {
-        try {
-          await cleanupSessionFile(sessionPath);
-        } catch {
-          // Best-effort cleanup before Pi removes the session file.
-        }
-        return await (origOnDelete as (p: string) => Promise<unknown>).call(list, sessionPath);
+    const wrapSessionSelectorInstance = (instance: unknown): void => {
+      const selector = instance as {
+        sessionList?: Record<string | symbol, unknown>;
+        renameSession?: (sessionPath: string, nextName: string) => Promise<unknown>;
+        [SESSION_SELECTOR_RENAME_PATCH_SYMBOL]?: boolean;
       };
-      list[SESSION_SELECTOR_DELETE_PATCH_SYMBOL] = true;
+      const list = selector?.sessionList;
+      if (list && !list[SESSION_SELECTOR_DELETE_PATCH_SYMBOL]) {
+        const origOnDelete = list.onDeleteSession;
+        if (typeof origOnDelete === "function") {
+          list.onDeleteSession = async (sessionPath: string) => {
+            try {
+              await cleanupSessionFile(sessionPath);
+            } catch {
+              // Best-effort cleanup before Pi removes the session file.
+            }
+            return await (origOnDelete as (p: string) => Promise<unknown>).call(list, sessionPath);
+          };
+          list[SESSION_SELECTOR_DELETE_PATCH_SYMBOL] = true;
+        }
+      }
+      if (
+        selector &&
+        !selector[SESSION_SELECTOR_RENAME_PATCH_SYMBOL] &&
+        typeof selector.renameSession === "function"
+      ) {
+        const origRename = selector.renameSession;
+        selector.renameSession = async (sessionPath: string, nextName: string) => {
+          const result = await origRename.call(selector, sessionPath, nextName);
+          try {
+            await renameSessionFile(sessionPath, nextName);
+          } catch {
+            // Best-effort title sync after Pi renames the session file.
+          }
+          return result;
+        };
+        selector[SESSION_SELECTOR_RENAME_PATCH_SYMBOL] = true;
+      }
     };
 
     if (typeof origCancelLoads === "function") {
       proto.cancelLoads = function patchedCancelLoads(this: unknown, ...args: unknown[]) {
-        wrapSessionListDelete(this);
+        wrapSessionSelectorInstance(this);
         return origCancelLoads.apply(this, args);
       };
     }
     if (typeof origHandleInput === "function") {
       proto.handleInput = function patchedHandleInput(this: unknown, ...args: unknown[]) {
-        wrapSessionListDelete(this);
+        wrapSessionSelectorInstance(this);
         return origHandleInput.apply(this, args);
       };
     }
@@ -649,6 +693,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   }
 
   const detachOnProcessExit = () => {
+    sessionSelectorRenameListeners.delete(onSessionSelectorRename);
     detachConversationMetadata(trackedConversationId);
     piToolsAgent.removeSync();
     mcpConfig.removeSync();
@@ -675,6 +720,21 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       detachAgyConversationBridgeMetadata(conversationId);
     }
   }
+
+  const onSessionSelectorRename = async (sessionPath: string, nextName: string): Promise<void> => {
+    const trimmed = nextName.trim();
+    if (!trimmed || !activeSessionCtx) return;
+    const probe = probeCtx(() => ({
+      sessionFile: activeSessionCtx?.sessionManager.getSessionFile(),
+      currentName: activeSessionCtx?.sessionManager.getSessionName()?.trim(),
+    }));
+    if (probe.stale || !probe.value.sessionFile || probe.value.sessionFile !== sessionPath) return;
+    if (probe.value.currentName !== trimmed) {
+      pi.setSessionName(trimmed);
+    }
+    await syncSessionNameToAgy(activeSessionCtx);
+  };
+  sessionSelectorRenameListeners.add(onSessionSelectorRename);
 
   /** Compact footer status while this provider is selected. */
   function refreshToolModeStatus(ctx: ExtensionContext): void {
@@ -1784,6 +1844,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       // Already closed.
     }
     process.removeListener("exit", detachOnProcessExit);
+    sessionSelectorRenameListeners.delete(onSessionSelectorRename);
     detachConversationMetadata(shutdownConversationId);
     await teardownBridge();
     sweepStalePiToolsConversations();
