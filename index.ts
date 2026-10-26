@@ -105,12 +105,12 @@ import {
 } from "./lib/agy-compaction.ts";
 import {
   computeSessionUsageSnapshot,
-  isLatestBranchContextFromAgy,
   readAgyFooterMode,
   renderFooterLines,
-  resolveAgyBranchContextTokens,
   resolveAgyFooterModeCommand,
+  resolveBranchContextFootprint,
   type AgyFooterMode,
+  type BranchContextFootprint,
   type SessionUsageSnapshot,
 } from "./lib/footer.ts";
 import {
@@ -663,7 +663,6 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   }
 
   let activeSessionCtx: ExtensionContext | undefined;
-  let activeModel: ExtensionContext["model"] | undefined;
   let lastSyncedSessionTitleKey: string | undefined;
   let trackedConversationId: string | undefined;
   let requestFooterRender: (() => void) | undefined;
@@ -690,8 +689,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       let cachedSnapshot: SessionUsageSnapshot = {
         usageTotals: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
       };
-      let cachedBranchAgyTokens: number | undefined;
-      let cachedBranchLatestIsAgy = false;
+      let cachedFootprint: BranchContextFootprint = {};
 
       ctx.ui.setFooter((tui, theme, footerData) => {
         agyFooterInstalled = true;
@@ -725,7 +723,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
                 getCwd?(): string;
                 getSessionName?(): string | undefined;
               };
-              const model = activeModel ?? liveCtx.model ?? ctx.model;
+              const model = liveCtx.model ?? ctx.model;
               const sessionId = sm.getSessionId();
               const leafId = sm.getLeafId?.() ?? "";
               const branch = sm.getBranch();
@@ -735,8 +733,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
               if (key !== cachedKey) {
                 cachedKey = key;
                 cachedSnapshot = computeSessionUsageSnapshot(entries);
-                cachedBranchAgyTokens = resolveAgyBranchContextTokens(branch);
-                cachedBranchLatestIsAgy = isLatestBranchContextFromAgy(branch);
+                cachedFootprint = resolveBranchContextFootprint(branch);
               }
               return {
                 cwd: sm.getCwd?.() ?? liveCtx.cwd,
@@ -752,9 +749,9 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
             if (state.stale) return [];
             const { cwd, sessionName, model, thinkingLevel, contextUsage } = state.value;
             const effectiveAgyTokens =
-              model?.provider === "antigravity" || cachedBranchLatestIsAgy
-                ? (observedContextTokens ?? cachedBranchAgyTokens)
-                : undefined;
+              model?.provider === "antigravity"
+                ? (observedContextTokens ?? cachedFootprint.agyTokens)
+                : cachedFootprint.nonAgyFallbackTokens;
             return renderFooterLines({
               width,
               cwd,
@@ -1664,8 +1661,6 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
 
   pi.on("agent_start", (_event, ctx) => {
     activeSessionCtx = ctx;
-    const modelProbe = probeCtx(() => ctx.model);
-    if (!modelProbe.stale) activeModel = modelProbe.value;
     subagentSpawnedThisTurn = false;
     const probe = probeCtx(() => ctx.model?.provider);
     if (probe.stale || probe.value !== "antigravity") return;
@@ -1707,8 +1702,6 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       }
     }
     activeSessionCtx = ctx;
-    const modelProbe = probeCtx(() => ctx.model);
-    if (!modelProbe.stale) activeModel = modelProbe.value;
     const probe = probeCtx(() => ctx.model?.provider);
     if (!probe.stale && (probe.value === "antigravity" || agyAgentActive)) {
       agyAgentActive = false;
@@ -1740,7 +1733,6 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
 
   pi.on("session_start", async (event, ctx: ExtensionContext) => {
     activeSessionCtx = ctx;
-    activeModel = ctx.model;
     lastSyncedSessionTitleKey = undefined;
     oneShotConsult = undefined;
     lastConsultUsed = undefined;
@@ -1829,7 +1821,6 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
 
   pi.on("model_select", async (event, ctx) => {
     activeSessionCtx = ctx;
-    activeModel = event.model ?? ctx.model;
     syncWrapperToolActivation(event.model?.provider);
     refreshToolModeStatus(ctx);
     invalidateFooter?.();
@@ -1882,8 +1873,6 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     // An agy conversation cannot be rewound to match a different pi branch.
     // Restart it and bootstrap the selected branch on the next provider call.
     activeSessionCtx = ctx;
-    const modelProbe = probeCtx(() => ctx.model);
-    if (!modelProbe.stale) activeModel = modelProbe.value;
     const provider = probeCtx(() => ctx.model?.provider);
     if (!provider.stale) syncWrapperToolActivation(provider.value);
     const cwd = probeCtx(() => ctx.cwd);
@@ -1911,7 +1900,6 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     if (sessionNamePollTimer) clearInterval(sessionNamePollTimer);
     sessionNamePollTimer = undefined;
     activeSessionCtx = undefined;
-    activeModel = undefined;
     agyAgentActive = false;
     if (widgetPollTimer) clearInterval(widgetPollTimer);
     widgetPollTimer = undefined;

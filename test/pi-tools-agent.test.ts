@@ -24,9 +24,9 @@ import {
 import {
   AGY_EFFECTIVE_CONTEXT_LIMIT,
   computeSessionUsageSnapshot,
-  isLatestBranchContextFromAgy,
   renderFooterLines,
   resolveAgyBranchContextTokens,
+  resolveBranchContextFootprint,
 } from "../lib/footer.ts";
 import { formatAgyCall } from "../lib/render.ts";
 import {
@@ -41,6 +41,7 @@ import {
   contextHasPriorBoostActivity,
   contextHasPriorTeamworkActivity,
   isBridgedMcpStep,
+  mapUsage,
 } from "../src/provider.ts";
 import { AntigravityRuntime, createAntigravityRuntime } from "../src/runtime.ts";
 
@@ -905,7 +906,8 @@ test("renderFooterLines renders 2-row footer with agy 300k context bar and filte
 
   // Switching mid-session from antigravity (300k) to kiro (1M) updates the footer limit to 1.0M
   // and preserves the 228k branch context footprint even when Pi's last-message totalTokens was 1.8k.
-  assert.equal(isLatestBranchContextFromAgy(branch), true);
+  const footprint = resolveBranchContextFootprint(branch);
+  assert.equal(footprint.nonAgyFallbackTokens, 228_000);
   const kiroLines = renderFooterLines({
     width: 120,
     cwd: "/Users/rongmauhong/Documents/Repo/ragnarok",
@@ -917,7 +919,7 @@ test("renderFooterLines renders 2-row footer with agy 300k context bar and filte
     reasoning: true,
     thinkingLevel: "high",
     availableProviderCount: 2,
-    agyContextTokens: isLatestBranchContextFromAgy(branch) ? agyTokens : undefined,
+    agyContextTokens: footprint.nonAgyFallbackTokens,
     modelContextWindow: 1_000_000,
     contextUsage: {
       tokens: 1_800,
@@ -933,6 +935,57 @@ test("renderFooterLines renders 2-row footer with agy 300k context bar and filte
   assert.equal(kiroLines.length, 2);
   assert.match(kiroLines[0]!, /\(kiro\) claude-opus-5-5 • high$/);
   assert.match(kiroLines[1]!, /^\[█+░+\] 228k\/1\.0M \(23%\) │ ↑3\.5k ↓800 R226k CH98\.7% \$11\.16/);
+
+  // Routed physical model contextWindow in contextUsage takes precedence over virtual modelContextWindow.
+  const routedKiroLines = renderFooterLines({
+    width: 120,
+    cwd: "/Users/rongmauhong/Documents/Repo/ragnarok",
+    home: "/Users/rongmauhong",
+    provider: "kiro",
+    modelId: "auto",
+    modelContextWindow: 1_000_000,
+    contextUsage: {
+      tokens: 100_000,
+      contextWindow: 200_000,
+      percent: 50,
+    },
+    usageTotals: snapshot.usageTotals,
+    theme: plainTheme,
+  });
+  assert.match(routedKiroLines[1]!, /^\[█+░+\] 100k\/200k \(50%\)/);
+
+  // One-shot /m consult on antigravity (truncated 51k bootstrap) after a 549k kiro turn keeps 549k floor.
+  const consultBranch = [
+    {
+      type: "message",
+      message: {
+        role: "assistant",
+        provider: "kiro",
+        usage: { input: 548_686, output: 799, totalTokens: 549_485 },
+      },
+    },
+    {
+      type: "message",
+      message: {
+        role: "assistant",
+        provider: "antigravity",
+        usage: { input: 2_254, output: 716, cacheRead: 48_958 },
+      },
+    },
+  ];
+  assert.equal(resolveBranchContextFootprint(consultBranch).nonAgyFallbackTokens, 549_485);
+
+  // Compaction resets prior branch context tokens, and mapUsage includes cache_read_tokens in totalTokens.
+  assert.equal(resolveAgyBranchContextTokens([...branch, { type: "compaction" }]), undefined);
+  assert.equal(
+    mapUsage({
+      input_tokens: 2_000,
+      output_tokens: 500,
+      cache_read_tokens: 226_000,
+      total_tokens: 2_500,
+    }).totalTokens,
+    228_500,
+  );
 });
 
 

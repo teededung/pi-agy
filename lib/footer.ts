@@ -142,71 +142,22 @@ export function formatFooterCwd(cwd: string, home = process.env.HOME || process.
  * Derive the latest known agy context footprint from the active Pi branch when
  * no live in-memory `observedContextTokens` sample is present yet.
  */
-export function resolveAgyBranchContextTokens(branch: readonly unknown[]): number | undefined {
-  let latest: number | undefined;
-  for (const raw of branch) {
-    const entry = raw as {
-      type?: string;
-      customType?: string;
-      data?: Record<string, unknown>;
-      message?: {
-        role?: string;
-        provider?: string;
-        usage?: { input?: number; cacheRead?: number };
-      };
-    };
-    if (entry.type === "custom") {
-      if (entry.customType === AGY_CONVERSATION_STATE_ENTRY && entry.data) {
-        if (entry.data.kind === "reset") {
-          latest = undefined;
-        } else if (
-          entry.data.kind === "conversation" &&
-          typeof entry.data.contextTokens === "number" &&
-          Number.isFinite(entry.data.contextTokens) &&
-          entry.data.contextTokens > 0
-        ) {
-          latest = entry.data.contextTokens;
-        }
-      } else if (
-        entry.customType === AGY_COMPACTION_ENTRY &&
-        entry.data &&
-        typeof entry.data.afterTokens === "number" &&
-        Number.isFinite(entry.data.afterTokens) &&
-        entry.data.afterTokens > 0
-      ) {
-        latest = entry.data.afterTokens;
-      }
-      continue;
-    }
-    if (entry.type === "compaction") {
-      latest = undefined;
-      continue;
-    }
-    if (entry.type === "message" && entry.message?.role === "assistant") {
-      if (entry.message.provider !== "antigravity") continue;
-      const input = entry.message.usage?.input ?? 0;
-      const cacheRead = entry.message.usage?.cacheRead ?? 0;
-      const total = input + cacheRead;
-      if (!Number.isFinite(total) || total <= 0) continue;
-      // Final step of a multi-step turn has its cumulative cacheRead subtracted by
-      // claimUsage(); ignore a synthetic cacheRead=0 drop when a fuller step was just seen.
-      if (cacheRead === 0 && latest !== undefined && latest >= 50_000 && total < latest * 0.2) {
-        continue;
-      }
-      latest = total;
-    }
-  }
-  return latest;
+export interface BranchContextFootprint {
+  /** Latest Antigravity context token footprint on the active branch. */
+  agyTokens?: number;
+  /** Fallback context tokens when a non-agy provider is active right after an agy turn/consult. */
+  nonAgyFallbackTokens?: number;
 }
 
 /**
- * Check whether the latest context-bearing entry on the branch comes from
- * Antigravity (either an assistant message or a persisted agy conversation/compaction state).
- * Used when switching mid-session from Antigravity to another provider (e.g. Kiro)
- * before the new provider has completed its first turn.
+ * Single-pass scan of the active Pi branch for Antigravity context tokens and
+ * cross-provider switch/consult fallback tokens.
  */
-export function isLatestBranchContextFromAgy(branch: readonly unknown[]): boolean {
+export function resolveBranchContextFootprint(branch: readonly unknown[]): BranchContextFootprint {
+  let agyTokens: number | undefined;
+  let nonAgyTokens: number | undefined;
   let latestIsAgy = false;
+
   for (const raw of branch) {
     const entry = raw as {
       type?: string;
@@ -216,29 +167,43 @@ export function isLatestBranchContextFromAgy(branch: readonly unknown[]): boolea
         role?: string;
         provider?: string;
         stopReason?: string;
+        usage?: {
+          input?: number;
+          output?: number;
+          cacheRead?: number;
+          cacheWrite?: number;
+          totalTokens?: number;
+        };
       };
     };
     if (entry.type === "compaction" || entry.type === "branch_summary") {
+      agyTokens = undefined;
+      nonAgyTokens = undefined;
       latestIsAgy = false;
       continue;
     }
     if (entry.type === "custom") {
       if (entry.customType === AGY_CONVERSATION_STATE_ENTRY && entry.data) {
         if (entry.data.kind === "reset") {
+          agyTokens = undefined;
           latestIsAgy = false;
         } else if (
           entry.data.kind === "conversation" &&
           typeof entry.data.contextTokens === "number" &&
+          Number.isFinite(entry.data.contextTokens) &&
           entry.data.contextTokens > 0
         ) {
+          agyTokens = entry.data.contextTokens;
           latestIsAgy = true;
         }
       } else if (
         entry.customType === AGY_COMPACTION_ENTRY &&
         entry.data &&
         typeof entry.data.afterTokens === "number" &&
+        Number.isFinite(entry.data.afterTokens) &&
         entry.data.afterTokens > 0
       ) {
+        agyTokens = entry.data.afterTokens;
         latestIsAgy = true;
       }
       continue;
@@ -247,10 +212,44 @@ export function isLatestBranchContextFromAgy(branch: readonly unknown[]): boolea
       if (entry.message.stopReason === "aborted" || entry.message.stopReason === "error") {
         continue;
       }
-      latestIsAgy = entry.message.provider === "antigravity";
+      const u = entry.message.usage;
+      if (entry.message.provider === "antigravity") {
+        const input = u?.input ?? 0;
+        const cacheRead = u?.cacheRead ?? 0;
+        const total = input + cacheRead;
+        if (!Number.isFinite(total) || total <= 0) continue;
+        latestIsAgy = true;
+        // Final step of a multi-step turn has its cumulative cacheRead subtracted by
+        // claimUsage(); ignore a synthetic cacheRead=0 drop when a fuller step was just seen.
+        if (cacheRead === 0 && agyTokens !== undefined && agyTokens >= 50_000 && total < agyTokens * 0.2) {
+          continue;
+        }
+        agyTokens = total;
+      } else {
+        const total =
+          (typeof u?.totalTokens === "number" && u.totalTokens > 0 ? u.totalTokens : 0) ||
+          (u?.input ?? 0) + (u?.output ?? 0) + (u?.cacheRead ?? 0) + (u?.cacheWrite ?? 0);
+        if (Number.isFinite(total) && total > 0) {
+          nonAgyTokens = total;
+          latestIsAgy = false;
+        }
+      }
     }
   }
-  return latestIsAgy;
+
+  const maxFallback = Math.max(agyTokens ?? 0, nonAgyTokens ?? 0);
+  return {
+    agyTokens,
+    nonAgyFallbackTokens: latestIsAgy && maxFallback > 0 ? maxFallback : undefined,
+  };
+}
+
+/**
+ * Derive the latest known agy context footprint from the active Pi branch when
+ * no live in-memory `observedContextTokens` sample is present yet.
+ */
+export function resolveAgyBranchContextTokens(branch: readonly unknown[]): number | undefined {
+  return resolveBranchContextFootprint(branch).agyTokens;
 }
 
 export interface SessionUsageSnapshot {
@@ -386,7 +385,7 @@ export function renderFooterLines(input: FooterRenderInput): string[] {
       : (contextTokens ?? input.agyContextTokens);
   const limitTokens = isAntigravity
     ? AGY_EFFECTIVE_CONTEXT_LIMIT
-    : (input.modelContextWindow || input.contextUsage?.contextWindow || 0);
+    : (input.contextUsage?.contextWindow || input.modelContextWindow || 0);
 
   const hasUsed = typeof usedTokens === "number" && Number.isFinite(usedTokens) && usedTokens >= 0;
   const rawPct =
