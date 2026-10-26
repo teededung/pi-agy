@@ -1445,7 +1445,9 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     console.error("pi-agy: background model refresh failed", error);
   });
 
-  pi.on("before_agent_start", (event) => {
+  pi.on("before_agent_start", (event, ctx) => {
+    const provider = probeCtx(() => ctx.model?.provider);
+    if (!provider.stale) syncWrapperToolActivation(provider.value);
     captureSkills(event.systemPromptOptions?.skills);
     refreshSkillTools();
   });
@@ -1701,6 +1703,8 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   pi.on("session_tree", async (_event, ctx: ExtensionContext) => {
     // An agy conversation cannot be rewound to match a different pi branch.
     // Restart it and bootstrap the selected branch on the next provider call.
+    const provider = probeCtx(() => ctx.model?.provider);
+    if (!provider.stale) syncWrapperToolActivation(provider.value);
     const cwd = probeCtx(() => ctx.cwd);
     if (cwd.stale) return;
     const previousConversationId = await captureActiveConversationId();
