@@ -285,9 +285,7 @@ const MARKED_BR_PATCH_SYMBOL = Symbol.for("pi-agy.marked-br-patch");
 /**
  * Normalize inline `<br>`, `<br/>`, and `<br />` HTML tags into Marked `br`
  * tokens on the shared `@earendil-works/pi-tui` Marked Tokenizer prototype so
- * multi-line Markdown table cells render as real line breaks in both
- * `pi-better-render` and Pi's built-in Markdown renderer without modifying
- * external packages.
+ * multi-line Markdown table cells render as real line breaks.
  */
 function installMarkedBrTagPatch(): void {
   try {
@@ -306,7 +304,7 @@ function installMarkedBrTagPatch(): void {
     };
     proto[MARKED_BR_PATCH_SYMBOL] = true;
   } catch {
-    // Best-effort patch for pi-tui / pi-better-render Marked inline tokenizer.
+    // Best-effort patch for pi-tui Marked inline tokenizer.
   }
 }
 
