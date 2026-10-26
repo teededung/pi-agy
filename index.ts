@@ -105,6 +105,7 @@ import {
 } from "./lib/agy-compaction.ts";
 import {
   computeSessionUsageSnapshot,
+  isLatestBranchContextFromAgy,
   readAgyFooterMode,
   renderFooterLines,
   resolveAgyBranchContextTokens,
@@ -662,9 +663,11 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   }
 
   let activeSessionCtx: ExtensionContext | undefined;
+  let activeModel: ExtensionContext["model"] | undefined;
   let lastSyncedSessionTitleKey: string | undefined;
   let trackedConversationId: string | undefined;
   let requestFooterRender: (() => void) | undefined;
+  let invalidateFooter: (() => void) | undefined;
   let agyFooterInstalled = false;
 
   function uninstallAgyFooter(ctx: ExtensionContext): void {
@@ -675,6 +678,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       }
       agyFooterInstalled = false;
       requestFooterRender = undefined;
+      invalidateFooter = undefined;
     });
   }
 
@@ -687,23 +691,32 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         usageTotals: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
       };
       let cachedBranchAgyTokens: number | undefined;
+      let cachedBranchLatestIsAgy = false;
 
       ctx.ui.setFooter((tui, theme, footerData) => {
         agyFooterInstalled = true;
         requestFooterRender = () => tui.requestRender();
-        const unsubBranch = footerData.onBranchChange(() => tui.requestRender());
+        invalidateFooter = () => {
+          cachedKey = "";
+        };
+        const unsubBranch = footerData.onBranchChange(() => {
+          cachedKey = "";
+          tui.requestRender();
+        });
         return {
           dispose() {
             unsubBranch();
             agyFooterInstalled = false;
             if (requestFooterRender) requestFooterRender = undefined;
+            if (invalidateFooter) invalidateFooter = undefined;
           },
           invalidate() {
             cachedKey = "";
           },
           render(width: number): string[] {
             const state = probeCtx(() => {
-              const sm = ctx.sessionManager as {
+              const liveCtx = activeSessionCtx ?? ctx;
+              const sm = liveCtx.sessionManager as {
                 getSessionId(): string;
                 getLeafId?(): string | null;
                 getEntryCount?(): number;
@@ -712,32 +725,34 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
                 getCwd?(): string;
                 getSessionName?(): string | undefined;
               };
+              const model = activeModel ?? liveCtx.model ?? ctx.model;
               const sessionId = sm.getSessionId();
               const leafId = sm.getLeafId?.() ?? "";
               const branch = sm.getBranch();
               const entries = sm.getEntries?.() ?? branch;
               const entryCount = sm.getEntryCount?.() ?? entries.length;
-              const key = `${sessionId}:${leafId}:${entryCount}`;
+              const key = `${sessionId}:${leafId}:${entryCount}:${model?.provider ?? ""}:${model?.id ?? ""}`;
               if (key !== cachedKey) {
                 cachedKey = key;
                 cachedSnapshot = computeSessionUsageSnapshot(entries);
                 cachedBranchAgyTokens = resolveAgyBranchContextTokens(branch);
+                cachedBranchLatestIsAgy = isLatestBranchContextFromAgy(branch);
               }
               return {
-                cwd: sm.getCwd?.() ?? ctx.cwd,
+                cwd: sm.getCwd?.() ?? liveCtx.cwd,
                 sessionName: sm.getSessionName?.()?.trim(),
-                model: ctx.model,
+                model,
                 thinkingLevel: pi.getThinkingLevel?.() ?? "off",
                 contextUsage:
-                  ctx.model?.provider === "antigravity"
+                  model?.provider === "antigravity"
                     ? undefined
-                    : ctx.getContextUsage?.(),
+                    : liveCtx.getContextUsage?.(),
               };
             });
             if (state.stale) return [];
             const { cwd, sessionName, model, thinkingLevel, contextUsage } = state.value;
             const effectiveAgyTokens =
-              model?.provider === "antigravity"
+              model?.provider === "antigravity" || cachedBranchLatestIsAgy
                 ? (observedContextTokens ?? cachedBranchAgyTokens)
                 : undefined;
             return renderFooterLines({
@@ -751,6 +766,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
               thinkingLevel,
               availableProviderCount: footerData.getAvailableProviderCount(),
               agyContextTokens: effectiveAgyTokens,
+              modelContextWindow: model?.contextWindow,
               contextUsage,
               usageTotals: cachedSnapshot.usageTotals,
               latestCacheHitRate: cachedSnapshot.latestCacheHitRate,
@@ -1648,6 +1664,8 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
 
   pi.on("agent_start", (_event, ctx) => {
     activeSessionCtx = ctx;
+    const modelProbe = probeCtx(() => ctx.model);
+    if (!modelProbe.stale) activeModel = modelProbe.value;
     subagentSpawnedThisTurn = false;
     const probe = probeCtx(() => ctx.model?.provider);
     if (probe.stale || probe.value !== "antigravity") return;
@@ -1689,12 +1707,16 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       }
     }
     activeSessionCtx = ctx;
+    const modelProbe = probeCtx(() => ctx.model);
+    if (!modelProbe.stale) activeModel = modelProbe.value;
     const probe = probeCtx(() => ctx.model?.provider);
     if (!probe.stale && (probe.value === "antigravity" || agyAgentActive)) {
       agyAgentActive = false;
       updateAgyTasksWidget();
     }
     await persistConversationState(ctx);
+    invalidateFooter?.();
+    requestFooterRender?.();
   });
 
   // The display-only `antigravity` wrapper tool only matters while an agy
@@ -1718,6 +1740,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
 
   pi.on("session_start", async (event, ctx: ExtensionContext) => {
     activeSessionCtx = ctx;
+    activeModel = ctx.model;
     lastSyncedSessionTitleKey = undefined;
     oneShotConsult = undefined;
     lastConsultUsed = undefined;
@@ -1805,8 +1828,11 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("model_select", async (event, ctx) => {
+    activeSessionCtx = ctx;
+    activeModel = event.model ?? ctx.model;
     syncWrapperToolActivation(event.model?.provider);
     refreshToolModeStatus(ctx);
+    invalidateFooter?.();
     requestFooterRender?.();
     const nextModelKey = event.model ? `${event.model.provider}:${event.model.id}` : undefined;
     if (
@@ -1848,11 +1874,16 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       }
       await teardownBridge();
     }
+    invalidateFooter?.();
+    requestFooterRender?.();
   });
 
   pi.on("session_tree", async (_event, ctx: ExtensionContext) => {
     // An agy conversation cannot be rewound to match a different pi branch.
     // Restart it and bootstrap the selected branch on the next provider call.
+    activeSessionCtx = ctx;
+    const modelProbe = probeCtx(() => ctx.model);
+    if (!modelProbe.stale) activeModel = modelProbe.value;
     const provider = probeCtx(() => ctx.model?.provider);
     if (!provider.stale) syncWrapperToolActivation(provider.value);
     const cwd = probeCtx(() => ctx.cwd);
@@ -1865,6 +1896,8 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     setAgyTasksWidget(0);
     setAgyArtifactsWidget(0);
     renderAgyStatusWidget(true);
+    invalidateFooter?.();
+    requestFooterRender?.();
   });
 
   pi.on("session_compact", async (_event, ctx: ExtensionContext) => {
@@ -1878,6 +1911,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     if (sessionNamePollTimer) clearInterval(sessionNamePollTimer);
     sessionNamePollTimer = undefined;
     activeSessionCtx = undefined;
+    activeModel = undefined;
     agyAgentActive = false;
     if (widgetPollTimer) clearInterval(widgetPollTimer);
     widgetPollTimer = undefined;

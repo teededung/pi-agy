@@ -184,15 +184,19 @@ export function piHistoryBootstrap(
 
 /** Map agy usage fields to pi usage fields. */
 export function mapUsage(u: AgyUsage | undefined): AssistantMessage["usage"] {
+  const input = u?.input_tokens ?? 0;
+  const output = u?.output_tokens ?? 0;
+  const cacheRead = u?.cache_read_tokens ?? 0;
+  const componentTotal = input + output + cacheRead;
   return {
-    input: u?.input_tokens ?? 0,
-    output: u?.output_tokens ?? 0,
+    input,
+    output,
     // agy never streams thought text (print mode exposes counts only);
     // report thinking_tokens as the reasoning subset of output regardless.
     reasoning: u?.thinking_tokens,
-    cacheRead: u?.cache_read_tokens ?? 0,
+    cacheRead,
     cacheWrite: 0,
-    totalTokens: u?.total_tokens ?? 0,
+    totalTokens: Math.max(u?.total_tokens ?? 0, componentTotal),
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
   };
 }

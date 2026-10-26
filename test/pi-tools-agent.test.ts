@@ -24,6 +24,7 @@ import {
 import {
   AGY_EFFECTIVE_CONTEXT_LIMIT,
   computeSessionUsageSnapshot,
+  isLatestBranchContextFromAgy,
   renderFooterLines,
   resolveAgyBranchContextTokens,
 } from "../lib/footer.ts";
@@ -901,6 +902,37 @@ test("renderFooterLines renders 2-row footer with agy 300k context bar and filte
   assert.match(lines[1]!, /^\[█+░+\] ~228k\/300k \(76%\) │ ↑3\.5k ↓800 R226k CH98\.7% \$11\.16/);
   assert.match(lines[1]!, /\[42\.0 tok\/s\] pi-tools:on ○ 🐴 ponytail: 🌱 LITE$/);
   assert.equal(lines[1]!.includes("agy context"), false);
+
+  // Switching mid-session from antigravity (300k) to kiro (1M) updates the footer limit to 1.0M
+  // and preserves the 228k branch context footprint even when Pi's last-message totalTokens was 1.8k.
+  assert.equal(isLatestBranchContextFromAgy(branch), true);
+  const kiroLines = renderFooterLines({
+    width: 120,
+    cwd: "/Users/rongmauhong/Documents/Repo/ragnarok",
+    home: "/Users/rongmauhong",
+    gitBranch: "main",
+    sessionName: "pi-agy",
+    provider: "kiro",
+    modelId: "claude-opus-5-5",
+    reasoning: true,
+    thinkingLevel: "high",
+    availableProviderCount: 2,
+    agyContextTokens: isLatestBranchContextFromAgy(branch) ? agyTokens : undefined,
+    modelContextWindow: 1_000_000,
+    contextUsage: {
+      tokens: 1_800,
+      contextWindow: 1_000_000,
+      percent: 0.18,
+    },
+    usageTotals: snapshot.usageTotals,
+    latestCacheHitRate: 98.7,
+    extensionStatuses: statuses,
+    theme: plainTheme,
+  });
+
+  assert.equal(kiroLines.length, 2);
+  assert.match(kiroLines[0]!, /\(kiro\) claude-opus-5-5 • high$/);
+  assert.match(kiroLines[1]!, /^\[█+░+\] 228k\/1\.0M \(23%\) │ ↑3\.5k ↓800 R226k CH98\.7% \$11\.16/);
 });
 
 

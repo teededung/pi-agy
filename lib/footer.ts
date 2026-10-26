@@ -95,6 +95,8 @@ export interface FooterRenderInput {
   availableProviderCount?: number;
   /** Live or branch-derived agy context tokens (uncached input + cacheRead). */
   agyContextTokens?: number;
+  /** Active model's context window (fallback when contextUsage is unavailable or stale). */
+  modelContextWindow?: number;
   /** Standard Pi context usage for non-antigravity providers. */
   contextUsage?: {
     tokens: number | null;
@@ -176,6 +178,10 @@ export function resolveAgyBranchContextTokens(branch: readonly unknown[]): numbe
       }
       continue;
     }
+    if (entry.type === "compaction") {
+      latest = undefined;
+      continue;
+    }
     if (entry.type === "message" && entry.message?.role === "assistant") {
       if (entry.message.provider !== "antigravity") continue;
       const input = entry.message.usage?.input ?? 0;
@@ -191,6 +197,60 @@ export function resolveAgyBranchContextTokens(branch: readonly unknown[]): numbe
     }
   }
   return latest;
+}
+
+/**
+ * Check whether the latest context-bearing entry on the branch comes from
+ * Antigravity (either an assistant message or a persisted agy conversation/compaction state).
+ * Used when switching mid-session from Antigravity to another provider (e.g. Kiro)
+ * before the new provider has completed its first turn.
+ */
+export function isLatestBranchContextFromAgy(branch: readonly unknown[]): boolean {
+  let latestIsAgy = false;
+  for (const raw of branch) {
+    const entry = raw as {
+      type?: string;
+      customType?: string;
+      data?: Record<string, unknown>;
+      message?: {
+        role?: string;
+        provider?: string;
+        stopReason?: string;
+      };
+    };
+    if (entry.type === "compaction" || entry.type === "branch_summary") {
+      latestIsAgy = false;
+      continue;
+    }
+    if (entry.type === "custom") {
+      if (entry.customType === AGY_CONVERSATION_STATE_ENTRY && entry.data) {
+        if (entry.data.kind === "reset") {
+          latestIsAgy = false;
+        } else if (
+          entry.data.kind === "conversation" &&
+          typeof entry.data.contextTokens === "number" &&
+          entry.data.contextTokens > 0
+        ) {
+          latestIsAgy = true;
+        }
+      } else if (
+        entry.customType === AGY_COMPACTION_ENTRY &&
+        entry.data &&
+        typeof entry.data.afterTokens === "number" &&
+        entry.data.afterTokens > 0
+      ) {
+        latestIsAgy = true;
+      }
+      continue;
+    }
+    if (entry.type === "message" && entry.message?.role === "assistant") {
+      if (entry.message.stopReason === "aborted" || entry.message.stopReason === "error") {
+        continue;
+      }
+      latestIsAgy = entry.message.provider === "antigravity";
+    }
+  }
+  return latestIsAgy;
 }
 
 export interface SessionUsageSnapshot {
@@ -315,20 +375,26 @@ export function renderFooterLines(input: FooterRenderInput): string[] {
 
   // --- Row 2: Context Bar + Stats (left) & Extension Statuses (right) ---
   const isAntigravity = input.provider === "antigravity";
+  const contextTokens =
+    typeof input.contextUsage?.tokens === "number" && Number.isFinite(input.contextUsage.tokens)
+      ? input.contextUsage.tokens
+      : undefined;
   const usedTokens = isAntigravity
     ? input.agyContextTokens
-    : (input.contextUsage?.tokens ?? undefined);
+    : contextTokens !== undefined && input.agyContextTokens !== undefined
+      ? Math.max(contextTokens, input.agyContextTokens)
+      : (contextTokens ?? input.agyContextTokens);
   const limitTokens = isAntigravity
     ? AGY_EFFECTIVE_CONTEXT_LIMIT
-    : (input.contextUsage?.contextWindow ?? 0);
+    : (input.modelContextWindow || input.contextUsage?.contextWindow || 0);
 
   const hasUsed = typeof usedTokens === "number" && Number.isFinite(usedTokens) && usedTokens >= 0;
-  const rawPct = isAntigravity
-    ? hasUsed && limitTokens > 0
+  const rawPct =
+    hasUsed && limitTokens > 0
       ? (usedTokens / limitTokens) * 100
-      : 0
-    : (input.contextUsage?.percent ??
-      (hasUsed && limitTokens > 0 ? (usedTokens / limitTokens) * 100 : 0));
+      : !isAntigravity && typeof input.contextUsage?.percent === "number"
+        ? input.contextUsage.percent
+        : 0;
   const pctUsed = Math.min(100, Math.max(0, rawPct));
   const barColor = !hasUsed
     ? "dim"
