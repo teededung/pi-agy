@@ -1,9 +1,15 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import {
+  AgyModelEffortFallbackError,
   AgySpawnError,
   AgyStallError,
   buildDriverAgyArgs,
+  canFallbackToLegacyEffortSuffix,
+  isAgyModelEffortFallbackError,
+  rememberLegacyEffortSuffixModel,
   runAgyTurn,
+  shouldUseLegacyEffortSuffix,
+  splitAgyModelEffort,
   type AgyTurnRequest,
 } from "./agy-client.ts";
 import {
@@ -168,14 +174,16 @@ function processConfig(
   binaryVersion?: string,
   binaryRevision?: string,
 ): AgyProcessConfigSnapshot {
+  const { baseModel, effort } = splitAgyModelEffort(request.model, request.effort);
+  const useLegacySuffix = shouldUseLegacyEffortSuffix(request);
   return {
     binary,
     binaryVersion,
     binaryRevision,
     cwd: request.cwd,
     mcpDirectory: request.mcpDirectory,
-    model: request.model,
-    effort: request.effort,
+    model: baseModel && useLegacySuffix && effort ? `${baseModel}-${effort}` : baseModel,
+    effort: useLegacySuffix ? undefined : effort,
     agent: request.agent,
     mode: request.mode,
     bridgeRevision: request.bridgeRevision,
@@ -391,6 +399,24 @@ export class AgyDriverSession implements AgyTurnExecutor {
   }
 
   async #runExclusive(request: AgyTurnRequest): Promise<AgyTurnOutcome> {
+    try {
+      return await this.#runSingleAttempt(request);
+    } catch (error) {
+      if (
+        canFallbackToLegacyEffortSuffix(request) &&
+        (error instanceof AgyModelEffortFallbackError ||
+          (error instanceof AgySpawnError && isAgyModelEffortFallbackError(error)))
+      ) {
+        rememberLegacyEffortSuffixModel(request.model, error);
+        this.#log(`fallback:legacy-effort-suffix:${request.model ?? "unknown"}`);
+        if (this.#child) await this.close("recycle", "effort");
+        return await this.#runSingleAttempt({ ...request, legacyEffortSuffix: true });
+      }
+      throw error;
+    }
+  }
+
+  async #runSingleAttempt(request: AgyTurnRequest): Promise<AgyTurnOutcome> {
     const checked = request.binary ? undefined : await checkAgyBinary();
     if (request.signal?.aborted) return abortOutcome();
     if (this.#shutdown) throw new AgySpawnError("agy driver is shut down.", this.#stderrTail);
@@ -412,7 +438,7 @@ export class AgyDriverSession implements AgyTurnExecutor {
     }
     if (request.signal?.aborted) return abortOutcome();
     if (this.#shutdown) throw new AgySpawnError("agy driver is shut down.", this.#stderrTail);
-    if (!this.#child) await this.#start(request, nextConfig);
+    if (!this.#child) this.#start(request, nextConfig);
     if (request.signal?.aborted) {
       await this.close("abort");
       return abortOutcome();
@@ -434,19 +460,22 @@ export class AgyDriverSession implements AgyTurnExecutor {
     try {
       await this.#writeUserEvent(child, request.prompt);
     } catch (error) {
-      this.#detachChild(child, "dead");
-      killAgyTree(child);
-      this.#settleTurn(turn, {
-        error: new AgySpawnError(
-          `failed to write to agy driver (${error instanceof Error ? error.message : String(error)}).`,
-          this.#stderrTail,
-        ),
-      });
+      await this.#waitUntilChildChanges(child, 50);
+      if (this.#active === turn) {
+        this.#detachChild(child, "dead");
+        killAgyTree(child);
+        this.#settleTurn(turn, {
+          error: new AgySpawnError(
+            `failed to write to agy driver (${error instanceof Error ? error.message : String(error)}).`,
+            this.#stderrTail,
+          ),
+        });
+      }
     }
     return outcomePromise;
   }
 
-  async #start(request: AgyTurnRequest, config: AgyProcessConfigSnapshot): Promise<void> {
+  #start(request: AgyTurnRequest, config: AgyProcessConfigSnapshot): void {
     this.#state = "starting";
     this.#generation += 1;
     const generation = this.#generation;
@@ -463,6 +492,7 @@ export class AgyDriverSession implements AgyTurnExecutor {
           conversationId: request.conversationId,
           model: request.model,
           effort: request.effort,
+          legacyEffortSuffix: request.legacyEffortSuffix,
           cwd: request.cwd,
           mcpDirectory: request.mcpDirectory,
           timeoutMs: request.timeoutMs,
@@ -1045,6 +1075,25 @@ export class AgyDriverSession implements AgyTurnExecutor {
       return;
     }
     const parsed = parseAgyLine(line);
+    if (
+      parsed.kind === "result" &&
+      parsed.result.status === "ERROR" &&
+      turn.outcome.activities.length === 0 &&
+      canFallbackToLegacyEffortSuffix(turn.request) &&
+      isAgyModelEffortFallbackError(parsed.result.error)
+    ) {
+      const child = this.#child;
+      if (child) {
+        this.#detachChild(child, "dead");
+        killAgyTree(child);
+      }
+      this.#settleTurn(turn, {
+        error: new AgyModelEffortFallbackError(
+          parsed.result.error ?? "invalid model/effort selection",
+        ),
+      });
+      return;
+    }
     if (!turn.conversationReported) {
       const id =
         parsed.kind === "init"

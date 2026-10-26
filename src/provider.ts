@@ -689,7 +689,7 @@ export function streamAntigravity(
                 : piHistoryBootstrap(context, turnPrompt.length),
             bootstrapSuffix: isolatedRequest ? undefined : getBootstrapSuffix?.(),
             modelId: effectiveModelId,
-            effort: requestedEffort ? effort : undefined,
+            effort,
             // Custom lean agents (like agy-lean or pi-tools) restrict tools and
             // strip invoke_subagent/send_message/manage_subagents. Bypass custom agent
             // when Boost or Teamwork orchestration is active so subagent tools are available

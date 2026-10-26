@@ -28,10 +28,15 @@ export interface AgyTurnRequest {
   prompt: string;
   /** Resume a prior conversation; omit to start a new one. */
   conversationId?: string;
-  /** agy model id, e.g. "gemini-3.7-flash". */
+  /** agy model id, e.g. "gemini-3.8-flash". */
   model?: string;
   /** Reasoning effort for this turn (agy --effort). */
   effort?: AgyEffort;
+  /**
+   * Fallback for older agy builds or catalog entries that only accept effort
+   * folded into the model ID (`<model>-<effort>`) instead of `--model <base> --effort <level>`.
+   */
+  legacyEffortSuffix?: boolean;
   /** Working directory for the agy process. */
   cwd?: string;
   /** Session-owned MCP discovery directory, added without changing cwd. */
@@ -107,20 +112,103 @@ export class AgyStallError extends Error {
   }
 }
 
+const MODEL_EFFORT_SUFFIX_RE = /^(.+)-(low|medium|high)$/i;
+const MODEL_EFFORT_FALLBACK_ERROR_RE =
+  /invalid model selection|--effort(?:=\S+)? is not supported|effort isn't adjustable|conflicts with --effort|unrecognized effort|unknown model|doesn't support thinking level|unsupported thinking level|flag provided but not defined: --?effort|no such flag -+-?effort/i;
+
+/** Base model IDs (or "*" when `--effort` flag itself is unrecognized) that rejected `--model <base> --effort <level>`. */
+const legacyEffortSuffixModels = new Set<string>();
+
+export function resetLegacyEffortSuffixCache(): void {
+  legacyEffortSuffixModels.clear();
+}
+
+export function splitAgyModelEffort(
+  model: string | undefined,
+  effort: AgyEffort | undefined,
+): { baseModel?: string; effort?: AgyEffort } {
+  if (!model) return { effort };
+  const match = model.match(MODEL_EFFORT_SUFFIX_RE);
+  if (!match) return { baseModel: model, effort };
+  return {
+    baseModel: match[1]!,
+    effort: effort ?? (match[2]!.toLowerCase() as AgyEffort),
+  };
+}
+
+export function shouldUseLegacyEffortSuffix(
+  request: Pick<AgyTurnRequest, "model" | "effort" | "legacyEffortSuffix">,
+): boolean {
+  if (request.legacyEffortSuffix !== undefined) return request.legacyEffortSuffix;
+  const { baseModel, effort } = splitAgyModelEffort(request.model, request.effort);
+  if (!baseModel || !effort) return false;
+  return (
+    legacyEffortSuffixModels.has("*") ||
+    legacyEffortSuffixModels.has(baseModel.toLowerCase())
+  );
+}
+
+export function canFallbackToLegacyEffortSuffix(
+  request: Pick<AgyTurnRequest, "model" | "effort" | "legacyEffortSuffix">,
+): boolean {
+  if (shouldUseLegacyEffortSuffix(request)) return false;
+  const { baseModel, effort } = splitAgyModelEffort(request.model, request.effort);
+  return Boolean(baseModel && effort);
+}
+
+export function isAgyModelEffortFallbackError(value: unknown): boolean {
+  const text =
+    value instanceof AgySpawnError
+      ? `${value.message}\n${value.stderr}`
+      : value instanceof Error
+        ? value.message
+        : typeof value === "string"
+          ? value
+          : "";
+  return Boolean(text && MODEL_EFFORT_FALLBACK_ERROR_RE.test(text));
+}
+
+export function rememberLegacyEffortSuffixModel(
+  model: string | undefined,
+  error?: unknown,
+): void {
+  const text =
+    error instanceof AgySpawnError
+      ? `${error.message}\n${error.stderr}`
+      : valueToErrorText(error);
+  if (/flag provided but not defined: --?effort|no such flag -+-?effort/i.test(text)) {
+    legacyEffortSuffixModels.add("*");
+  }
+  const { baseModel } = splitAgyModelEffort(model, undefined);
+  if (baseModel) legacyEffortSuffixModels.add(baseModel.toLowerCase());
+}
+
+function valueToErrorText(value: unknown): string {
+  return value instanceof Error ? value.message : typeof value === "string" ? value : "";
+}
+
+export class AgyModelEffortFallbackError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AgyModelEffortFallbackError";
+  }
+}
+
 function appendProcessArgs(args: string[], request: AgyTurnRequest): string[] {
   if (request.cwd) args.push("--add-dir", request.cwd);
   if (request.mcpDirectory) args.push("--add-dir", request.mcpDirectory);
   if (request.conversationId) args.push("--conversation", request.conversationId);
-  // Newer agy lists effort as a model-id suffix (`gemini-4-argon-high`) and
-  // some models reject a separate `--effort`, so fold effort into the id.
-  if (request.model) {
-    const hasSuffix = /-(low|medium|high)$/i.test(request.model);
-    args.push(
-      "--model",
-      request.effort && !hasSuffix ? `${request.model}-${request.effort}` : request.model,
-    );
-  } else if (request.effort) {
-    args.push("--effort", request.effort);
+  const { baseModel, effort } = splitAgyModelEffort(request.model, request.effort);
+  const useLegacySuffix = shouldUseLegacyEffortSuffix(request);
+  if (baseModel) {
+    if (useLegacySuffix && effort) {
+      args.push("--model", `${baseModel}-${effort}`);
+    } else {
+      args.push("--model", baseModel);
+      if (effort) args.push("--effort", effort);
+    }
+  } else if (effort) {
+    args.push("--effort", effort);
   }
   if (request.agent) args.push("--agent", request.agent);
   if (request.mode) args.push("--mode", request.mode);
@@ -175,6 +263,22 @@ export const buildAgyArgs = buildOneShotAgyArgs;
  * fails before producing any result event (missing binary, auth failure, …).
  */
 export async function runAgyTurn(request: AgyTurnRequest): Promise<AgyTurnOutcome> {
+  try {
+    return await runSingleAgyTurn(request);
+  } catch (error) {
+    if (
+      canFallbackToLegacyEffortSuffix(request) &&
+      (error instanceof AgyModelEffortFallbackError ||
+        (error instanceof AgySpawnError && isAgyModelEffortFallbackError(error)))
+    ) {
+      rememberLegacyEffortSuffixModel(request.model, error);
+      return await runSingleAgyTurn({ ...request, legacyEffortSuffix: true });
+    }
+    throw error;
+  }
+}
+
+async function runSingleAgyTurn(request: AgyTurnRequest): Promise<AgyTurnOutcome> {
   const binary = request.binary ?? (request.spawnOverride ? "agy" : await getAgyBinary());
   return new Promise((resolve, reject) => {
     if (request.signal?.aborted) {
@@ -316,6 +420,22 @@ export async function runAgyTurn(request: AgyTurnRequest): Promise<AgyTurnOutcom
     let conversationReported = false;
     const handleParsed = (parsed: ReturnType<typeof parseAgyLine>) => {
       if (settled) return;
+      if (
+        parsed.kind === "result" &&
+        parsed.result.status === "ERROR" &&
+        outcome.activities.length === 0 &&
+        canFallbackToLegacyEffortSuffix(request) &&
+        isAgyModelEffortFallbackError(parsed.result.error)
+      ) {
+        killAgyTree(child);
+        untrack();
+        finishLogical(() =>
+          reject(
+            new AgyModelEffortFallbackError(parsed.result.error ?? "invalid model/effort selection"),
+          ),
+        );
+        return;
+      }
       if (!conversationReported) {
         const id =
           parsed.kind === "init"
