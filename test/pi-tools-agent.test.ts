@@ -11,7 +11,10 @@ import {
   renameAgyConversationsForSessionFile,
   sweepStalePiToolsConversations,
 } from "../lib/conversation-metadata.ts";
-import { installSessionSelectorDeletePatch } from "../index.ts";
+import {
+  installModelSelectorSelectionPatch,
+  installSessionSelectorDeletePatch,
+} from "../index.ts";
 import { isAgyEditTool } from "../lib/diff.ts";
 import { mapAgyToolToNative } from "../lib/native-tools.ts";
 import {
@@ -776,6 +779,67 @@ test("installSessionSelectorDeletePatch and deleteAgyConversationsForSessionFile
     await readFile(path.join(agyBase, "cache", "conversation_metadata.json"), "utf8"),
   ) as { conversations: Record<string, unknown> };
   assert.equal(cid in metaJson.conversations, false);
+});
+
+test("installModelSelectorSelectionPatch preserves user selection when background model catalog refresh completes", () => {
+  class FakeModelSelector {
+    allModels = [
+      { provider: "antigravity", id: "gemini-3-flash" },
+      { provider: "antigravity", id: "claude-sonnet-4-6" },
+      { provider: "antigravity", id: "claude-opus-4-6" },
+    ];
+    filteredModels = [...this.allModels];
+    selectedIndex = 0;
+    lastRenderedIndex = 0;
+
+    constructor() {
+      this.loadModelsFromSnapshot();
+      this.updateList();
+    }
+
+    loadModelsFromSnapshot(): void {
+      this.filteredModels = [...this.allModels];
+      // Simulate Pi's built-in reset to currentModel (index 0)
+      this.selectedIndex = 0;
+    }
+
+    filterModels(query: string): void {
+      this.filteredModels = query
+        ? this.allModels.filter((m) => m.id.includes(query))
+        : [...this.allModels];
+      // Simulate Pi's built-in reset when query is non-empty or clamped
+      this.selectedIndex = query
+        ? 0
+        : Math.min(this.selectedIndex, Math.max(0, this.filteredModels.length - 1));
+      this.updateList();
+    }
+
+    updateList(): void {
+      this.lastRenderedIndex = this.selectedIndex;
+    }
+  }
+
+  installModelSelectorSelectionPatch(FakeModelSelector);
+
+  // 1. Browsing without search query: user moves down to index 2, then background refresh finishes
+  const selector = new FakeModelSelector();
+  assert.equal(selector.selectedIndex, 0);
+  selector.selectedIndex = 2; // User moved cursor to claude-opus-4-6
+  selector.loadModelsFromSnapshot();
+  selector.filterModels("");
+  assert.equal(selector.selectedIndex, 2);
+  assert.equal(selector.lastRenderedIndex, 2);
+  assert.equal(selector.filteredModels[selector.selectedIndex]?.id, "claude-opus-4-6");
+
+  // 2. Browsing with search query: user filters "claude" and moves down to index 1, then refresh finishes
+  selector.filterModels("claude");
+  assert.equal(selector.selectedIndex, 0); // Typing a new query moves to top match
+  selector.selectedIndex = 1; // User moves down to second "claude" model (claude-opus-4-6)
+  selector.loadModelsFromSnapshot();
+  selector.filterModels("claude");
+  assert.equal(selector.selectedIndex, 1);
+  assert.equal(selector.lastRenderedIndex, 1);
+  assert.equal(selector.filteredModels[selector.selectedIndex]?.id, "claude-opus-4-6");
 });
 
 test("renderFooterLines renders 2-row footer with agy 300k context bar and filters redundant agy-context status", () => {

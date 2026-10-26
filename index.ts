@@ -34,6 +34,7 @@ import {
   getDocsPath,
   getExamplesPath,
   getReadmePath,
+  ModelSelectorComponent,
   SessionSelectorComponent,
 } from "@earendil-works/pi-coding-agent";
 import { Marked, stripTerminalSequences, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
@@ -409,6 +410,96 @@ export function installSessionSelectorDeletePatch(
 
 installSessionSelectorDeletePatch();
 
+const MODEL_SELECTOR_PATCH_SYMBOL = Symbol.for("pi-agy.model-selector-selection-patch");
+const MODEL_SELECTOR_INITIAL_LOAD_SYMBOL = Symbol.for("pi-agy.model-selector-initial-load");
+const MODEL_SELECTOR_PENDING_SELECTION_SYMBOL = Symbol.for(
+  "pi-agy.model-selector-pending-selection",
+);
+
+/**
+ * Patch Pi's interactive `/model` (`ModelSelectorComponent`) so when background
+ * `refreshModels()` completes ("Model catalogs refreshed."), it preserves the
+ * model item and `selectedIndex` the user is currently highlighting instead of
+ * jumping back to `currentModel` or index 0.
+ */
+export function installModelSelectorSelectionPatch(
+  SelectorClass: unknown = ModelSelectorComponent,
+): void {
+  try {
+    const proto = (SelectorClass as { prototype?: Record<string | symbol, unknown> })?.prototype;
+    if (!proto || proto[MODEL_SELECTOR_PATCH_SYMBOL]) return;
+    const origLoadModelsFromSnapshot = proto.loadModelsFromSnapshot;
+    const origFilterModels = proto.filterModels;
+    if (typeof origLoadModelsFromSnapshot !== "function" || typeof origFilterModels !== "function") {
+      return;
+    }
+
+    type SelectorInstance = {
+      filteredModels?: Array<{ provider?: string; id?: string }>;
+      selectedIndex?: number;
+      updateList?: () => void;
+      [MODEL_SELECTOR_INITIAL_LOAD_SYMBOL]?: boolean;
+      [MODEL_SELECTOR_PENDING_SELECTION_SYMBOL]?: {
+        index: number;
+        provider?: string;
+        id?: string;
+      };
+    };
+
+    proto.loadModelsFromSnapshot = function patchedLoadModelsFromSnapshot(
+      this: SelectorInstance,
+      ...args: unknown[]
+    ) {
+      if (this[MODEL_SELECTOR_INITIAL_LOAD_SYMBOL]) {
+        const index = typeof this.selectedIndex === "number" ? this.selectedIndex : 0;
+        const currentItem = Array.isArray(this.filteredModels)
+          ? this.filteredModels[index]
+          : undefined;
+        this[MODEL_SELECTOR_PENDING_SELECTION_SYMBOL] = {
+          index,
+          provider: currentItem?.provider,
+          id: currentItem?.id,
+        };
+      } else {
+        this[MODEL_SELECTOR_INITIAL_LOAD_SYMBOL] = true;
+      }
+      return origLoadModelsFromSnapshot.apply(this, args);
+    };
+
+    proto.filterModels = function patchedFilterModels(
+      this: SelectorInstance,
+      ...args: unknown[]
+    ) {
+      const result = origFilterModels.apply(this, args);
+      const pending = this[MODEL_SELECTOR_PENDING_SELECTION_SYMBOL];
+      if (pending) {
+        delete this[MODEL_SELECTOR_PENDING_SELECTION_SYMBOL];
+        const list = Array.isArray(this.filteredModels) ? this.filteredModels : [];
+        if (list.length > 0) {
+          const matchedIndex =
+            pending.provider && pending.id
+              ? list.findIndex(
+                  (item) => item.provider === pending.provider && item.id === pending.id,
+                )
+              : -1;
+          this.selectedIndex =
+            matchedIndex >= 0
+              ? matchedIndex
+              : Math.min(Math.max(0, pending.index), list.length - 1);
+          this.updateList?.();
+        }
+      }
+      return result;
+    };
+
+    proto[MODEL_SELECTOR_PATCH_SYMBOL] = true;
+  } catch {
+    // Best-effort patch for interactive `/model` selector.
+  }
+}
+
+installModelSelectorSelectionPatch();
+
 export default function antigravityExtension(pi: ExtensionAPI): void {
   pi.registerFlag("agy-tools", {
     description: "Antigravity tool mode: native or pi (execute work through Pi tools)",
@@ -440,6 +531,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
 
   installMarkedBrTagPatch();
   installSessionSelectorDeletePatch();
+  installModelSelectorSelectionPatch();
   installAgyDeathHooks();
   const runtime = createAntigravityRuntime();
   const service = runtime.runSync(AntigravityRuntime);
