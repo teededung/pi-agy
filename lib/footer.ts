@@ -4,13 +4,24 @@ import { AGY_COMPACTION_ENTRY } from "./agy-compaction.ts";
 import { AGY_CONVERSATION_STATE_ENTRY } from "./conversation-state.ts";
 
 /**
- * Effective native compaction ceiling in agy (~300k tokens).
- * Pi's model registry receives 1M (`AGY_PI_SCHEDULING_CONTEXT_WINDOW`) only so
+ * Effective native compaction ceiling in agy (~300k tokens for Gemini models;
+ * 1M total context window for Claude Sonnet/Opus 4.6 & 5.5 models).
+ * Pi's model registry receives 1M (`AGY_PI_SCHEDULING_CONTEXT_WINDOW`) so
  * Pi never triggers client-side compaction ahead of agy's own native compaction.
  */
 export const AGY_EFFECTIVE_CONTEXT_LIMIT = 300_000;
+export const AGY_CLAUDE_CONTEXT_LIMIT = 1_000_000;
 export const DEFAULT_CONTEXT_BAR_WIDTH = 16;
 export const MIN_CONTEXT_BAR_WIDTH = 6;
+
+const AGY_1M_CLAUDE_MODEL_RE = /^claude-(?:opus|sonnet)-(?:4-6|4-8|5-5)(?:$|[-@])/i;
+
+export function resolveAgyEffectiveContextLimit(modelId?: string): number {
+  if (typeof modelId === "string" && AGY_1M_CLAUDE_MODEL_RE.test(modelId.trim())) {
+    return AGY_CLAUDE_CONTEXT_LIMIT;
+  }
+  return AGY_EFFECTIVE_CONTEXT_LIMIT;
+}
 
 export type AgyFooterMode = "on" | "off";
 
@@ -384,7 +395,7 @@ export function renderFooterLines(input: FooterRenderInput): string[] {
       ? Math.max(contextTokens, input.agyContextTokens)
       : (contextTokens ?? input.agyContextTokens);
   const limitTokens = isAntigravity
-    ? AGY_EFFECTIVE_CONTEXT_LIMIT
+    ? resolveAgyEffectiveContextLimit(input.routedModel?.id ?? input.modelId)
     : (input.contextUsage?.contextWindow || input.modelContextWindow || 0);
 
   const hasUsed = typeof usedTokens === "number" && Number.isFinite(usedTokens) && usedTokens >= 0;

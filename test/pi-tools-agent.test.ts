@@ -22,10 +22,12 @@ import {
   EAGER_PI_BRIDGE_TOOLS_CONFIG,
 } from "../lib/pi-tools-agent.ts";
 import {
+  AGY_CLAUDE_CONTEXT_LIMIT,
   AGY_EFFECTIVE_CONTEXT_LIMIT,
   computeSessionUsageSnapshot,
   renderFooterLines,
   resolveAgyBranchContextTokens,
+  resolveAgyEffectiveContextLimit,
   resolveBranchContextFootprint,
 } from "../lib/footer.ts";
 import { formatAgyCall } from "../lib/render.ts";
@@ -903,6 +905,33 @@ test("renderFooterLines renders 2-row footer with agy 300k context bar and filte
   assert.match(lines[1]!, /^\[█+░+\] ~228k\/300k \(76%\) │ ↑3\.5k ↓800 R226k CH98\.7% \$11\.16/);
   assert.match(lines[1]!, /\[42\.0 tok\/s\] pi-tools:on ○ 🐴 ponytail: 🌱 LITE$/);
   assert.equal(lines[1]!.includes("agy context"), false);
+
+  // Antigravity Claude Sonnet 5.5 and Opus 5.5 models render against their 1.0M context window,
+  // while Gemini models continue to use the 300k effective ceiling.
+  assert.equal(resolveAgyEffectiveContextLimit("gemini-4-argon"), AGY_EFFECTIVE_CONTEXT_LIMIT);
+  assert.equal(resolveAgyEffectiveContextLimit("gemini-3.8-flash"), AGY_EFFECTIVE_CONTEXT_LIMIT);
+  assert.equal(resolveAgyEffectiveContextLimit("claude-sonnet-5-5"), AGY_CLAUDE_CONTEXT_LIMIT);
+  assert.equal(resolveAgyEffectiveContextLimit("claude-opus-5-5"), AGY_CLAUDE_CONTEXT_LIMIT);
+  const agyClaudeLines = renderFooterLines({
+    width: 120,
+    cwd: "/Users/rongmauhong/Documents/Repo/ragnarok",
+    home: "/Users/rongmauhong",
+    gitBranch: "main",
+    sessionName: "pi-agy",
+    provider: "antigravity",
+    modelId: "claude-opus-5-5",
+    reasoning: true,
+    thinkingLevel: "high",
+    availableProviderCount: 2,
+    agyContextTokens: agyTokens,
+    modelContextWindow: 1_000_000,
+    usageTotals: snapshot.usageTotals,
+    latestCacheHitRate: 98.7,
+    extensionStatuses: statuses,
+    theme: plainTheme,
+  });
+  assert.match(agyClaudeLines[0]!, /\(antigravity\) claude-opus-5-5 • high$/);
+  assert.match(agyClaudeLines[1]!, /^\[█+░+\] ~228k\/1\.0M \(23%\) │ ↑3\.5k ↓800 R226k CH98\.7% \$11\.16/);
 
   // Switching mid-session from antigravity (300k) to kiro (1M) updates the footer limit to 1.0M
   // and preserves the 228k branch context footprint even when Pi's last-message totalTokens was 1.8k.
