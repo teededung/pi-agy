@@ -858,11 +858,12 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     // widens once this handler yields.
     const probe = probeCtx(() => ({
       provider: ctx.model?.provider,
+      modelId: ctx.model?.id,
       sessionId: ctx.sessionManager.getSessionId(),
       cwd: ctx.cwd,
     }));
     if (probe.stale || probe.value.provider !== "antigravity") return;
-    const { sessionId, cwd } = probe.value;
+    const { modelId, sessionId, cwd } = probe.value;
     const snapshot = await runAntigravity(runtime, service.snapshot);
     if (!snapshot.conversationId || !snapshot.model || snapshot.cwd !== cwd) return;
     trackedConversationId = snapshot.conversationId;
@@ -873,7 +874,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       sessionId,
       conversationId: snapshot.conversationId,
       cwd,
-      modelId: snapshot.model,
+      modelId: modelId ?? snapshot.model,
       toolMode: getToolMode(),
       bridgeServer: BRIDGE_ENABLED ? mcpConfig.serverName : undefined,
       turns: snapshot.turns,
@@ -1587,6 +1588,10 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
           if (tasksUi) updateConsultStatus(tasksUi);
         },
         isTeamworkActive,
+        () =>
+          activeSessionCtx
+            ? probeCtx(() => activeSessionCtx?.sessionManager.getBranch()).value
+            : undefined,
       ),
     });
   };
@@ -1763,9 +1768,8 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         ? restored
         : undefined;
     const previousConversationId = await captureActiveConversationId();
-    // Fresh instances have new private discovery credentials and server names.
-    // Rebuild from Pi history when the saved conversation belongs to another
-    // bridge, agent, or tool mode.
+    // Rebuild from Pi history when no compatible conversation can be restored
+    // (e.g. tool mode changed or context-changing entries followed the marker).
     await runAntigravity(
       runtime,
       service.setSession(ctx.cwd, undefined, !compatibleRestore && event.reason !== "new"),
@@ -2790,14 +2794,37 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     ctx: ExtensionCommandContext,
   ): Promise<boolean> => {
     const trimmed = args.trim();
+    if (!trimmed) return false;
     const spaceAt = trimmed.search(/\s/);
-    if (spaceAt < 0) return false;
-    const token = trimmed.slice(0, spaceAt).toLowerCase();
-    const prompt = trimmed.slice(spaceAt).trim();
+    const token = (spaceAt < 0 ? trimmed : trimmed.slice(0, spaceAt)).toLowerCase();
+    const prompt = spaceAt < 0 ? "" : trimmed.slice(spaceAt).trim();
     const match = listOtherPiModels(ctx.modelRegistry).find(
       (m) => `${m.provider}/${m.id}`.toLowerCase() === token || m.id.toLowerCase() === token,
     );
-    if (!match || !prompt) return false;
+    if (!match) return false;
+
+    if (!prompt) {
+      if (ctx.model?.provider === match.provider && ctx.model?.id === match.id) {
+        ctx.ui.notify(`Already using ${match.provider}/${match.id}.`, "info");
+        return true;
+      }
+      try {
+        await pi.setModel(match);
+        ctx.ui.notify(`Switched model to ${match.provider}/${match.id}.`, "info");
+      } catch {
+        ctx.ui.notify(`Cannot switch to ${match.provider}/${match.id}.`, "error");
+      }
+      return true;
+    }
+
+    if (ctx.model?.provider === match.provider && ctx.model?.id === match.id) {
+      if (ctx.isIdle()) {
+        pi.sendUserMessage(prompt);
+      } else {
+        pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+      }
+      return true;
+    }
 
     const label = `Consulted ${match.name || match.id}`;
     const message = `${prompt}\n${label}`;
@@ -2826,7 +2853,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
 
   const handleConsultCommand = async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
     if (await handleOtherPiModelConsult(args, ctx)) return;
-    const parsed = resolveAgyConsultSpec(args, currentCache.models);
+    const parsed = resolveAgyConsultSpec(args, currentCache.models, { allowEmptyPrompt: true });
     if (!parsed.ok) {
       ctx.ui.notify(parsed.error, "error");
       return;
@@ -2839,6 +2866,51 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         : mapThinkingToEffort(sessionThinking as Exclude<typeof sessionThinking, "off">);
     const effectiveEffort =
       parsed.effort ?? resolveAgyModelEffort(parsed.model, sessionEffort);
+
+    if (!parsed.prompt) {
+      const agyModel = ctx.modelRegistry.find("antigravity", parsed.model.id);
+      if (!agyModel) {
+        ctx.ui.notify(`Model antigravity/${parsed.model.id} is not registered.`, "error");
+        return;
+      }
+      try {
+        if (ctx.model?.provider !== "antigravity" || ctx.model.id !== parsed.model.id) {
+          await pi.setModel(agyModel);
+        }
+        const targetThinking = parsed.effort ?? effectiveEffort;
+        if (targetThinking) {
+          pi.setThinkingLevel(targetThinking);
+        } else if (parsed.model.supportedEfforts.length === 0) {
+          pi.setThinkingLevel("off");
+        }
+        ctx.ui.notify(
+          `Switched to ${parsed.model.name || parsed.model.id}${targetThinking ? ` (${targetThinking})` : ""}.`,
+          "info",
+        );
+      } catch {
+        ctx.ui.notify(`Cannot switch to antigravity/${parsed.model.id}.`, "error");
+      }
+      return;
+    }
+
+    const currentEffectiveEffort =
+      ctx.model?.provider === "antigravity" && ctx.model.id === parsed.model.id
+        ? resolveAgyModelEffort(parsed.model, sessionEffort)
+        : undefined;
+    const isSameActiveModelAndEffort =
+      ctx.model?.provider === "antigravity" &&
+      ctx.model.id === parsed.model.id &&
+      effectiveEffort === currentEffectiveEffort;
+
+    if (isSameActiveModelAndEffort) {
+      if (ctx.isIdle()) {
+        pi.sendUserMessage(parsed.prompt);
+      } else {
+        pi.sendUserMessage(parsed.prompt, { deliverAs: "followUp" });
+      }
+      return;
+    }
+
     const consultLabel = formatAgyConsultLabel(parsed.model, effectiveEffort);
     const userMessageWithConsult = `${parsed.prompt}\n${consultLabel}`;
 
@@ -2876,7 +2948,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
 
   const consultCommandOptions = {
     description:
-      "One-shot model consult: /m <opus|sonnet|argon|flash>[1|2|3] <prompt> (1=low, 2=mid, 3=high, omit=session thinking)",
+      "Switch or one-shot consult model: /m <opus|sonnet|argon|flash>[1|2|3] [prompt] (omit prompt to switch; with prompt, consults for 1 turn)",
     getArgumentCompletions: (argumentPrefix: string) => {
       const probedModelId = activeSessionCtx
         ? probeCtx(() =>
@@ -2890,7 +2962,25 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         (selectedModelKey?.startsWith("antigravity:")
           ? selectedModelKey.slice("antigravity:".length)
           : undefined);
-      const agyItems = getAgyConsultCompletions(argumentPrefix, currentCache.models, currentModelId) ?? [];
+      const sessionThinking = pi.getThinkingLevel();
+      const sessionEffort =
+        sessionThinking === "off"
+          ? undefined
+          : mapThinkingToEffort(sessionThinking as Exclude<typeof sessionThinking, "off">);
+      const currentModelInfo = currentModelId
+        ? (currentCache.models.find((m) => m.id === currentModelId) ??
+          ALL_FALLBACK_MODELS.find((m) => m.id === currentModelId))
+        : undefined;
+      const currentEffort = currentModelInfo
+        ? resolveAgyModelEffort(currentModelInfo, sessionEffort)
+        : sessionEffort;
+      const agyItems =
+        getAgyConsultCompletions(
+          argumentPrefix,
+          currentCache.models,
+          currentModelId,
+          currentEffort,
+        ) ?? [];
       const prefix = argumentPrefix.trim().toLowerCase();
       const otherItems = activeSessionCtx
         ? (probeCtx(() => listOtherPiModels(activeSessionCtx!.modelRegistry)).value ?? [])

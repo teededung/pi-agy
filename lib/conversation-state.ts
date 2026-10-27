@@ -158,9 +158,6 @@ export function restorableAgyConversation(
   toolMode: AgyToolMode = "native",
   bridgeServer?: string,
 ): PersistedAgyConversation | undefined {
-  // Pi mode uses a session-owned agent and current loopback credentials.
-  // Its saved conversation must be rebuilt from Pi history on a new session.
-  if (toolMode === "pi") return undefined;
   for (let index = branch.length - 1; index >= 0; index -= 1) {
     const entry = branch[index];
     if (
@@ -173,9 +170,20 @@ export function restorableAgyConversation(
     const state = parsePersistedAgyState(entry.data);
     // The newest state marker is authoritative. A reset or malformed marker
     // must not accidentally resurrect an older conversation.
-    if (!state || state.kind === "reset" || state.toolMode === "pi") return undefined;
+    if (!state || state.kind === "reset") return undefined;
+    if ((state.toolMode ?? "native") !== toolMode) return undefined;
     if (state.sessionId !== sessionId || state.cwd !== cwd) return undefined;
-    if (state.bridgeServer !== bridgeServer) return undefined;
+    // In Pi tool mode, prepareAgyConversationBridgeMetadata rebinds
+    // trajectory_metadata_blob to the current instance's pi-tools-* agent and
+    // bridge workspace before spawning, so server rotation across /reload or
+    // session resume stays compatible as long as the bridge remains enabled.
+    if (
+      toolMode === "pi"
+        ? Boolean(state.bridgeServer) !== Boolean(bridgeServer)
+        : state.bridgeServer !== bridgeServer
+    ) {
+      return undefined;
+    }
     if (branch.slice(index + 1).some(isContextChangingEntry)) {
       return undefined;
     }

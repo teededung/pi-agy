@@ -5,6 +5,10 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import {
+  AGY_CONVERSATION_STATE_ENTRY,
+  restorableAgyConversation,
+} from "../lib/conversation-state.ts";
+import {
   deleteAgyConversationsForSessionFile,
   detachAgyConversationBridgeMetadata,
   extractAgyConversationIdsFromSessionFile,
@@ -39,11 +43,18 @@ import {
   type AgySubagentEntry,
 } from "../lib/subagents.ts";
 import { readAgyToolMode, resolveAgyToolModeCommand } from "../lib/tool-mode.ts";
+import { AGY_COMPACTION_ENTRY } from "../lib/agy-compaction.ts";
+import {
+  ALL_FALLBACK_MODELS,
+  getAgyConsultCompletions,
+  resolveAgyConsultSpec,
+} from "../lib/models.ts";
 import {
   contextHasPriorBoostActivity,
   contextHasPriorTeamworkActivity,
   isBridgedMcpStep,
   mapUsage,
+  piHistoryBootstrap,
 } from "../src/provider.ts";
 import { AntigravityRuntime, createAntigravityRuntime } from "../src/runtime.ts";
 
@@ -1017,7 +1028,154 @@ test("renderFooterLines renders 2-row footer with agy 300k context bar and filte
   );
 });
 
+test("restorableAgyConversation restores pi tool-mode conversations across bridge server rotation", () => {
+  const sessionId = "session-123";
+  const cwd = "/Users/test/repo/ragnarok";
+  const piMarker = {
+    type: "custom",
+    customType: AGY_CONVERSATION_STATE_ENTRY,
+    data: {
+      version: 1,
+      kind: "conversation",
+      sessionId,
+      conversationId: "c4098627-f3db-4e14-92df-90df43d7b3a9",
+      cwd,
+      modelId: "gemini-4-argon",
+      toolMode: "pi",
+      bridgeServer: "pi-676687f0606b",
+      turns: 27,
+      usage: { input_tokens: 1_579, output_tokens: 204, cache_read_tokens: 20_026 },
+      contextTokens: 20_026,
+    },
+  } as const;
 
+  const branch = [
+    { type: "message", message: { role: "user", content: "hello" } },
+    piMarker,
+    // Non-context-changing custom entries (such aspi-agy-compaction) may follow the state marker.
+    {
+      type: "custom",
+      customType: "pi-agy-compaction",
+      data: { version: 1, tokensBefore: 299_135, tokensAfter: 20_026 },
+    },
+  ] as unknown as Parameters<typeof restorableAgyConversation>[0];
 
+  // Restores in pi mode even when /reload or session resume creates a new bridgeServer name.
+  const restored = restorableAgyConversation(branch, sessionId, cwd, "pi", "pi-c95c4c4c57c2");
+  assert.equal(restored?.conversationId, "c4098627-f3db-4e14-92df-90df43d7b3a9");
+  assert.equal(restored?.contextTokens, 20_026);
 
+  // Rejects when toolMode mismatches or when the bridge is disabled.
+  assert.equal(restorableAgyConversation(branch, sessionId, cwd, "native", "pi-c95c4c4c57c2"), undefined);
+  assert.equal(restorableAgyConversation(branch, sessionId, cwd, "pi", undefined), undefined);
 
+  // Native mode still requires matching bridgeServer.
+  const nativeBranch = [
+    {
+      type: "custom",
+      customType: AGY_CONVERSATION_STATE_ENTRY,
+      data: {
+        ...piMarker.data,
+        toolMode: "native",
+      },
+    },
+  ] as unknown as Parameters<typeof restorableAgyConversation>[0];
+  assert.equal(
+    restorableAgyConversation(nativeBranch, sessionId, cwd, "native", "pi-676687f0606b")?.conversationId,
+    "c4098627-f3db-4e14-92df-90df43d7b3a9",
+  );
+  assert.equal(
+    restorableAgyConversation(nativeBranch, sessionId, cwd, "native", "pi-c95c4c4c57c2"),
+    undefined,
+  );
+});
+
+test("resolveAgyConsultSpec supports model/thinking switch when allowEmptyPrompt is set", () => {
+  const rejected = resolveAgyConsultSpec("flash3", ALL_FALLBACK_MODELS);
+  assert.equal(rejected.ok, false);
+
+  const switchedFlash = resolveAgyConsultSpec("flash3", ALL_FALLBACK_MODELS, {
+    allowEmptyPrompt: true,
+  });
+  assert.equal(switchedFlash.ok, true);
+  if (switchedFlash.ok) {
+    assert.equal(switchedFlash.model.id, "gemini-3.8-flash");
+    assert.equal(switchedFlash.effort, "high");
+    assert.equal(switchedFlash.prompt, "");
+  }
+
+  const switchedOpus = resolveAgyConsultSpec("opus", ALL_FALLBACK_MODELS, {
+    allowEmptyPrompt: true,
+  });
+  assert.equal(switchedOpus.ok, true);
+  if (switchedOpus.ok) {
+    assert.equal(switchedOpus.model.id, "claude-opus-5-5");
+    assert.equal(switchedOpus.effort, undefined);
+    assert.equal(switchedOpus.prompt, "");
+  }
+
+  const completions = getAgyConsultCompletions(
+    "opus",
+    ALL_FALLBACK_MODELS,
+    "claude-opus-5-5",
+    "high",
+  );
+  assert.ok(completions && completions.length > 0);
+  const opus2 = completions.find((item) => item.label === "opus2");
+  const opus3 = completions.find((item) => item.label === "opus3");
+  assert.ok(opus2);
+  assert.equal(opus3, undefined);
+});
+
+test("piHistoryBootstrap slices pre-compaction messages when branch contains pi-agy-compaction", () => {
+  const turn1User = { role: "user", content: "turn 1 old question" };
+  const turn1Assistant = { role: "assistant", content: [{ type: "text", text: "turn 1 old answer" }] };
+  const turn2User = { role: "user", content: "turn 2 question that compacted mid-turn" };
+  const turn2PreStep = {
+    role: "assistant",
+    content: [{ type: "toolCall", id: "c1", name: "read", arguments: { path: "old.ts" } }],
+  };
+  const turn2PreTool = { role: "toolResult", toolName: "read", content: "old file contents" };
+  const turn2PostAssistant = {
+    role: "assistant",
+    content: [{ type: "text", text: "turn 2 final answer after compaction" }],
+  };
+  const turn3User = { role: "user", content: "turn 3 follow-up" };
+
+  const context = {
+    messages: [
+      turn1User,
+      turn1Assistant,
+      turn2User,
+      turn2PreStep,
+      turn2PreTool,
+      turn2PostAssistant,
+      turn3User,
+    ],
+  } as unknown as Parameters<typeof piHistoryBootstrap>[0];
+
+  const branch = [
+    { type: "message", message: turn1User },
+    { type: "message", message: turn1Assistant },
+    { type: "message", message: turn2User },
+    { type: "message", message: turn2PreStep },
+    { type: "message", message: turn2PreTool },
+    {
+      type: "custom",
+      customType: AGY_COMPACTION_ENTRY,
+      data: { version: 1, beforeTokens: 299_135, afterTokens: 20_026 },
+    },
+    { type: "message", message: turn2PostAssistant },
+    { type: "message", message: turn3User },
+  ];
+
+  const restored = piHistoryBootstrap(context, 0, branch);
+  assert.ok(restored);
+  assert.ok(restored.includes("[Earlier history compacted]"));
+  assert.ok(!restored.includes("turn 1 old question"));
+  assert.ok(!restored.includes("turn 1 old answer"));
+  assert.ok(!restored.includes("old.ts"));
+  assert.ok(!restored.includes("old file contents"));
+  assert.ok(restored.includes("turn 2 question that compacted mid-turn"));
+  assert.ok(restored.includes("turn 2 final answer after compaction"));
+});

@@ -29,6 +29,7 @@ import {
   type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import type { AgyEffort } from "../lib/agy-client.ts";
+import { AGY_COMPACTION_ENTRY } from "../lib/agy-compaction.ts";
 import { type AgyPiBridge, resolveBridgeResultsFromContext } from "../lib/bridge.ts";
 import {
   ALL_FALLBACK_MODELS,
@@ -128,16 +129,130 @@ export function latestUserPrompt(context: TranscriptContext): { prompt: string; 
 const MAX_RESTORED_HISTORY_CHARS = 60_000;
 const MAX_TOOL_RESULT_RESTORE_CHARS = 1_500;
 
+function isAgyCompactionEntry(entry: unknown): boolean {
+  if (!entry || typeof entry !== "object") return false;
+  const record = entry as { type?: unknown; customType?: unknown };
+  return record.type === "custom" && record.customType === AGY_COMPACTION_ENTRY;
+}
+
+function isBranchMessageEntry(entry: unknown): entry is { type: "message"; message: unknown } {
+  if (!entry || typeof entry !== "object") return false;
+  return (entry as { type?: unknown }).type === "message" && "message" in entry;
+}
+
+function countsAsContextMessage(entry: unknown): boolean {
+  if (!entry || typeof entry !== "object") return false;
+  const record = entry as {
+    type?: unknown;
+    summary?: unknown;
+    message?: { role?: unknown };
+  };
+  if (record.type === "message") return record.message?.role !== "system";
+  if (record.type === "custom_message" || record.type === "compaction") return true;
+  if (record.type === "branch_summary") return Boolean(record.summary);
+  return false;
+}
+
+function sliceMessagesAfterCompaction(
+  priorMessages: TranscriptContext["messages"],
+  branch?: readonly unknown[],
+): { messages: TranscriptContext["messages"]; compacted: boolean } {
+  if (!branch || branch.length === 0 || priorMessages.length === 0) {
+    return { messages: priorMessages, compacted: false };
+  }
+  let lastAgyCompactionIdx = -1;
+  let lastNativeCompactionIdx = -1;
+  for (let i = 0; i < branch.length; i++) {
+    const entry = branch[i];
+    if (isAgyCompactionEntry(entry)) {
+      lastAgyCompactionIdx = i;
+    } else if (
+      entry &&
+      typeof entry === "object" &&
+      (entry as { type?: unknown }).type === "compaction"
+    ) {
+      lastNativeCompactionIdx = i;
+    }
+  }
+  if (lastAgyCompactionIdx < 0 || lastAgyCompactionIdx < lastNativeCompactionIdx) {
+    return { messages: priorMessages, compacted: false };
+  }
+
+  let firstPostCompactionIdx = -1;
+  let matchedByRef = false;
+  for (let i = lastAgyCompactionIdx + 1; i < branch.length; i++) {
+    const entry = branch[i];
+    if (!isBranchMessageEntry(entry)) continue;
+    const idx = priorMessages.indexOf(entry.message as TranscriptContext["messages"][number]);
+    if (idx >= 0) {
+      firstPostCompactionIdx = idx;
+      matchedByRef = true;
+      break;
+    }
+  }
+  if (!matchedByRef) {
+    for (let i = lastAgyCompactionIdx - 1; i >= 0; i--) {
+      const entry = branch[i];
+      if (!isBranchMessageEntry(entry)) continue;
+      const idx = priorMessages.indexOf(entry.message as TranscriptContext["messages"][number]);
+      if (idx >= 0) {
+        firstPostCompactionIdx = idx + 1;
+        matchedByRef = true;
+        break;
+      }
+    }
+  }
+  if (!matchedByRef) {
+    const startBranchIdx = lastNativeCompactionIdx >= 0 ? lastNativeCompactionIdx : 0;
+    let preCompactionCount = 0;
+    for (let i = startBranchIdx; i < lastAgyCompactionIdx; i++) {
+      if (countsAsContextMessage(branch[i])) preCompactionCount += 1;
+    }
+    let nonSystemSeen = 0;
+    firstPostCompactionIdx = priorMessages.length;
+    for (let i = 0; i < priorMessages.length; i++) {
+      if (priorMessages[i]!.role === "system") continue;
+      if (nonSystemSeen === preCompactionCount) {
+        firstPostCompactionIdx = i;
+        break;
+      }
+      nonSystemSeen += 1;
+    }
+  }
+
+  if (firstPostCompactionIdx <= 0) {
+    return { messages: priorMessages, compacted: false };
+  }
+  const postCompaction = priorMessages.slice(firstPostCompactionIdx);
+  if (postCompaction.length > 0 && postCompaction[0]!.role !== "user") {
+    for (let i = firstPostCompactionIdx - 1; i >= 0; i--) {
+      if (priorMessages[i]!.role !== "user") continue;
+      const end = i + 1;
+      while (i > 0 && priorMessages[i - 1]!.role === "user") i--;
+      return {
+        messages: [...priorMessages.slice(i, end), ...postCompaction],
+        compacted: i > 0 || end < firstPostCompactionIdx,
+      };
+    }
+  }
+  return { messages: postCompaction, compacted: true };
+}
+
 /** Serialize the active pi branch before its latest user request. */
 export function piHistoryBootstrap(
   context: TranscriptContext,
   promptReserveChars = 0,
+  branch?: readonly unknown[],
 ): string | undefined {
   const { start: latestUser } = latestUserBatch(context);
   if (latestUser <= 0) return undefined;
 
+  const { messages: historyMessages, compacted } = sliceMessagesAfterCompaction(
+    context.messages.slice(0, latestUser),
+    branch,
+  );
   const entries: string[] = [];
-  for (const raw of context.messages.slice(0, latestUser)) {
+  for (const raw of historyMessages) {
     if (raw.role === "system") continue;
     const message = raw as {
       role?: string;
@@ -177,7 +292,9 @@ export function piHistoryBootstrap(
   const maxHistoryChars = Math.max(10_000, MAX_RESTORED_HISTORY_CHARS - promptReserveChars);
   const bounded =
     transcript.length <= maxHistoryChars
-      ? transcript
+      ? compacted
+        ? `[Earlier history compacted]\n${transcript}`
+        : transcript
       : `[Earlier history omitted]\n${transcript.slice(-maxHistoryChars)}`;
   return restoredPiContextPrompt(bounded);
 }
@@ -452,6 +569,8 @@ export function streamAntigravity(
   onConsultUsed?: (consult: OneShotConsultOverride) => void,
   /** Whether Teamwork multi-agent orchestration mode is currently active. */
   isTeamworkActive?: () => boolean,
+  /** Active session branch entries for compaction-aware history bootstrap. */
+  getBranch?: () => readonly unknown[] | undefined,
 ) {
   let hadBoostInConversation = false;
   let hadTeamworkInConversation = false;
@@ -690,7 +809,7 @@ export function streamAntigravity(
             historyBootstrap:
               summaryRequest || sideSummaryRequest
                 ? undefined
-                : piHistoryBootstrap(context, turnPrompt.length),
+                : piHistoryBootstrap(context, turnPrompt.length, getBranch?.()),
             bootstrapSuffix: isolatedRequest ? undefined : getBootstrapSuffix?.(),
             modelId: effectiveModelId,
             effort,

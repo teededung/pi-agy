@@ -949,8 +949,13 @@ export function attachAgyConversationBridgeMetadata(
 
     const cached = detachedTrajectoryBridgeFields.get(conversationId);
     const agentMarker = Buffer.from(agentName, "utf-8");
+    const bridgeMarker = mcpDirectory
+      ? Buffer.from(pathToFileURL(mcpDirectory).href, "utf-8")
+      : undefined;
     const fieldsToAttach =
-      cached && cached.includes(agentMarker)
+      cached &&
+      cached.includes(agentMarker) &&
+      (!bridgeMarker || cached.includes(bridgeMarker))
         ? cached
         : buildPiToolsTrajectoryMetadataFields(agentName, mcpDirectory);
     rememberDetachedBridgeFields(conversationId, fieldsToAttach);

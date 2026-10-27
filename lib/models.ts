@@ -330,19 +330,21 @@ export type ResolvedAgyConsultSpec =
     };
 
 export const CONSULT_USAGE_MESSAGE =
-  'Usage: /m <opus|sonnet|argon|flash>[1|2|3] <prompt> (thinking: 1=low, 2=mid, 3=high, omit=session current)';
+  'Usage: /m <opus|sonnet|argon|flash>[1|2|3] [prompt] (thinking: 1=low, 2=mid, 3=high, omit=session current)';
 
 /**
- * Parse `/m <spec> <prompt>` arguments.
+ * Parse `/m <spec> [prompt]` arguments.
  * Supports:
  * - `/m argon <prompt>` (uses session's current thinking level)
  * - `/m argon3 <prompt>`, `/m opus2 <prompt>`, `/m sonnet1 <prompt>`, `/m flash3 <prompt>`
  * - `/m argon 3 <prompt>`, `/m opus:2 <prompt>`, `/m argon-1 <prompt>`
+ * - `/m argon3`, `/m flash` (when `allowEmptyPrompt: true`, switches session model/thinking)
  * - Full/partial model IDs (`gemini-4-argon`, `claude-opus-5-5`, etc.)
  */
 export function resolveAgyConsultSpec(
   args: string,
   models: readonly AgyModelInfo[] = ALL_FALLBACK_MODELS,
+  options: { allowEmptyPrompt?: boolean } = {},
 ): ResolvedAgyConsultSpec {
   const trimmed = args.trim();
   if (!trimmed) {
@@ -388,7 +390,7 @@ export function resolveAgyConsultSpec(
     }
   }
 
-  if (!rest) {
+  if (!rest && !options.allowEmptyPrompt) {
     return { ok: false, error: `Missing prompt for ${model.id}. ${CONSULT_USAGE_MESSAGE}` };
   }
 
@@ -407,6 +409,7 @@ export function getAgyConsultCompletions(
   argumentPrefix: string,
   models: readonly AgyModelInfo[] = ALL_FALLBACK_MODELS,
   currentModelId?: string,
+  currentEffort?: AgyEffort,
 ): Array<{ value: string; label: string; description: string }> | null {
   if (argumentPrefix.includes(" ")) return null;
   const prefix = argumentPrefix.trim().toLowerCase();
@@ -416,18 +419,22 @@ export function getAgyConsultCompletions(
 
   for (const alias of aliases) {
     const model = findAgyConsultModel(alias, models);
-    if (activeId && model?.id.toLowerCase() === activeId) continue;
+    const isCurrentModel = Boolean(activeId && model?.id.toLowerCase() === activeId);
+    if (isCurrentModel && !currentEffort) continue;
     const modelLabel = model ? `${model.name} (${model.id})` : alias;
-    items.push({
-      value: `${alias} `,
-      label: alias,
-      description: `${modelLabel} · session thinking`,
-    });
-    for (const [digit, level] of [
-      ["1", "low"],
-      ["2", "mid"],
-      ["3", "high"],
+    if (!isCurrentModel) {
+      items.push({
+        value: `${alias} `,
+        label: alias,
+        description: `${modelLabel} · session thinking`,
+      });
+    }
+    for (const [digit, level, effortValue] of [
+      ["1", "low", "low"],
+      ["2", "mid", "medium"],
+      ["3", "high", "high"],
     ] as const) {
+      if (isCurrentModel && currentEffort === effortValue) continue;
       items.push({
         value: `${alias}${digit} `,
         label: `${alias}${digit}`,
