@@ -158,6 +158,8 @@ export interface BranchContextFootprint {
   agyTokens?: number;
   /** Fallback context tokens when a non-agy provider is active right after an agy turn/consult. */
   nonAgyFallbackTokens?: number;
+  /** True when the branch was compacted and no post-compaction assistant turn has completed yet. */
+  awaitingPostCompactionTurn?: boolean;
 }
 
 /**
@@ -168,6 +170,7 @@ export function resolveBranchContextFootprint(branch: readonly unknown[]): Branc
   let agyTokens: number | undefined;
   let nonAgyTokens: number | undefined;
   let latestIsAgy = false;
+  let awaitingPostCompactionTurn = false;
 
   for (const raw of branch) {
     const entry = raw as {
@@ -191,6 +194,7 @@ export function resolveBranchContextFootprint(branch: readonly unknown[]): Branc
       agyTokens = undefined;
       nonAgyTokens = undefined;
       latestIsAgy = false;
+      awaitingPostCompactionTurn = true;
       continue;
     }
     if (entry.type === "custom") {
@@ -199,6 +203,7 @@ export function resolveBranchContextFootprint(branch: readonly unknown[]): Branc
           agyTokens = undefined;
           latestIsAgy = false;
         } else if (
+          !awaitingPostCompactionTurn &&
           entry.data.kind === "conversation" &&
           typeof entry.data.contextTokens === "number" &&
           Number.isFinite(entry.data.contextTokens) &&
@@ -216,6 +221,7 @@ export function resolveBranchContextFootprint(branch: readonly unknown[]): Branc
       ) {
         agyTokens = entry.data.afterTokens;
         latestIsAgy = true;
+        awaitingPostCompactionTurn = false;
       }
       continue;
     }
@@ -223,6 +229,7 @@ export function resolveBranchContextFootprint(branch: readonly unknown[]): Branc
       if (entry.message.stopReason === "aborted" || entry.message.stopReason === "error") {
         continue;
       }
+      awaitingPostCompactionTurn = false;
       const u = entry.message.usage;
       if (entry.message.provider === "antigravity") {
         const input = u?.input ?? 0;
@@ -252,6 +259,7 @@ export function resolveBranchContextFootprint(branch: readonly unknown[]): Branc
   return {
     agyTokens,
     nonAgyFallbackTokens: latestIsAgy && maxFallback > 0 ? maxFallback : undefined,
+    ...(awaitingPostCompactionTurn ? { awaitingPostCompactionTurn: true } : {}),
   };
 }
 

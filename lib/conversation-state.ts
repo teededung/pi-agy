@@ -187,6 +187,35 @@ export function restorableAgyConversation(
     if (branch.slice(index + 1).some(isContextChangingEntry)) {
       return undefined;
     }
+    // Reject state markers re-anchored after /compact without a post-compaction
+    // turn, or reusing a pre-compaction conversationId.
+    let sawMessageSinceCompaction = false;
+    let sawCompactionBeforeMarker = false;
+    for (let prior = index - 1; prior >= 0; prior -= 1) {
+      const priorEntry = branch[prior];
+      if (!sawCompactionBeforeMarker && priorEntry.type === "message") {
+        sawMessageSinceCompaction = true;
+      }
+      if (priorEntry.type === "compaction" || priorEntry.type === "branch_summary") {
+        if (!sawMessageSinceCompaction) return undefined;
+        sawCompactionBeforeMarker = true;
+        continue;
+      }
+      if (
+        sawCompactionBeforeMarker &&
+        priorEntry.type === "custom" &&
+        (priorEntry.customType === AGY_CONVERSATION_STATE_ENTRY ||
+          priorEntry.customType === "pi-antigravity-conversation-state")
+      ) {
+        const priorState = parsePersistedAgyState(priorEntry.data);
+        if (
+          priorState?.kind === "conversation" &&
+          priorState.conversationId === state.conversationId
+        ) {
+          return undefined;
+        }
+      }
+    }
     return state;
   }
   return undefined;

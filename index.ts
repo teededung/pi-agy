@@ -735,22 +735,37 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
                 cachedSnapshot = computeSessionUsageSnapshot(entries);
                 cachedFootprint = resolveBranchContextFootprint(branch);
               }
+              const needsCompactedEstimate =
+                model?.provider === "antigravity" &&
+                observedContextTokens === undefined &&
+                cachedFootprint.agyTokens === undefined &&
+                cachedFootprint.awaitingPostCompactionTurn === true;
               return {
                 cwd: sm.getCwd?.() ?? liveCtx.cwd,
                 sessionName: sm.getSessionName?.()?.trim(),
                 model,
                 thinkingLevel: pi.getThinkingLevel?.() ?? "off",
                 contextUsage:
-                  model?.provider === "antigravity"
+                  model?.provider === "antigravity" && !needsCompactedEstimate
                     ? undefined
                     : liveCtx.getContextUsage?.(),
               };
             });
             if (state.stale) return [];
             const { cwd, sessionName, model, thinkingLevel, contextUsage } = state.value;
+            const postCompactionEstimatedTokens =
+              typeof contextUsage?.tokens === "number" &&
+              Number.isFinite(contextUsage.tokens) &&
+              contextUsage.tokens > 0
+                ? contextUsage.tokens
+                : undefined;
             const effectiveAgyTokens =
               model?.provider === "antigravity"
-                ? (observedContextTokens ?? cachedFootprint.agyTokens)
+                ? (observedContextTokens ??
+                  cachedFootprint.agyTokens ??
+                  (cachedFootprint.awaitingPostCompactionTurn
+                    ? postCompactionEstimatedTokens
+                    : undefined))
                 : cachedFootprint.nonAgyFallbackTokens;
             return renderFooterLines({
               width,
@@ -1894,9 +1909,22 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("session_compact", async (_event, ctx: ExtensionContext) => {
-    // Pi manual/overflow compaction changes the session branch but not agy's
-    // native conversation. Re-anchor the same owner after the compaction entry.
-    await persistConversationState(ctx, true);
+    // Pi manual/overflow compaction summarizes earlier history on the session
+    // branch. Reset the agy conversation so the next turn bootstraps from the
+    // compacted branch and the footer immediately clears pre-compaction tokens.
+    activeSessionCtx = ctx;
+    const cwd = probeCtx(() => ctx.cwd);
+    if (cwd.stale) return;
+    const previousConversationId = await captureActiveConversationId();
+    await runAntigravity(runtime, service.setSession(cwd.value, undefined, true));
+    detachConversationMetadata(previousConversationId);
+    appendConversationReset(ctx);
+    subagentRoster.clear();
+    setAgyTasksWidget(0);
+    setAgyArtifactsWidget(0);
+    renderAgyStatusWidget(true);
+    invalidateFooter?.();
+    requestFooterRender?.();
   });
 
   pi.on("session_shutdown", async () => {

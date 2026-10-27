@@ -1017,6 +1017,42 @@ test("renderFooterLines renders 2-row footer with agy 300k context bar and filte
 
   // Compaction resets prior branch context tokens, and mapUsage includes cache_read_tokens in totalTokens.
   assert.equal(resolveAgyBranchContextTokens([...branch, { type: "compaction" }]), undefined);
+  // A stale pi-agy-conversation-state marker re-anchored right after /compact without a post-compaction
+  // assistant turn must not resurrect the 314k pre-compaction red context bar.
+  const stalePostCompactBranch = [
+    ...branch,
+    {
+      type: "custom",
+      customType: AGY_CONVERSATION_STATE_ENTRY,
+      data: { kind: "conversation", conversationId: "pre-compact-conv", contextTokens: 314_326 },
+    },
+    { type: "compaction", tokensBefore: 315_421, summary: "## Goal\nContinue..." },
+    {
+      type: "custom",
+      customType: AGY_CONVERSATION_STATE_ENTRY,
+      data: { kind: "conversation", conversationId: "pre-compact-conv", contextTokens: 314_326 },
+    },
+  ];
+  const staleFootprint = resolveBranchContextFootprint(stalePostCompactBranch);
+  assert.equal(staleFootprint.agyTokens, undefined);
+  assert.equal(staleFootprint.awaitingPostCompactionTurn, true);
+
+  // Once a new assistant turn completes after compaction, its context footprint becomes authoritative.
+  const postCompactTurnBranch = [
+    ...stalePostCompactBranch,
+    {
+      type: "message",
+      message: {
+        role: "assistant",
+        provider: "antigravity",
+        usage: { input: 3_200, output: 400, cacheRead: 28_000 },
+      },
+    },
+  ];
+  const postCompactFootprint = resolveBranchContextFootprint(postCompactTurnBranch);
+  assert.equal(postCompactFootprint.agyTokens, 31_200);
+  assert.equal(postCompactFootprint.awaitingPostCompactionTurn, undefined);
+
   assert.equal(
     mapUsage({
       input_tokens: 2_000,
@@ -1086,6 +1122,18 @@ test("restorableAgyConversation restores pi tool-mode conversations across bridg
   );
   assert.equal(
     restorableAgyConversation(nativeBranch, sessionId, cwd, "native", "pi-c95c4c4c57c2"),
+    undefined,
+  );
+
+  // Rejects a state marker persisted right after /compact without any post-compaction message turn.
+  const compactedBranch = [
+    { type: "message", message: { role: "user", content: "hello" } },
+    piMarker,
+    { type: "compaction", tokensBefore: 315_421, summary: "## Goal\n..." },
+    piMarker,
+  ] as unknown as Parameters<typeof restorableAgyConversation>[0];
+  assert.equal(
+    restorableAgyConversation(compactedBranch, sessionId, cwd, "pi", "pi-c95c4c4c57c2"),
     undefined,
   );
 });
