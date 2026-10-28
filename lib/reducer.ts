@@ -155,13 +155,17 @@ export function newTurnOutcome(): AgyTurnOutcome {
 const HALLUCINATED_TURN_BOUNDARY_RE =
   /\[\]用户(?:\r?\n<(?:MESSAGE_RECEIVED|SYSTEM_MESSAGE)\b[\s\S]*|\r?\n?$)|\r?\n<MESSAGE_RECEIVED>\r?\nSender ID:\s+\S+[\s\S]*$/;
 
+const INVISIBLE_ANNOTATION_CHARS_RE = /[\uFFF9-\uFFFB]/g;
+
 const outcomeResponseStepState = new WeakMap<
   AgyTurnOutcome,
   { truncatedSteps: Set<number>; stepBuffers: Map<number, string> }
 >();
 
 export function stripHallucinatedTurnSuffix(text: string): string {
-  return text.replace(HALLUCINATED_TURN_BOUNDARY_RE, "");
+  return text
+    .replace(INVISIBLE_ANNOTATION_CHARS_RE, "")
+    .replace(HALLUCINATED_TURN_BOUNDARY_RE, "");
 }
 
 function sanitizeAgentResponseDelta(
@@ -169,8 +173,10 @@ function sanitizeAgentResponseDelta(
   stepIndex: number | undefined,
   rawDelta: string,
 ): string {
+  const cleanDelta = rawDelta.replace(INVISIBLE_ANNOTATION_CHARS_RE, "");
+  if (!cleanDelta) return "";
   if (stepIndex === undefined) {
-    return stripHallucinatedTurnSuffix(rawDelta);
+    return stripHallucinatedTurnSuffix(cleanDelta);
   }
   let state = outcomeResponseStepState.get(outcome);
   if (!state) {
@@ -181,15 +187,15 @@ function sanitizeAgentResponseDelta(
     return "";
   }
   const prev = state.stepBuffers.get(stepIndex) ?? "";
-  const combined = prev + rawDelta;
-  const sanitized = stripHallucinatedTurnSuffix(combined);
+  const combined = prev + cleanDelta;
+  const sanitized = combined.replace(HALLUCINATED_TURN_BOUNDARY_RE, "");
   if (sanitized.length < combined.length) {
     state.truncatedSteps.add(stepIndex);
     state.stepBuffers.set(stepIndex, sanitized);
     return sanitized.length > prev.length ? sanitized.slice(prev.length) : "";
   }
   state.stepBuffers.set(stepIndex, combined);
-  return rawDelta;
+  return cleanDelta;
 }
 
 export type { AgyUsage };

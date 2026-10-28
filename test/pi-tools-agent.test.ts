@@ -10,11 +10,14 @@ import {
 } from "../lib/conversation-state.ts";
 import {
   deleteAgyConversationsForSessionFile,
+  deleteDisposableAgyConversation,
   detachAgyConversationBridgeMetadata,
   extractAgyConversationIdsFromSessionFile,
   renameAgyConversationsForSessionFile,
   sweepStalePiToolsConversations,
 } from "../lib/conversation-metadata.ts";
+import { RECOMMENDED_AGY_VERSION } from "../lib/agy-diagnostics.ts";
+import { reduceAgyStream, stripHallucinatedTurnSuffix } from "../lib/reducer.ts";
 import {
   installModelSelectorSelectionPatch,
   installSessionSelectorDeletePatch,
@@ -1226,4 +1229,146 @@ test("piHistoryBootstrap slices pre-compaction messages when branch contains pi-
   assert.ok(!restored.includes("old file contents"));
   assert.ok(restored.includes("turn 2 question that compacted mid-turn"));
   assert.ok(restored.includes("turn 2 final answer after compaction"));
+});
+
+test("deleteDisposableAgyConversation recursively deletes subagent trees and cleans last_conversations.json", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "pi-agy-subagent-delete-"));
+  try {
+    const agyBase = path.join(home, ".gemini", "antigravity-cli");
+    await mkdir(path.join(agyBase, "conversations"), { recursive: true });
+    await mkdir(path.join(agyBase, "annotations"), { recursive: true });
+    await mkdir(path.join(agyBase, "cache"), { recursive: true });
+
+    const rootCid = "11111111-1111-4111-8111-111111111111";
+    const childCid = "22222222-2222-4222-8222-222222222222";
+    const nestedWorkerCid = "33333333-3333-4333-8333-333333333333";
+    const unrelatedCid = "44444444-4444-4444-8444-444444444444";
+
+    for (const cid of [rootCid, childCid, nestedWorkerCid, unrelatedCid]) {
+      await writeFile(path.join(agyBase, "conversations", `${cid}.db`), "db", "utf8");
+      await writeFile(path.join(agyBase, "annotations", `${cid}.pbtxt`), `title:"${cid}"`, "utf8");
+      await mkdir(path.join(agyBase, "brain", cid), { recursive: true });
+    }
+
+    // root -> child via brain/.system_generated/subagents/*.json
+    const rootSubDir = path.join(agyBase, "brain", rootCid, ".system_generated", "subagents");
+    await mkdir(rootSubDir, { recursive: true });
+    await writeFile(
+      path.join(rootSubDir, `${childCid}.json`),
+      JSON.stringify({ conversationId: childCid, state: "SUBAGENT_STATE_ALIVE" }),
+      "utf8",
+    );
+
+    // child -> nestedWorker via conversation_summaries.db parent_conversation_id
+    const summariesDbPath = path.join(agyBase, "conversation_summaries.db");
+    const db = new DatabaseSync(summariesDbPath);
+    db.exec(
+      "CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, parent_conversation_id TEXT NOT NULL DEFAULT '', title TEXT NOT NULL DEFAULT '')",
+    );
+    db.prepare(
+      "INSERT INTO conversation_summaries (conversation_id, parent_conversation_id, title) VALUES (?, ?, ?)",
+    ).run(rootCid, "", "Root");
+    db.prepare(
+      "INSERT INTO conversation_summaries (conversation_id, parent_conversation_id, title) VALUES (?, ?, ?)",
+    ).run(childCid, rootCid, "DeepCoder");
+    db.prepare(
+      "INSERT INTO conversation_summaries (conversation_id, parent_conversation_id, title) VALUES (?, ?, ?)",
+    ).run(nestedWorkerCid, childCid, "DeepCoderWorkerL0");
+    db.prepare(
+      "INSERT INTO conversation_summaries (conversation_id, parent_conversation_id, title) VALUES (?, ?, ?)",
+    ).run(unrelatedCid, "", "Keep Me");
+    db.close();
+
+    await writeFile(
+      path.join(agyBase, "cache", "conversation_metadata.json"),
+      JSON.stringify({
+        conversations: {
+          [rootCid]: { summary: { ID: rootCid } },
+          [childCid]: { summary: { ID: childCid } },
+          [nestedWorkerCid]: { summary: { ID: nestedWorkerCid } },
+          [unrelatedCid]: { summary: { ID: unrelatedCid } },
+        },
+      }),
+      "utf8",
+    );
+
+    const missingBridgeDir = path.join(home, ".pi", "agent", "antigravity", "bridges", "dead-bridge");
+    await writeFile(
+      path.join(agyBase, "cache", "last_conversations.json"),
+      JSON.stringify({
+        "/repo/root": rootCid,
+        "/repo/subagent": childCid,
+        [missingBridgeDir]: unrelatedCid,
+        "/repo/keep": unrelatedCid,
+      }),
+      "utf8",
+    );
+
+    await deleteDisposableAgyConversation(rootCid, home);
+
+    for (const deletedId of [rootCid, childCid, nestedWorkerCid]) {
+      await assert.rejects(stat(path.join(agyBase, "conversations", `${deletedId}.db`)));
+      await assert.rejects(stat(path.join(agyBase, "annotations", `${deletedId}.pbtxt`)));
+      await assert.rejects(stat(path.join(agyBase, "brain", deletedId)));
+    }
+    await stat(path.join(agyBase, "conversations", `${unrelatedCid}.db`));
+
+    const verifyDb = new DatabaseSync(summariesDbPath, { readOnly: true });
+    const rows = verifyDb
+      .prepare("SELECT conversation_id FROM conversation_summaries")
+      .all() as Array<{ conversation_id: string }>;
+    verifyDb.close();
+    assert.deepEqual(
+      rows.map((r) => r.conversation_id),
+      [unrelatedCid],
+    );
+
+    const lastConvs = JSON.parse(
+      await readFile(path.join(agyBase, "cache", "last_conversations.json"), "utf8"),
+    ) as Record<string, string>;
+    assert.deepEqual(lastConvs, { "/repo/keep": unrelatedCid });
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("reduceAgyStream strips invisible U+FFF9-U+FFFB chars without truncating subsequent deltas and RECOMMENDED_AGY_VERSION is 1.4.9", () => {
+  assert.equal(RECOMMENDED_AGY_VERSION, "1.4.9");
+  assert.equal(stripHallucinatedTurnSuffix("hello \uFFF9code\uFFFA\uFFFB world"), "hello code world");
+
+  const stream = [
+    JSON.stringify({
+      event: "step_update",
+      step_update: {
+        step_index: 1,
+        step_type: "agent_response",
+        state: "ACTIVE",
+        text_delta: "First \uFFF9chunk\uFFFA, ",
+      },
+    }),
+    JSON.stringify({
+      event: "step_update",
+      step_update: {
+        step_index: 1,
+        step_type: "agent_response",
+        state: "DONE",
+        text_delta: "second \uFFFBchunk!",
+      },
+    }),
+    JSON.stringify({
+      event: "result",
+      result: {
+        status: "SUCCESS",
+        response: "First \uFFF9chunk\uFFFA, second \uFFFBchunk!",
+      },
+    }),
+  ].join("\n");
+
+  const outcome = reduceAgyStream(stream);
+  assert.equal(outcome.response, "First chunk, second chunk!");
+  const streamedText = outcome.activities
+    .filter((a): a is Extract<typeof a, { type: "text" }> => a.type === "text")
+    .map((a) => a.delta)
+    .join("");
+  assert.equal(streamedText, "First chunk, second chunk!");
 });

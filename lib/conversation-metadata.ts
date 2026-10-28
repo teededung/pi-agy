@@ -355,57 +355,172 @@ export function extractAgyConversationIdsFromSessionFile(
 }
 
 /**
- * Remove an agy conversation completely from disk (`conversations/<id>.db*`,
- * `annotations/<id>.pbtxt`, `presence/<id>.lock`, `implicit/<id>.pb`,
- * `brain/<id>`, `conversation_summaries.db`, and `cache/conversation_metadata.json`)
- * so it never pollutes `agy -c` / `agy --resume`.
+ * Remove an agy conversation and all its descendant subagent conversations
+ * completely from disk (`conversations/<id>.db*`, `annotations/<id>.pbtxt`,
+ * `presence/<id>.lock`, `implicit/<id>.pb`, `brain/<id>`,
+ * `conversation_summaries.db`, `cache/conversation_metadata.json`, and
+ * `cache/last_conversations.json`) so it never pollutes `agy -c` / `agy --resume`.
  */
 export async function deleteDisposableAgyConversation(
   conversationId: string | undefined,
   homeDirectory = os.homedir(),
 ): Promise<void> {
   if (!conversationId || !/^[0-9a-f-]{36}$/i.test(conversationId)) return;
-  detachedTrajectoryBridgeFields.delete(conversationId);
   const baseDir = path.join(homeDirectory, ".gemini", "antigravity-cli");
-  const removals = [
-    path.join(baseDir, "conversations", `${conversationId}.db`),
-    path.join(baseDir, "conversations", `${conversationId}.db-wal`),
-    path.join(baseDir, "conversations", `${conversationId}.db-shm`),
-    path.join(baseDir, "annotations", `${conversationId}.pbtxt`),
-    path.join(baseDir, "presence", `${conversationId}.lock`),
-    path.join(baseDir, "implicit", `${conversationId}.pb`),
-    path.join(baseDir, "brain", conversationId),
-  ];
+  const dbPath = path.join(baseDir, "conversation_summaries.db");
+
+  const idsToDelete = new Set<string>();
+  const queue: string[] = [conversationId.toLowerCase()];
+
+  let summaryDb: DatabaseSync | undefined;
+  if (existsSync(dbPath)) {
+    try {
+      summaryDb = new DatabaseSync(dbPath);
+      summaryDb.exec("PRAGMA busy_timeout = 2000;");
+    } catch {
+      summaryDb = undefined;
+    }
+  }
+
+  try {
+    while (queue.length > 0 && idsToDelete.size < 256) {
+      const current = queue.shift()!;
+      if (idsToDelete.has(current)) continue;
+      idsToDelete.add(current);
+
+      const subagentsDir = path.join(baseDir, "brain", current, ".system_generated", "subagents");
+      try {
+        const files = await fs.readdir(subagentsDir);
+        for (const file of files) {
+          if (!file.endsWith(".json")) continue;
+          const stem = file.slice(0, -5).toLowerCase();
+          if (/^[0-9a-f-]{36}$/i.test(stem) && !idsToDelete.has(stem)) {
+            queue.push(stem);
+          }
+          try {
+            const raw = await fs.readFile(path.join(subagentsDir, file), "utf-8");
+            const parsed = record(JSON.parse(raw));
+            const childId =
+              typeof parsed?.conversationId === "string"
+                ? parsed.conversationId.trim().toLowerCase()
+                : undefined;
+            if (childId && /^[0-9a-f-]{36}$/i.test(childId) && !idsToDelete.has(childId)) {
+              queue.push(childId);
+            }
+          } catch {
+            // Ignore malformed subagent JSON
+          }
+        }
+      } catch {
+        // No subagents directory for this conversation
+      }
+
+      if (summaryDb) {
+        try {
+          const rows = summaryDb
+            .prepare(
+              "SELECT conversation_id FROM conversation_summaries WHERE LOWER(parent_conversation_id) = ?",
+            )
+            .all(current) as Array<{ conversation_id?: string }>;
+          for (const row of rows) {
+            const childId = row.conversation_id?.trim().toLowerCase();
+            if (childId && /^[0-9a-f-]{36}$/i.test(childId) && !idsToDelete.has(childId)) {
+              queue.push(childId);
+            }
+          }
+        } catch {
+          // Best-effort
+        }
+      }
+    }
+
+    if (summaryDb) {
+      try {
+        const deleteById = summaryDb.prepare(
+          "DELETE FROM conversation_summaries WHERE LOWER(conversation_id) = ?",
+        );
+        for (const cid of idsToDelete) {
+          deleteById.run(cid);
+        }
+      } catch {
+        // Best-effort
+      }
+      try {
+        const deleteByParent = summaryDb.prepare(
+          "DELETE FROM conversation_summaries WHERE LOWER(parent_conversation_id) = ?",
+        );
+        for (const cid of idsToDelete) {
+          deleteByParent.run(cid);
+        }
+      } catch {
+        // Optional column on older/minimal test tables
+      }
+    }
+  } finally {
+    try {
+      summaryDb?.close();
+    } catch {
+      // Ignore close errors
+    }
+  }
+
+  const removals: string[] = [];
+  for (const cid of idsToDelete) {
+    detachedTrajectoryBridgeFields.delete(cid);
+    removals.push(
+      path.join(baseDir, "conversations", `${cid}.db`),
+      path.join(baseDir, "conversations", `${cid}.db-wal`),
+      path.join(baseDir, "conversations", `${cid}.db-shm`),
+      path.join(baseDir, "annotations", `${cid}.pbtxt`),
+      path.join(baseDir, "presence", `${cid}.lock`),
+      path.join(baseDir, "implicit", `${cid}.pb`),
+      path.join(baseDir, "brain", cid),
+    );
+  }
   await Promise.all(
     removals.map((target) => fs.rm(target, { recursive: true, force: true }).catch(() => {})),
   );
-  const dbPath = path.join(baseDir, "conversation_summaries.db");
-  if (existsSync(dbPath)) {
-    let db: DatabaseSync | undefined;
-    try {
-      db = new DatabaseSync(dbPath);
-      db.exec("PRAGMA busy_timeout = 2000;");
-      db.prepare("DELETE FROM conversation_summaries WHERE conversation_id = ?").run(
-        conversationId,
-      );
-    } catch {
-      // Best-effort
-    } finally {
-      try {
-        db?.close();
-      } catch {
-        // Ignore close errors
-      }
-    }
-  }
+
   const metadataPath = agyConversationMetadataPath(homeDirectory);
   if (existsSync(metadataPath)) {
     try {
       const parsed = JSON.parse(readFileSync(metadataPath, "utf-8")) as Record<string, unknown>;
       const conversations = record(parsed.conversations);
-      if (conversations && conversationId in conversations) {
-        delete conversations[conversationId];
-        writeFileSync(metadataPath, JSON.stringify(parsed), "utf-8");
+      if (conversations) {
+        let changed = false;
+        for (const key of Object.keys(conversations)) {
+          if (idsToDelete.has(key.toLowerCase())) {
+            delete conversations[key];
+            changed = true;
+          }
+        }
+        if (changed) {
+          writeFileSync(metadataPath, JSON.stringify(parsed), "utf-8");
+        }
+      }
+    } catch {
+      // Best-effort
+    }
+  }
+
+  const lastConversationsPath = path.join(baseDir, "cache", "last_conversations.json");
+  if (existsSync(lastConversationsPath)) {
+    try {
+      const parsed = record(JSON.parse(readFileSync(lastConversationsPath, "utf-8")));
+      if (parsed) {
+        let changed = false;
+        for (const [workspaceKey, mappedId] of Object.entries(parsed)) {
+          const idLower = typeof mappedId === "string" ? mappedId.toLowerCase() : "";
+          const deadBridgeDir =
+            isBridgeWorkspaceUri(workspaceKey) && !bridgeDirStillExists(workspaceKey);
+          if ((idLower && idsToDelete.has(idLower)) || deadBridgeDir) {
+            delete parsed[workspaceKey];
+            changed = true;
+          }
+        }
+        if (changed) {
+          writeFileSync(lastConversationsPath, JSON.stringify(parsed, null, 2), "utf-8");
+        }
       }
     } catch {
       // Best-effort
@@ -1078,6 +1193,34 @@ export function sweepStalePiToolsConversations(
       cleaned += 1;
     }
   }
+
+  const lastConversationsPath = path.join(
+    homeDirectory,
+    ".gemini",
+    "antigravity-cli",
+    "cache",
+    "last_conversations.json",
+  );
+  if (existsSync(lastConversationsPath)) {
+    try {
+      const parsed = record(JSON.parse(readFileSync(lastConversationsPath, "utf-8")));
+      if (parsed) {
+        let changed = false;
+        for (const workspaceKey of Object.keys(parsed)) {
+          if (isBridgeWorkspaceUri(workspaceKey) && !bridgeDirStillExists(workspaceKey)) {
+            delete parsed[workspaceKey];
+            changed = true;
+          }
+        }
+        if (changed) {
+          writeFileSync(lastConversationsPath, JSON.stringify(parsed, null, 2), "utf-8");
+        }
+      }
+    } catch {
+      // Best-effort
+    }
+  }
+
   return cleaned;
 }
 
