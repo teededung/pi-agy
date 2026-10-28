@@ -592,9 +592,10 @@ function bridgeDirStillExists(uri: string): boolean {
 }
 
 const detachedTrajectoryBridgeFields = new Map<string, Buffer>();
+const BROKEN_SOURCELESS_TOOL_FIELD = Buffer.from("\x1a\x10\x0a\x0egenerate_image", "binary");
 
 function rememberDetachedBridgeFields(conversationId: string, fields: Buffer): void {
-  if (fields.length === 0) return;
+  if (fields.length === 0 || fields.includes(BROKEN_SOURCELESS_TOOL_FIELD)) return;
   detachedTrajectoryBridgeFields.delete(conversationId);
   detachedTrajectoryBridgeFields.set(conversationId, fields);
   while (detachedTrajectoryBridgeFields.size > 64) {
@@ -753,7 +754,7 @@ export function buildPiToolsTrajectoryMetadataFields(
   ].map((inner) => pbBytesField(2, inner));
 
   const toolFields = declaredTools.map((toolName) =>
-    pbBytesField(3, pbBytesField(1, toolName)),
+    pbBytesField(3, Buffer.concat([pbBytesField(1, toolName), pbVarintField(2, 1)])),
   );
 
   const checks = [

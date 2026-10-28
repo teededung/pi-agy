@@ -1391,7 +1391,12 @@ test("buildPiToolsTrajectoryMetadataFields encodes native specialty tools and la
 
   const blob = buildPiToolsTrajectoryMetadataFields(agent.name, mcpDir);
   for (const nativeTool of PI_TOOLS_AGENT_NATIVE_TOOLS) {
-    assert.equal(blob.includes(Buffer.from(nativeTool, "utf8")), true);
+    // Each tool in DeclarativeComponentConfig (f18.1.3) must include field 1 (name) + field 2 (builtin: true = 0x10 0x01).
+    const expectedEntry = Buffer.concat([
+      pbField(1, nativeTool),
+      Buffer.from([0x10, 0x01]),
+    ]);
+    assert.equal(blob.includes(expectedEntry), true);
   }
   assert.equal(blob.includes(Buffer.from("pi__web_search", "utf8")), true);
   assert.equal(blob.includes(Buffer.from("pi__fetch_content", "utf8")), true);
