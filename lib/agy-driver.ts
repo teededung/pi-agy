@@ -451,15 +451,17 @@ export class AgyDriverSession implements AgyTurnExecutor {
       turn.resolve = resolve;
       turn.reject = reject;
     });
+    // Ensure early settlement (e.g. stall timeout, overall timeout, abort, or
+    // child exit while a >64KB prompt is still waiting for stdin drain) never
+    // triggers an unhandled rejection before outcomePromise is awaited.
+    outcomePromise.catch(() => {});
     this.#active = turn;
     this.#state = "running";
     this.#submittedTurns += 1;
     this.#currentProcessTurns += 1;
     this.#armTurnTimers(turn);
     if (this.#active !== turn) return outcomePromise;
-    try {
-      await this.#writeUserEvent(child, request.prompt);
-    } catch (error) {
+    void this.#writeUserEvent(child, request.prompt).catch(async (error) => {
       await this.#waitUntilChildChanges(child, 50);
       if (this.#active === turn) {
         this.#detachChild(child, "dead");
@@ -471,7 +473,7 @@ export class AgyDriverSession implements AgyTurnExecutor {
           ),
         });
       }
-    }
+    });
     return outcomePromise;
   }
 
@@ -529,6 +531,10 @@ export class AgyDriverSession implements AgyTurnExecutor {
     trackAgyChild(child);
     this.#log(`spawn:${child.pid ?? "unknown"}`);
 
+    child.stdin.on("error", () => {
+      // Per-write errors are handled in #writeUserEvent; swallow late EPIPE
+      // emitted when a child is killed while a >64KB write is still buffered.
+    });
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => this.#onStdout(generation, chunk));
     child.stderr.setEncoding("utf8");
@@ -1298,6 +1304,13 @@ export class AgyDriverSession implements AgyTurnExecutor {
       this.#active?.outcome.conversationId ?? this.#boundConversationId,
     );
     untrackAgyChild(child);
+    if (nextState === "dead") {
+      try {
+        child.stdin.destroy();
+      } catch {
+        // Already closed or destroyed.
+      }
+    }
     this.#child = undefined;
     this.#currentProcessTurns = 0;
     this.#state = nextState;

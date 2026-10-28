@@ -7,6 +7,7 @@ import { PassThrough } from "node:stream";
 import { test } from "node:test";
 import { SettingsManager } from "@earendil-works/pi-coding-agent";
 import {
+  AgyStallError,
   buildDriverAgyArgs,
   buildOneShotAgyArgs,
   resetLegacyEffortSuffixCache,
@@ -206,3 +207,34 @@ test("model and effort default to base model + --effort and fall back to legacy 
   assert.equal(spawnedArgs[2]![spawnedArgs[2]!.indexOf("--model") + 1], "gemini-3.8-flash-low");
   assert.equal(spawnedArgs[2]!.includes("--effort"), false);
 });
+
+test("AgyDriverSession rejects cleanly with AgyStallError without unhandledRejection when a >64KB stdin write stalls before drain", async (t) => {
+  const { spawn } = await import("node:child_process");
+  const driver = new AgyDriverSession();
+  t.after(() => driver.close("shutdown"));
+
+  let unhandled: unknown;
+  const onUnhandled = (reason: unknown) => {
+    unhandled = reason;
+  };
+  process.on("unhandledRejection", onUnhandled);
+  t.after(() => process.off("unhandledRejection", onUnhandled));
+
+  await assert.rejects(
+    () =>
+      driver.run({
+        prompt: "x".repeat(75_000),
+        binary: process.execPath,
+        inactivityTimeoutMs: 80,
+        spawnOverride: () =>
+          spawn(process.execPath, ["-e", "setTimeout(() => {}, 5000)"], {
+            stdio: ["pipe", "pipe", "pipe"],
+            detached: true,
+          }),
+      }),
+    (err: unknown) => err instanceof AgyStallError && err.stalledMs === 80,
+  );
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(unhandled, undefined);
+});
+
