@@ -55,6 +55,7 @@ import {
   BOOST_DEACTIVATED_PROMPT,
   BOOST_ORCHESTRATOR_PROMPT,
   BRIDGE_PENDING_TOOL_MESSAGE,
+  GOAL_INITIAL_PROMPT,
   omittedImagesPrompt,
   restoredPiContextPrompt,
   TEAMWORK_CONTINUATION_PROMPT,
@@ -621,6 +622,11 @@ export function contextHasPriorTeamworkActivity(messages: TranscriptContext["mes
   return false;
 }
 
+export interface AgySettledTurnOutcome {
+  stopReason: AssistantMessage["stopReason"];
+  responseText: string;
+}
+
 /** Build the streamSimple implementation bound to the runtime service. */
 export function streamAntigravity(
   runtime: AntigravityRuntimeInstance,
@@ -630,7 +636,7 @@ export function streamAntigravity(
   bridge: AgyPiBridge,
   /** Called when a turn fully settles (stop or error) — the moment an agy
    * background task may have been created. */
-  onSettled?: () => void,
+  onSettled?: (outcome?: AgySettledTurnOutcome) => void,
   /**
    * Extra prompt text for bootstrap sends (fresh agy conversation). Bridge
    * mode returns nothing; direct mode (bridge off) injects skill file paths.
@@ -670,6 +676,10 @@ export function streamAntigravity(
   isTeamworkActive?: () => boolean,
   /** Active session branch entries for compaction-aware history bootstrap. */
   getBranch?: () => readonly unknown[] | undefined,
+  /** Whether `/goal` autonomous mode is currently active. */
+  isGoalActive?: () => boolean,
+  /** Notifies the extension when a turn starts with an explicit `/goal <task>` directive. */
+  onGoalStarted?: (request: string, options?: { boost?: boolean }) => void,
 ) {
   let hadBoostInConversation = false;
   let hadTeamworkInConversation = false;
@@ -710,7 +720,14 @@ export function streamAntigravity(
         turnCleared = true;
         const finished = turnRuntime.runPromise(turnService.finishTurn).catch(() => {});
         if (!isolatedRuntime) {
-          onSettled?.();
+          const settledText = output.content
+            .map((c) => (c.type === "text" ? c.text : ""))
+            .filter(Boolean)
+            .join("\n");
+          onSettled?.({
+            stopReason: output.stopReason,
+            responseText: settledText,
+          });
           return;
         }
         // A summarizer or disposable side-conversation (/btw) has no main-thread
@@ -800,6 +817,8 @@ export function streamAntigravity(
         }
         let isBoost = false;
         let isTeamwork = false;
+        let isGoal = false;
+        let explicitBoostCommand = false;
         let explicitTeamworkCommand = false;
         if (!isolatedRequest) {
           if (userBatch.start !== currentTurnBatchStart) {
@@ -817,6 +836,10 @@ export function streamAntigravity(
               (userBatch.start > 0 &&
                 contextHasPriorTeamworkActivity(context.messages.slice(0, userBatch.start)));
           }
+          if (/^\/(?:agy-)?goal\b/i.test(prompt)) {
+            isGoal = true;
+            prompt = prompt.replace(/^\/(?:agy-)?goal\s*/i, "").trim();
+          }
           if (/^\/(?:agy-)?teamwork\b/i.test(prompt)) {
             isTeamwork = true;
             explicitTeamworkCommand = true;
@@ -827,8 +850,9 @@ export function streamAntigravity(
             }
           } else if (/^\/(?:agy-)?boost\b/i.test(prompt)) {
             isBoost = true;
+            explicitBoostCommand = true;
             prompt = prompt.replace(/^\/(?:agy-)?boost\s*/i, "").trim();
-            if (!prompt) {
+            if (!prompt && !isGoal) {
               prompt =
                 "Boost mode is ready. What coding or investigation task would you like to tackle? Please share the details or requirements, and I will orchestrate the work.";
             }
@@ -836,6 +860,19 @@ export function streamAntigravity(
             isTeamwork = true;
           } else if (isBoostActive?.()) {
             isBoost = true;
+          }
+          if (!isGoal && /^\/(?:agy-)?goal\b/i.test(prompt)) {
+            isGoal = true;
+            prompt = prompt.replace(/^\/(?:agy-)?goal\s*/i, "").trim();
+          }
+          if (isGoal) {
+            if (!prompt) {
+              prompt =
+                "Goal mode is ready. What long-running goal or deliverables would you like to accomplish?";
+            } else if (context.messages[context.messages.length - 1]?.role === "user") {
+              onGoalStarted?.(prompt, { boost: explicitBoostCommand });
+            }
+            prompt = `${GOAL_INITIAL_PROMPT}\n\n${prompt}`;
           }
           if (isTeamwork) {
             hadTeamworkInConversation = true;
@@ -921,7 +958,11 @@ export function streamAntigravity(
             mcpDirectory: processProfile.mcpDirectory,
             bridgeRevision,
             signal: options?.signal,
-            timeoutMs: isTeamwork ? 43_200_000 : isBoost ? 7_200_000 : undefined,
+            timeoutMs: isTeamwork
+              ? 43_200_000
+              : isBoost || isGoal || isGoalActive?.()
+                ? 7_200_000
+                : undefined,
           }),
         );
 

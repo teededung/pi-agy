@@ -61,7 +61,20 @@ import {
   latestUserPrompt,
   mapUsage,
   piHistoryBootstrap,
+  streamAntigravity,
+  type AgySettledTurnOutcome,
 } from "../src/provider.ts";
+import {
+  buildGoalContinuationPrompt,
+  decideGoalSettlement,
+  formatGoalElapsed,
+  GOAL_CANCELLED_MARKER,
+  GOAL_COMPLETE_MARKER,
+  GOAL_INITIAL_PROMPT,
+  inspectGoalResponseMarkers,
+} from "../lib/prompt.ts";
+import { AgyPiBridge } from "../lib/bridge.ts";
+import { AgyReplayStore } from "../lib/replay.ts";
 import { AgyStallError } from "../lib/agy-client.ts";
 import { AntigravityRuntime, createAntigravityRuntime } from "../src/runtime.ts";
 
@@ -1507,5 +1520,197 @@ test("AntigravityRuntime resends user prompt when a resumed conversation stalls 
   assert.match(prompts[2]!, /The stream was interrupted before your previous turn completed/);
   assert.doesNotMatch(prompts[2]!, /Here is a side conversation I had for additional context/);
 });
+
+test("/goal prompt helpers format elapsed time, continuation checklist, and response markers", () => {
+  assert.equal(formatGoalElapsed(0), "0s");
+  assert.equal(formatGoalElapsed(45_900), "45s");
+  assert.equal(formatGoalElapsed(120_000), "2m");
+  assert.equal(formatGoalElapsed(750_000), "12m 30s");
+  assert.equal(formatGoalElapsed(3_600_000), "1h");
+  assert.equal(formatGoalElapsed(3_900_000), "1h 5m");
+
+  const cont = buildGoalContinuationPrompt("Ship full test suite and docs", 750_000, 3);
+  assert.match(cont, /You are still working toward the user's goal\./);
+  assert.match(cont, /Time spent so far: 12m 30s/);
+  assert.match(cont, /Continuation: #3/);
+  assert.match(cont, /include <!-- GOAL_COMPLETE --> in your response/);
+  assert.match(cont, /include <!-- GOAL_CANCELLED --> in your response/);
+  assert.match(cont, /Original request: Ship full test suite and docs$/);
+
+  assert.equal(inspectGoalResponseMarkers("Still working on step 2..."), undefined);
+  assert.equal(
+    inspectGoalResponseMarkers(`All deliverables verified.\n${GOAL_COMPLETE_MARKER}`),
+    "complete",
+  );
+  assert.equal(
+    inspectGoalResponseMarkers(`Stopping as requested.\n${GOAL_CANCELLED_MARKER}`),
+    "cancelled",
+  );
+
+  // decideGoalSettlement covers complete, cancelled, Esc abort during toolUse, subagent wait, max continuations, and continue
+  assert.equal(
+    decideGoalSettlement({
+      settled: true,
+      stopReason: "stop",
+      responseText: `Done ${GOAL_COMPLETE_MARKER}`,
+      continuations: 0,
+    }),
+    "complete",
+  );
+  assert.equal(
+    decideGoalSettlement({
+      settled: true,
+      stopReason: "stop",
+      responseText: `Stopped ${GOAL_CANCELLED_MARKER}`,
+      continuations: 1,
+    }),
+    "cancelled",
+  );
+  assert.equal(
+    decideGoalSettlement({
+      aborted: true,
+      settled: false,
+      stopReason: "toolUse",
+      responseText: "Running slow bash command...",
+      continuations: 2,
+    }),
+    "aborted",
+  );
+  assert.equal(
+    decideGoalSettlement({
+      settled: true,
+      stopReason: "error",
+      responseText: "Partial text",
+      continuations: 0,
+    }),
+    "aborted",
+  );
+  assert.equal(
+    decideGoalSettlement({
+      settled: true,
+      stopReason: "stop",
+      responseText: "Spawned DeepCoder subagent.",
+      hadSubagentActivity: true,
+      continuations: 0,
+    }),
+    "wait",
+  );
+  assert.equal(
+    decideGoalSettlement({
+      settled: true,
+      stopReason: "stop",
+      responseText: "Still working...",
+      continuations: 50,
+    }),
+    "max_continuations",
+  );
+  assert.equal(
+    decideGoalSettlement({
+      settled: true,
+      stopReason: "stop",
+      responseText: "Finished phase 1, moving to phase 2.",
+      continuations: 2,
+    }),
+    "continue",
+  );
+});
+
+test("streamAntigravity expands /goal, notifies onGoalStarted, and reports settled outcome", async (t) => {
+  const seenRequests: Array<{ prompt: string; agent?: string; timeoutMs?: number }> = [];
+  const runtime = createAntigravityRuntime(async (request) => {
+    seenRequests.push({
+      prompt: request.prompt,
+      agent: request.agent,
+      timeoutMs: request.timeoutMs,
+    });
+    request.onConversation?.("goal-conv-1");
+    const result = {
+      type: "result" as const,
+      status: "OK" as const,
+      response: "Completed all checks. <!-- GOAL_COMPLETE -->",
+      usage: { input_tokens: 50, output_tokens: 15, total_tokens: 65 },
+    };
+    request.onActivity?.(result);
+    return {
+      conversationId: "goal-conv-1",
+      status: "OK",
+      response: result.response,
+      activities: [result],
+      usage: result.usage,
+      finished: true,
+    };
+  });
+  t.after(() => runtime.dispose());
+
+  const service = runtime.runSync(AntigravityRuntime);
+  const replay = new AgyReplayStore();
+  const bridge = new AgyPiBridge("pi-test");
+
+  const startedGoals: Array<{ request: string; boost?: boolean }> = [];
+  const settledOutcomes: Array<AgySettledTurnOutcome | undefined> = [];
+
+  const streamFn = streamAntigravity(
+    runtime,
+    service,
+    replay,
+    bridge,
+    (outcome) => settledOutcomes.push(outcome),
+    undefined,
+    () => true,
+    undefined,
+    createAntigravityRuntime,
+    () => undefined,
+    () => ({ mode: "agent", agent: "pi-tools" }),
+    () => undefined,
+    () => "Relayed instructions",
+    () => false,
+    () => undefined,
+    () => ALL_FALLBACK_MODELS,
+    undefined,
+    () => false,
+    () => undefined,
+    () => true,
+    (request, options) => startedGoals.push({ request, boost: options?.boost }),
+  );
+
+  const model = {
+    id: "gemini-4-argon",
+    name: "Gemini",
+    api: "antigravity-stream-json",
+    provider: "antigravity",
+    baseUrl: "agy://local-stream-json",
+    reasoning: true,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 1_000_000,
+    maxTokens: 64_000,
+  };
+
+  const eventStream = streamFn(model, {
+    messages: [{ role: "user", content: "/goal /boost Refactor auth and run all tests" }],
+  });
+  for await (const _event of eventStream) {
+    // consume stream
+  }
+
+  assert.equal(startedGoals.length, 1);
+  assert.deepEqual(startedGoals[0], {
+    request: "Refactor auth and run all tests",
+    boost: true,
+  });
+  assert.equal(seenRequests.length, 1);
+  assert.ok(seenRequests[0]!.prompt.includes(GOAL_INITIAL_PROMPT));
+  assert.ok(seenRequests[0]!.prompt.includes("Refactor auth and run all tests"));
+  assert.equal(seenRequests[0]!.agent, undefined); // bypassed custom agent because /boost was combined
+  assert.equal(seenRequests[0]!.timeoutMs, 7_200_000);
+  assert.equal(settledOutcomes.length, 1);
+  assert.equal(settledOutcomes[0]?.stopReason, "stop");
+  assert.equal(settledOutcomes[0]?.responseText, "Completed all checks. <!-- GOAL_COMPLETE -->");
+  assert.equal(
+    inspectGoalResponseMarkers(settledOutcomes[0]?.responseText ?? ""),
+    "complete",
+  );
+});
+
 
 

@@ -154,6 +154,10 @@ import { findAgyArtifact, listAgyArtifacts } from "./lib/artifacts.ts";
 import { fetchAgyUsage } from "./lib/usage.ts";
 import {
   buildAgyRelayedInstructions,
+  buildGoalContinuationPrompt,
+  decideGoalSettlement,
+  formatGoalElapsed,
+  MAX_GOAL_CONTINUATIONS,
   WRAPPER_TOOL_DESCRIPTION,
   WRAPPER_TOOL_NAME,
 } from "./lib/prompt.ts";
@@ -167,6 +171,7 @@ import { computeAgyToolDiff, isAgyEditTool, safeRenderDiff } from "./lib/diff.ts
 import {
   mapThinkingToEffort,
   streamAntigravity,
+  type AgySettledTurnOutcome,
   type OneShotConsultOverride,
 } from "./src/provider.ts";
 import {
@@ -549,6 +554,16 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   let oneShotTeamwork = false;
   let teamworkLaunchedThisTurn = false;
   let subagentSpawnedThisTurn = false;
+  let lastSettledSpawnedSubagent = false;
+  let lastSettledOutcome: AgySettledTurnOutcome | undefined;
+
+  interface ActiveGoalState {
+    request: string;
+    startedAt: number;
+    continuations: number;
+    boost?: boolean;
+  }
+  let activeGoal: ActiveGoalState | undefined;
 
   interface ActiveOneShotConsult extends OneShotConsultOverride {
     restoreModel?: NonNullable<ExtensionContext["model"]>;
@@ -566,8 +581,10 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     completedAt: string;
   }
 
-  const isBoostActive = (): boolean => sessionBoostMode || oneShotBoost;
+  const isBoostActive = (): boolean =>
+    sessionBoostMode || oneShotBoost || Boolean(activeGoal?.boost);
   const isTeamworkActive = (): boolean => sessionTeamworkMode || oneShotTeamwork;
+  const isGoalActive = (): boolean => Boolean(activeGoal);
   const getOneShotConsult = (): OneShotConsultOverride | undefined => oneShotConsult;
 
   const updateOrchestrationStatus = (ui?: ExtensionContext["ui"]): void => {
@@ -580,6 +597,17 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       ui.setStatus(
         "agy-teamwork",
         isTeamworkActive() ? ui.theme.fg("accent", "[teamwork]\u00A0") : undefined,
+      );
+      ui.setStatus(
+        "agy-goal",
+        activeGoal
+          ? ui.theme.fg(
+              "accent",
+              activeGoal.continuations > 0
+                ? `[goal #${activeGoal.continuations}]\u00A0`
+                : "[goal]\u00A0",
+            )
+          : undefined,
       );
     } catch {
       // UI may be unavailable (e.g. non-interactive modes).
@@ -1571,7 +1599,9 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         service,
         replay,
         bridge,
-        () => {
+        (outcome) => {
+          lastSettledOutcome = outcome;
+          lastSettledSpawnedSubagent = subagentSpawnedThisTurn;
           subagentSpawnedThisTurn = false;
           const hadOneShotBoost = oneShotBoost;
           oneShotBoost = false;
@@ -1607,6 +1637,20 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
           activeSessionCtx
             ? probeCtx(() => activeSessionCtx?.sessionManager.getBranch()).value
             : undefined,
+        isGoalActive,
+        (request, options) => {
+          if (!activeGoal || activeGoal.request !== request) {
+            activeGoal = {
+              request,
+              startedAt: Date.now(),
+              continuations: 0,
+              boost: options?.boost,
+            };
+          } else if (options?.boost) {
+            activeGoal.boost = true;
+          }
+          updateOrchestrationStatus(tasksUi);
+        },
       ),
     });
   };
@@ -1690,7 +1734,57 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     reconcileWidgetPolling();
   });
 
-  pi.on("agent_settled", async (_event, ctx: ExtensionContext) => {
+  const collectLatestTurnAssistantInfo = (
+    branch: readonly unknown[] | undefined,
+  ): { stopReason?: string; text: string } => {
+    if (!Array.isArray(branch)) return { text: "" };
+    const texts: string[] = [];
+    let latestStopReason: string | undefined;
+    for (let i = branch.length - 1; i >= 0; i--) {
+      const entry = branch[i] as {
+        type?: unknown;
+        message?: {
+          role?: unknown;
+          stopReason?: unknown;
+          content?: unknown;
+        };
+      };
+      if (!entry || typeof entry !== "object" || entry.type !== "message" || !entry.message) {
+        continue;
+      }
+      if (entry.message.role === "user") {
+        break;
+      }
+      if (entry.message.role === "assistant") {
+        if (!latestStopReason && typeof entry.message.stopReason === "string") {
+          latestStopReason = entry.message.stopReason;
+        }
+        if (typeof entry.message.content === "string") {
+          texts.push(entry.message.content);
+        } else if (Array.isArray(entry.message.content)) {
+          for (const part of entry.message.content) {
+            if (
+              part &&
+              typeof part === "object" &&
+              "type" in part &&
+              (part as { type?: unknown }).type === "text" &&
+              "text" in part &&
+              typeof (part as { text?: unknown }).text === "string"
+            ) {
+              texts.push((part as { text: string }).text);
+            }
+          }
+        }
+      }
+    }
+    return { stopReason: latestStopReason, text: texts.join("\n") };
+  };
+
+  pi.on("agent_settled", async (event, ctx: ExtensionContext) => {
+    const settledOutcome = lastSettledOutcome;
+    lastSettledOutcome = undefined;
+    const hadSubagentThisTurn = lastSettledSpawnedSubagent || subagentSpawnedThisTurn;
+    lastSettledSpawnedSubagent = false;
     subagentSpawnedThisTurn = false;
     const hadOneShotBoost = oneShotBoost;
     oneShotBoost = false;
@@ -1728,6 +1822,58 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       updateAgyTasksWidget();
     }
     await persistConversationState(ctx);
+    if (activeGoal) {
+      const uiProbe = probeCtx(() => ctx.ui);
+      const ui = !uiProbe.stale && uiProbe.value ? uiProbe.value : tasksUi;
+      const branchProbe = probeCtx(() => ctx.sessionManager.getBranch());
+      const branchInfo = collectLatestTurnAssistantInfo(
+        branchProbe.stale ? undefined : branchProbe.value,
+      );
+      const decision = decideGoalSettlement({
+        aborted: event.aborted,
+        settled: Boolean(settledOutcome),
+        stopReason: settledOutcome?.stopReason ?? branchInfo.stopReason,
+        responseText: branchInfo.text || settledOutcome?.responseText || "",
+        hadSubagentActivity: hadSubagentThisTurn || hasRunningSubagent(),
+        continuations: activeGoal.continuations,
+      });
+      if (decision === "complete" || decision === "cancelled") {
+        activeGoal = undefined;
+        updateOrchestrationStatus(ui);
+        try {
+          ui?.notify(
+            decision === "complete" ? "Goal completed." : "Goal cancelled.",
+            "info",
+          );
+        } catch {
+          // Best-effort UI notification
+        }
+      } else if (decision === "aborted") {
+        activeGoal = undefined;
+        updateOrchestrationStatus(ui);
+      } else if (decision === "max_continuations") {
+        activeGoal = undefined;
+        updateOrchestrationStatus(ui);
+        try {
+          ui?.notify(
+            `Goal stopped after reaching maximum continuations (${MAX_GOAL_CONTINUATIONS}).`,
+            "warning",
+          );
+        } catch {
+          // Best-effort UI notification
+        }
+      } else if (decision === "continue") {
+        activeGoal.continuations += 1;
+        updateOrchestrationStatus(ui);
+        pi.sendUserMessage(
+          buildGoalContinuationPrompt(
+            activeGoal.request,
+            Date.now() - activeGoal.startedAt,
+            activeGoal.continuations,
+          ),
+        );
+      }
+    }
     invalidateFooter?.();
     requestFooterRender?.();
   });
@@ -1759,6 +1905,9 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     oneShotBoost = false;
     oneShotTeamwork = false;
     teamworkLaunchedThisTurn = false;
+    activeGoal = undefined;
+    lastSettledOutcome = undefined;
+    lastSettledSpawnedSubagent = false;
     if (event.reason === "new") {
       sessionBoostMode = false;
       sessionTeamworkMode = false;
@@ -1877,6 +2026,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         try {
           ui.value.setStatus("agy-boost", undefined);
           ui.value.setStatus("agy-teamwork", undefined);
+          ui.value.setStatus("agy-goal", undefined);
           ui.value.setStatus("agy-consult", undefined);
         } catch {
           // Best effort
@@ -1900,6 +2050,9 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     await runAntigravity(runtime, service.setSession(cwd.value, undefined, true));
     detachConversationMetadata(previousConversationId);
     appendConversationReset(ctx);
+    activeGoal = undefined;
+    const ui = probeCtx(() => ctx.ui);
+    if (!ui.stale && ui.value) updateOrchestrationStatus(ui.value);
     subagentRoster.clear();
     setAgyTasksWidget(0);
     setAgyArtifactsWidget(0);
@@ -2263,6 +2416,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       oneShotTeamwork = false;
       teamworkLaunchedThisTurn = false;
       sessionTeamworkMode = false;
+      activeGoal = undefined;
       updateOrchestrationStatus(ctx.ui);
       subagentRoster.clear();
       setAgyTasksWidget(0);
@@ -2283,6 +2437,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       oneShotTeamwork = false;
       teamworkLaunchedThisTurn = false;
       sessionTeamworkMode = false;
+      activeGoal = undefined;
       updateOrchestrationStatus(ctx.ui);
       subagentRoster.clear();
       setAgyTasksWidget(0);
@@ -2711,7 +2866,10 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     const setActive = (next: boolean) => {
       if (isBoost) {
         sessionBoostMode = next;
-        if (!next) oneShotBoost = false;
+        if (!next) {
+          oneShotBoost = false;
+          if (activeGoal) activeGoal.boost = false;
+        }
         if (next) {
           sessionTeamworkMode = false;
           oneShotTeamwork = false;
@@ -2722,6 +2880,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         if (next) {
           sessionBoostMode = false;
           oneShotBoost = false;
+          if (activeGoal) activeGoal.boost = false;
         }
       }
       updateOrchestrationStatus(ctx.ui);
@@ -2807,6 +2966,66 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       "Toggle Teamwork two-phase multi-agent mode or start a project with teamwork_preview orchestration (alias for /teamwork)",
     getArgumentCompletions: toggleCommandCompletions,
     handler: handleTeamworkCommand,
+  });
+
+  const goalCommandCompletions = (prefix: string) =>
+    ["off", "status"]
+      .filter((value) => value.startsWith(prefix))
+      .map((value) => ({ value, label: value }));
+
+  const handleGoalCommand = async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
+    const trimmed = args.trim();
+    if (!trimmed || /^status$/i.test(trimmed)) {
+      if (activeGoal) {
+        const elapsed = formatGoalElapsed(Date.now() - activeGoal.startedAt);
+        ctx.ui.notify(
+          `Goal mode is ON (#${activeGoal.continuations}, ${elapsed}): ${activeGoal.request}`,
+          "info",
+        );
+      } else {
+        ctx.ui.notify('Goal mode is OFF. Usage: "/goal <task>" or "/goal off".', "info");
+      }
+      return;
+    }
+    if (/^(off|stop|cancel|disable|clear|false)$/i.test(trimmed)) {
+      if (activeGoal) {
+        activeGoal = undefined;
+        updateOrchestrationStatus(ctx.ui);
+        ctx.ui.notify("Goal mode cancelled.", "info");
+      } else {
+        ctx.ui.notify("Goal mode is already OFF.", "info");
+      }
+      return;
+    }
+    const wantsBoost = /^\/(?:agy-)?boost\b/i.test(trimmed);
+    const cleanRequest = trimmed.replace(/^\/(?:agy-)?boost\s*/i, "").trim() || trimmed;
+    if (ctx.isIdle()) {
+      activeGoal = {
+        request: cleanRequest,
+        startedAt: Date.now(),
+        continuations: 0,
+        boost: wantsBoost || undefined,
+      };
+      updateOrchestrationStatus(ctx.ui);
+      pi.sendUserMessage(`/goal ${trimmed}`);
+    } else {
+      pi.sendUserMessage(`/goal ${trimmed}`, { deliverAs: "followUp" });
+      ctx.ui.notify("Goal task queued as follow-up.", "info");
+    }
+  };
+
+  pi.registerCommand("goal", {
+    description:
+      "Run a long-horizon task with autonomous audit-and-continuation until <!-- GOAL_COMPLETE --> (or /goal off to cancel)",
+    getArgumentCompletions: goalCommandCompletions,
+    handler: handleGoalCommand,
+  });
+
+  pi.registerCommand("agy-goal", {
+    description:
+      "Run a long-horizon task with autonomous audit-and-continuation until <!-- GOAL_COMPLETE --> (alias for /goal)",
+    getArgumentCompletions: goalCommandCompletions,
+    handler: handleGoalCommand,
   });
 
   const listOtherPiModels = (registry: ExtensionContext["modelRegistry"]) => {

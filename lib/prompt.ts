@@ -463,3 +463,123 @@ export const TEAMWORK_DEACTIVATED_PROMPT =
   "[System note: Teamwork multi-agent mode is now OFF for this turn, superseding any earlier `<TEAMWORK>` or Boost/Delegation instructions in this conversation. " +
   "Execute the request directly yourself using workspace tools and do NOT call `invoke_subagent` (including `teamwork_preview`), `send_message`, `manage_subagents`, or `schedule`. " +
   "Never fabricate or simulate `[]用户`, `<MESSAGE_RECEIVED>...</MESSAGE_RECEIVED>`, `<SYSTEM_MESSAGE>`, or subagent completion reports inside your response.]";
+
+export const GOAL_COMPLETE_MARKER = "<!-- GOAL_COMPLETE -->";
+export const GOAL_CANCELLED_MARKER = "<!-- GOAL_CANCELLED -->";
+
+/**
+ * Initial prompt prefix for Antigravity's /goal autonomous mode, extracted from
+ * agy 1.4.9 (print mode disables native slash command expansion, so pi-agy
+ * expands /goal and drives the continuation loop across turns).
+ */
+export const GOAL_INITIAL_PROMPT =
+  "The user has marked this task with /goal, indicating that this task is intended to run for a long time without user input, e.g. overnight. " +
+  "You should be extra thorough and only stop when you are confident the goal has been completely fulfilled. " +
+  "The system will force you to continue execution, prompting you to audit your work until completion. " +
+  "Once complete, include <!-- GOAL_COMPLETE --> in your response. " +
+  "If the user explicitly asked to stop or cancel this goal, include <!-- GOAL_CANCELLED --> in your response to cancel the goal.";
+
+export function formatGoalElapsed(elapsedMs: number): string {
+  const totalSeconds = Math.max(0, Math.floor(elapsedMs / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) {
+    return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
+  }
+  if (minutes > 0) {
+    return seconds > 0 ? `${minutes}m ${seconds}s` : `${minutes}m`;
+  }
+  return `${seconds}s`;
+}
+
+/**
+ * Audit-and-continuation prompt injected when an active /goal turn stops
+ * without emitting <!-- GOAL_COMPLETE --> or <!-- GOAL_CANCELLED -->.
+ */
+export function buildGoalContinuationPrompt(
+  originalRequest: string,
+  elapsedMs: number,
+  continuation: number,
+): string {
+  const elapsed = formatGoalElapsed(elapsedMs);
+  const count = Math.max(1, Math.floor(continuation));
+  return [
+    "You are still working toward the user's goal. Do not stop until the task is fully complete.",
+    "",
+    `Time spent so far: ${elapsed}`,
+    `Continuation: #${count}`,
+    "",
+    "Before concluding, verify your work:",
+    "1. Re-read the original request and identify every concrete deliverable.",
+    "2. Build a checklist that maps every explicit requirement and deliverable to concrete evidence.",
+    "3. For each deliverable, confirm it is done by checking actual output: file contents, test results, build logs, etc.",
+    "4. Wanting to be done or having spent effort is not the same as being done. Only real evidence counts.",
+    "5. If anything is unfinished or unverified, keep going. If anything is uncertain, then spend more time to validate.",
+    "",
+    "Once every deliverable is genuinely complete, include <!-- GOAL_COMPLETE --> in your response to signal you are finished.",
+    "",
+    "If the user explicitly asked to stop or cancel this goal, include <!-- GOAL_CANCELLED --> in your response to cancel the goal.",
+    "",
+    "If there is still work to do, take the next step now.",
+    "",
+    `Original request: ${originalRequest.trim()}`,
+  ].join("\n");
+}
+
+export function inspectGoalResponseMarkers(
+  text: string,
+): "complete" | "cancelled" | undefined {
+  if (!text) return undefined;
+  if (text.includes(GOAL_CANCELLED_MARKER)) return "cancelled";
+  if (text.includes(GOAL_COMPLETE_MARKER)) return "complete";
+  return undefined;
+}
+
+export const MAX_GOAL_CONTINUATIONS = 50;
+
+export interface GoalSettlementCheck {
+  aborted?: boolean;
+  settled?: boolean;
+  stopReason?: string;
+  responseText: string;
+  hadSubagentActivity?: boolean;
+  continuations: number;
+  maxContinuations?: number;
+}
+
+export type GoalSettlementDecision =
+  | "complete"
+  | "cancelled"
+  | "aborted"
+  | "max_continuations"
+  | "wait"
+  | "continue";
+
+export function decideGoalSettlement(
+  check: GoalSettlementCheck,
+): GoalSettlementDecision {
+  const marker = inspectGoalResponseMarkers(check.responseText);
+  if (marker === "complete") return "complete";
+  if (marker === "cancelled") return "cancelled";
+  if (
+    check.aborted ||
+    check.stopReason === "aborted" ||
+    check.stopReason === "error"
+  ) {
+    return "aborted";
+  }
+  if (
+    !check.settled ||
+    check.stopReason !== "stop" ||
+    check.hadSubagentActivity
+  ) {
+    return "wait";
+  }
+  if (check.continuations >= (check.maxContinuations ?? MAX_GOAL_CONTINUATIONS)) {
+    return "max_continuations";
+  }
+  return "continue";
+}
+
+
