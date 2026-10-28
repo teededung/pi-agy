@@ -532,6 +532,7 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
               const runTurnWithStallRetries = async (): Promise<AgyTurnOutcome> => {
                 let retry = 0;
                 let freshFallback = false;
+                let turnPromptDelivered = false;
                 const startFreshFallback = () => {
                   restoredAttemptActive = false;
                   controller.push({ type: "conversation_fallback" });
@@ -546,6 +547,7 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                   pendingSystemPromptRelay = freshSystemPromptRelay;
                   pendingBootstrapSuffix = request.bootstrapSuffix;
                   freshFallback = true;
+                  turnPromptDelivered = false;
                   retry = 0;
                 };
                 for (;;) {
@@ -557,7 +559,13 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                   const resumableConversationId = freshFallback
                     ? conversationId
                     : (conversationId ?? spawnRequest.conversationId);
-                  const resumingRetry = retry > 0 && resumableConversationId !== undefined;
+                  // Only replace the user's prompt with stallContinuationPrompt()
+                  // once an attempt in THIS turn actually reached init/activity and
+                  // committed the user prompt into the conversation. If agy stalled
+                  // during silent auth before init on an existing conversationId,
+                  // the user prompt was never recorded server-side and must be resent.
+                  const resumingRetry =
+                    retry > 0 && turnPromptDelivered && resumableConversationId !== undefined;
                   const carriedRelay = resumingRetry
                     ? pendingSystemPromptRelay
                     : freshFallback
@@ -570,6 +578,7 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                       : bootstrapSuffix;
                   const commitAttemptSync = () => {
                     if (turnGeneration !== generation || turnAbort.signal.aborted) return;
+                    turnPromptDelivered = true;
                     // Only this attempt's payload can acknowledge a snapshot.
                     // A new conversation with no instructions is empty by definition.
                     if (carriedRelay !== undefined || resumableConversationId === undefined) {
@@ -595,6 +604,10 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                     onConversation: (id) => {
                       spawnRequest.onConversation?.(id);
                       commitAttemptSync();
+                    },
+                    onActivity: (activity) => {
+                      commitAttemptSync();
+                      spawnRequest.onActivity?.(activity);
                     },
                   };
                   try {

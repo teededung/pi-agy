@@ -62,6 +62,7 @@ import {
   mapUsage,
   piHistoryBootstrap,
 } from "../src/provider.ts";
+import { AgyStallError } from "../lib/agy-client.ts";
 import { AntigravityRuntime, createAntigravityRuntime } from "../src/runtime.ts";
 
 test("tool mode defaults to pi and the startup flag overrides the environment", () => {
@@ -1430,4 +1431,81 @@ test("buildPiToolsTrajectoryMetadataFields encodes native specialty tools and la
   const savedBytes = await readFile(savedFilePath);
   assert.deepEqual(savedBytes, Buffer.from(tinyPngBase64, "base64"));
 });
+
+test("AntigravityRuntime resends user prompt when a resumed conversation stalls before init, and uses continuation prompt only after init", async (t) => {
+  const prevBackoff = process.env.AGY_STALL_RETRY_BACKOFF_MS;
+  process.env.AGY_STALL_RETRY_BACKOFF_MS = "1";
+  t.after(() => {
+    if (prevBackoff === undefined) delete process.env.AGY_STALL_RETRY_BACKOFF_MS;
+    else process.env.AGY_STALL_RETRY_BACKOFF_MS = prevBackoff;
+  });
+
+  const prompts: string[] = [];
+  let attempt = 0;
+  const runtime = createAntigravityRuntime(async (request) => {
+    attempt += 1;
+    prompts.push(request.prompt);
+    if (attempt === 1) {
+      // Stalled during silent auth BEFORE init/onConversation: agy never recorded the user prompt.
+      throw new AgyStallError(90_000, false);
+    }
+    if (attempt === 2) {
+      // Reached init (onConversation), so agy recorded the prompt, then stalled mid-turn.
+      request.onConversation?.("ebb9b188-f5d6-42e9-bc50-7a01c3089a3b");
+      throw new AgyStallError(90_000, false);
+    }
+    request.onConversation?.("ebb9b188-f5d6-42e9-bc50-7a01c3089a3b");
+    const result = {
+      type: "result" as const,
+      status: "OK" as const,
+      response: "handled injected context",
+      usage: { input_tokens: 100, output_tokens: 20, total_tokens: 120 },
+    };
+    request.onActivity?.(result);
+    return {
+      conversationId: "ebb9b188-f5d6-42e9-bc50-7a01c3089a3b",
+      status: "OK",
+      response: "handled injected context",
+      activities: [result],
+      usage: result.usage,
+      finished: true,
+    };
+  });
+  t.after(() => runtime.dispose());
+
+  const service = runtime.runSync(AntigravityRuntime);
+  await runtime.runPromise(
+    service.restoreConversation({
+      conversationId: "ebb9b188-f5d6-42e9-bc50-7a01c3089a3b",
+      modelId: "gemini-4-argon",
+      cwd: "/tmp/ws",
+      turns: 3,
+      usage: {},
+    }),
+  );
+
+  const injectedPrompt =
+    "Here is a side conversation I had for additional context:\n\nUser: can we safe-refactor?";
+  const controller = await runtime.runPromise(
+    service.beginStreamTurn({
+      prompt: injectedPrompt,
+      systemPrompt: "Instructions",
+      modelId: "gemini-4-argon",
+    }),
+  );
+  while ((await controller.next()) !== null) {
+    // consume activities
+  }
+  await runtime.runPromise(service.finishTurn);
+
+  assert.equal(prompts.length, 3);
+  // Attempt 1 (initial) and Attempt 2 (retry after pre-init stall) both carry the injected user prompt.
+  assert.match(prompts[0]!, /Here is a side conversation I had for additional context/);
+  assert.match(prompts[1]!, /Here is a side conversation I had for additional context/);
+  assert.doesNotMatch(prompts[1]!, /The stream was interrupted before your previous turn completed/);
+  // Attempt 3 (retry after post-init stall) uses the continuation prompt without duplicating the user prompt.
+  assert.match(prompts[2]!, /The stream was interrupted before your previous turn completed/);
+  assert.doesNotMatch(prompts[2]!, /Here is a side conversation I had for additional context/);
+});
+
 
