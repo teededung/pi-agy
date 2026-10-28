@@ -4,7 +4,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { PI_TOOLS_AGENT_DESCRIPTION } from "./prompt.ts";
-import { EAGER_PI_BRIDGE_TOOLS } from "./pi-tools-agent.ts";
+import { EAGER_PI_BRIDGE_TOOLS, PI_TOOLS_AGENT_NATIVE_TOOLS } from "./pi-tools-agent.ts";
 
 export const AGY_METADATA_MAX_BYTES = 5 * 1024 * 1024;
 
@@ -698,6 +698,7 @@ export function buildPiToolsTrajectoryMetadataFields(
 
   let description = PI_TOOLS_AGENT_DESCRIPTION;
   let promptBody = "You are the agent for the current Pi coding session. Complete the user request using Pi tools.";
+  let declaredTools: string[] = [...PI_TOOLS_AGENT_NATIVE_TOOLS];
   let mcpServers: Array<{ name: string; serverUrl: string; headers?: Record<string, string> }> = [];
 
   if (mcpDirectory && existsSync(agentFilePath)) {
@@ -708,6 +709,11 @@ export function buildPiToolsTrajectoryMetadataFields(
         const parsed = record(JSON.parse(match[1]!));
         if (typeof parsed?.description === "string" && parsed.description.trim()) {
           description = parsed.description;
+        }
+        if (Array.isArray(parsed?.tools)) {
+          declaredTools = parsed.tools.filter(
+            (item): item is string => typeof item === "string" && item.trim().length > 0,
+          );
         }
         if (Array.isArray(parsed?.mcpServers)) {
           mcpServers = parsed.mcpServers
@@ -745,6 +751,10 @@ export function buildPiToolsTrajectoryMetadataFields(
       "communication_style",
     ].map((section) => pbBytesField(2, section)),
   ].map((inner) => pbBytesField(2, inner));
+
+  const toolFields = declaredTools.map((toolName) =>
+    pbBytesField(3, pbBytesField(1, toolName)),
+  );
 
   const checks = [
     "message_continue_check",
@@ -785,7 +795,7 @@ export function buildPiToolsTrajectoryMetadataFields(
   const f18 = pbBytesField(
     18,
     Buffer.concat([
-      pbBytesField(1, Buffer.concat([...sections, ...checks])),
+      pbBytesField(1, Buffer.concat([...sections, ...toolFields, ...checks])),
       pbBytesField(
         4,
         Buffer.concat([

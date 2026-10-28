@@ -12,6 +12,25 @@ export const EAGER_PI_BRIDGE_TOOLS = [
   "pi__edit",
   "pi__write",
   "pi__ask_user_question",
+  "pi__grep",
+  "pi__find",
+  "pi__ls",
+  "pi__web_search",
+  "pi__fetch_content",
+  "pi__get_search_content",
+  "pi__source_check",
+  "pi__x_search",
+] as const;
+
+/**
+ * Antigravity-exclusive native tools kept available alongside bridged Pi tools
+ * so models retain native image generation and built-in web fallback when Pi
+ * web extensions are not installed.
+ */
+export const PI_TOOLS_AGENT_NATIVE_TOOLS = [
+  "generate_image",
+  "search_web",
+  "read_url_content",
 ] as const;
 
 export const EAGER_PI_BRIDGE_TOOLS_CONFIG: Record<string, { eager: true }> = Object.fromEntries(
@@ -43,7 +62,7 @@ export function createPiToolsAgent(
         mainAgent: true,
         subagent: false,
         inheritCustomizations: false,
-        tools: [],
+        tools: [...PI_TOOLS_AGENT_NATIVE_TOOLS],
         mcpServers: [
           {
             name: bridge.serverName,

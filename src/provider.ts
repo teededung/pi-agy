@@ -16,6 +16,10 @@
  * so failed reads are never re-executed as successful pi tools.
  */
 
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import {
   calculateCost,
   createAssistantMessageEventStream,
@@ -47,6 +51,7 @@ import { inspectAgyCommandResult } from "../lib/command-result.ts";
 import { agyToolStepKey } from "../lib/tool-steps.ts";
 import {
   agyIncompleteToolError,
+  attachedImagesPrompt,
   BOOST_DEACTIVATED_PROMPT,
   BOOST_ORCHESTRATOR_PROMPT,
   BRIDGE_PENDING_TOOL_MESSAGE,
@@ -71,7 +76,82 @@ interface TextPart {
 
 interface ImagePart {
   type: "image";
+  data?: unknown;
+  mimeType?: unknown;
+  source?: {
+    data?: unknown;
+    media_type?: unknown;
+    mimeType?: unknown;
+  };
   [k: string]: unknown;
+}
+
+function inferImageExtension(mimeType: string | undefined, bytes: Buffer): string {
+  const normalized = (mimeType ?? "").toLowerCase().trim();
+  if (normalized === "image/png") return "png";
+  if (normalized === "image/jpeg" || normalized === "image/jpg") return "jpg";
+  if (normalized === "image/gif") return "gif";
+  if (normalized === "image/webp") return "webp";
+  if (normalized === "image/bmp") return "bmp";
+  if (bytes.length >= 4 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) {
+    return "png";
+  }
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return "jpg";
+  }
+  if (bytes.length >= 4 && bytes.subarray(0, 4).toString("ascii") === "GIF8") {
+    return "gif";
+  }
+  if (
+    bytes.length >= 12 &&
+    bytes.subarray(0, 4).toString("ascii") === "RIFF" &&
+    bytes.subarray(8, 12).toString("ascii") === "WEBP"
+  ) {
+    return "webp";
+  }
+  return "png";
+}
+
+function persistUserImagePart(part: ImagePart): string | undefined {
+  const rawData =
+    typeof part.data === "string"
+      ? part.data
+      : typeof part.source?.data === "string"
+        ? part.source.data
+        : undefined;
+  if (!rawData || !rawData.trim()) return undefined;
+
+  let base64 = rawData.trim();
+  let mimeType =
+    typeof part.mimeType === "string"
+      ? part.mimeType
+      : typeof part.source?.mimeType === "string"
+        ? part.source.mimeType
+        : typeof part.source?.media_type === "string"
+          ? part.source.media_type
+          : undefined;
+
+  const dataUrlMatch = base64.match(/^data:([^;,]+)?;base64,([\s\S]+)$/i);
+  if (dataUrlMatch) {
+    if (!mimeType && dataUrlMatch[1]) mimeType = dataUrlMatch[1];
+    base64 = dataUrlMatch[2]!.trim();
+  }
+
+  try {
+    const bytes = Buffer.from(base64, "base64");
+    if (bytes.length === 0) return undefined;
+    const ext = inferImageExtension(mimeType, bytes);
+    const hash = createHash("sha256").update(bytes).digest("hex").slice(0, 16);
+    const dir = path.join(tmpdir(), "pi-agy-images");
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const filePath = path.join(dir, `user-image-${hash}.${ext}`);
+    if (!existsSync(filePath)) {
+      writeFileSync(filePath, bytes, { mode: 0o600 });
+    }
+    return filePath;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -90,6 +170,8 @@ function latestUserBatch(context: TranscriptContext): {
     const end = i + 1;
     while (i > 0 && context.messages[i - 1].role === "user") i--;
     const texts: string[] = [];
+    const savedImagePaths: string[] = [];
+    let omittedImages = 0;
     let images = 0;
     for (const message of context.messages.slice(i, end)) {
       if (typeof message.content === "string") {
@@ -102,14 +184,26 @@ function latestUserBatch(context: TranscriptContext): {
           texts.push(part.text);
         } else if (part?.type === "image") {
           images += 1;
+          const savedPath = persistUserImagePart(part as ImagePart);
+          if (savedPath) {
+            savedImagePaths.push(savedPath);
+          } else {
+            omittedImages += 1;
+          }
         }
       }
     }
     if (texts.length === 0 && images === 0) continue;
-    const prompt = texts.join("\n");
+    const promptSegments = [...texts];
+    if (savedImagePaths.length > 0) {
+      promptSegments.push(attachedImagesPrompt(savedImagePaths));
+    }
+    if (omittedImages > 0) {
+      promptSegments.push(omittedImagesPrompt(omittedImages));
+    }
     return {
       start: i,
-      prompt: prompt + (images ? `\n${omittedImagesPrompt(images)}` : ""),
+      prompt: promptSegments.join("\n"),
       images,
     };
   }
@@ -278,6 +372,11 @@ export function piHistoryBootstrap(
       } else if (part?.type === "toolCall" && typeof part.name === "string") {
         const args = JSON.stringify(part.arguments ?? {});
         rendered.push(`[tool call: ${part.name}${args === "{}" ? "" : ` ${args}`}]`);
+      } else if (part?.type === "image" && message.role === "user") {
+        const savedPath = persistUserImagePart(part as ImagePart);
+        if (savedPath) {
+          rendered.push(attachedImagesPrompt([savedPath]));
+        }
       }
     }
     if (rendered.length === 0) continue;

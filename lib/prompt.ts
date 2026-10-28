@@ -74,6 +74,16 @@ export function omittedImagesPrompt(images: number): string {
   return `(${images} image(s) omitted — the agy print interface is text-only)`;
 }
 
+export function attachedImagesPrompt(imagePaths: readonly string[]): string {
+  if (imagePaths.length === 0) return "";
+  const list = imagePaths.map((filePath, idx) => `- Image ${idx + 1}: ${filePath}`).join("\n");
+  return [
+    "[Attached user image(s) saved to disk because the agy print interface is text-only — inspect them with your file-reading tool (`pi__read` or `view_file`):",
+    list,
+    "]",
+  ].join("\n");
+}
+
 /**
  * Drop Pi's own tool inventory from an instruction snapshot.
  *

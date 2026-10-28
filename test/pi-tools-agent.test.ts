@@ -9,6 +9,7 @@ import {
   restorableAgyConversation,
 } from "../lib/conversation-state.ts";
 import {
+  buildPiToolsTrajectoryMetadataFields,
   deleteAgyConversationsForSessionFile,
   deleteDisposableAgyConversation,
   detachAgyConversationBridgeMetadata,
@@ -27,6 +28,7 @@ import { mapAgyToolToNative } from "../lib/native-tools.ts";
 import {
   createPiToolsAgent,
   EAGER_PI_BRIDGE_TOOLS_CONFIG,
+  PI_TOOLS_AGENT_NATIVE_TOOLS,
 } from "../lib/pi-tools-agent.ts";
 import {
   AGY_CLAUDE_CONTEXT_LIMIT,
@@ -56,6 +58,7 @@ import {
   contextHasPriorBoostActivity,
   contextHasPriorTeamworkActivity,
   isBridgedMcpStep,
+  latestUserPrompt,
   mapUsage,
   piHistoryBootstrap,
 } from "../src/provider.ts";
@@ -102,7 +105,10 @@ test("Pi tool agent scopes MCP to its bridge and removes only its own configurat
   assert.equal(agent.isPrepared(), true);
   const agentFile = path.join(root, agent.name, "agent.md");
   const definition = JSON.parse((await readFile(agentFile, "utf8")).split("---\n")[1]);
-  assert.deepEqual(definition.tools, []);
+  assert.deepEqual(definition.tools, [...PI_TOOLS_AGENT_NATIVE_TOOLS]);
+  assert.equal(EAGER_PI_BRIDGE_TOOLS_CONFIG.pi__web_search?.eager, true);
+  assert.equal(EAGER_PI_BRIDGE_TOOLS_CONFIG.pi__fetch_content?.eager, true);
+  assert.equal(EAGER_PI_BRIDGE_TOOLS_CONFIG.pi__grep?.eager, true);
   assert.equal(definition.mainAgent, true);
   assert.equal(definition.inheritCustomizations, false);
   assert.deepEqual(definition.mcpServers, [
@@ -1372,3 +1378,51 @@ test("reduceAgyStream strips invisible U+FFF9-U+FFFB chars without truncating su
     .join("");
   assert.equal(streamedText, "First chunk, second chunk!");
 });
+
+test("buildPiToolsTrajectoryMetadataFields encodes native specialty tools and latestUserPrompt materializes base64 images", async (t) => {
+  const mcpDir = await mkdtemp(path.join(tmpdir(), "pi-agy-meta-tools-"));
+  t.after(() => rm(mcpDir, { recursive: true, force: true }));
+  const agent = createPiToolsAgent(path.join(mcpDir, ".agents", "agents"));
+  await agent.prepare({
+    serverName: "pi-bridge-test",
+    url: "http://127.0.0.1:4321/mcp",
+    token: "secret",
+  });
+
+  const blob = buildPiToolsTrajectoryMetadataFields(agent.name, mcpDir);
+  for (const nativeTool of PI_TOOLS_AGENT_NATIVE_TOOLS) {
+    assert.equal(blob.includes(Buffer.from(nativeTool, "utf8")), true);
+  }
+  assert.equal(blob.includes(Buffer.from("pi__web_search", "utf8")), true);
+  assert.equal(blob.includes(Buffer.from("pi__fetch_content", "utf8")), true);
+
+  // 1x1 transparent PNG in base64
+  const tinyPngBase64 =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+  const contextWithImage = {
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "What is in this screenshot?" },
+          { type: "image", mimeType: "image/png", data: tinyPngBase64 },
+          { type: "image" }, // bare image stub without data falls back to omittedImagesPrompt
+        ],
+      },
+    ],
+  } as unknown as Parameters<typeof latestUserPrompt>[0];
+
+  const { prompt, images } = latestUserPrompt(contextWithImage);
+  assert.equal(images, 2);
+  assert.match(prompt, /What is in this screenshot\?/);
+  assert.match(prompt, /Attached user image\(s\) saved to disk/);
+  assert.match(prompt, /\(1 image\(s\) omitted — the agy print interface is text-only\)/);
+
+  const pathMatch = prompt.match(/^- Image 1: (.+\.png)$/m);
+  assert.ok(pathMatch?.[1]);
+  const savedFilePath = pathMatch[1];
+  t.after(() => rm(savedFilePath, { force: true }));
+  const savedBytes = await readFile(savedFilePath);
+  assert.deepEqual(savedBytes, Buffer.from(tinyPngBase64, "base64"));
+});
+
