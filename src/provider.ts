@@ -1722,22 +1722,33 @@ export function streamAntigravity(
                 Boolean(activity.response?.trim()) ||
                 output.content.some((c) => c.type === "text" && Boolean(c.text.trim()));
 
-              // agy flags auto-recovered stream interruptions as ERROR even
-              // though the full response was delivered; pi aborts the run on
-              // stopReason "error", so complete those turns normally instead.
+              // agy flags auto-recovered tail transport interruptions as ERROR
+              // even though the full response was delivered; pi aborts the run
+              // on stopReason "error", so complete only genuine transient tail
+              // interruptions — never early cut-offs (print_timeout/interrupted)
+              // or hook/fatal errors that merely follow partial text.
+              const earlyTermination =
+                activity.finishedReason === "print_timeout" ||
+                activity.finishedReason === "interrupted";
               const recovered =
+                !earlyTermination &&
                 hasResponse &&
                 !OVERFLOW_PATTERN.test(activity.error ?? "") &&
-                (RECOVERED_INTERRUPTION_PATTERN.test(activity.error ?? "") ||
-                  Boolean(activity.response?.trim()));
+                RECOVERED_INTERRUPTION_PATTERN.test(activity.error ?? "");
 
               if (activity.status === "ERROR" && !recovered) {
-                const message = activity.error || "agy reported an error for this turn.";
-                output.stopReason = "error";
+                const message =
+                  activity.error ||
+                  (activity.finishedReason
+                    ? `agy turn ended early (${activity.finishedReason}).`
+                    : "agy reported an error for this turn.");
+                const aborted =
+                  options?.signal?.aborted || activity.finishedReason === "interrupted";
+                output.stopReason = aborted ? "aborted" : "error";
                 output.errorMessage = OVERFLOW_PATTERN.test(message)
                   ? `context_length_exceeded: ${message}`
                   : message;
-                stream.push({ type: "error", reason: "error", error: output });
+                stream.push({ type: "error", reason: output.stopReason, error: output });
               } else {
                 output.stopReason = "stop";
                 stream.push({ type: "done", reason: "stop", message: output });

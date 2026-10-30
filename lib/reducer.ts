@@ -9,7 +9,7 @@
  */
 
 import type { JsonObject } from "@earendil-works/pi-ai";
-import type { AgyStepUpdate, AgyUsage, ParsedAgyEvent } from "./events.ts";
+import type { AgyFinishedReason, AgyStepUpdate, AgyUsage, ParsedAgyEvent } from "./events.ts";
 import { parseAgyLine } from "./events.ts";
 
 /**
@@ -75,12 +75,13 @@ export type AgyActivity =
   | { type: "usage"; usage: AgyUsage }
   | {
       /** Terminal status, already normalized: anything agy did not explicitly
-       * report as successful arrives as "ERROR". */
+       * report as successful (or any early `finished_reason`) arrives as "ERROR". */
       type: "result";
       status: "OK" | "ERROR";
+      finishedReason?: AgyFinishedReason;
       response: string;
-      error: string | undefined;
-      usage: AgyUsage | undefined;
+      error?: string;
+      usage?: AgyUsage;
     };
 
 export interface AgyTurnOutcome {
@@ -88,10 +89,12 @@ export interface AgyTurnOutcome {
   conversationId: string | undefined;
   /** "UNKNOWN" until the result event lands; then "OK" or "ERROR". */
   status: "OK" | "ERROR" | "UNKNOWN";
+  /** Early-termination reason (`print_timeout` | `interrupted` | `error`) when present. */
+  finishedReason?: AgyFinishedReason;
   /** Final assistant text (empty until the result event). */
   response: string;
   /** Error message when status is ERROR. */
-  error: string | undefined;
+  error?: string;
   usage: AgyUsage | undefined;
   /** Structured activity events, appended as the stream unfolds. */
   activities: AgyActivity[];
@@ -291,17 +294,33 @@ export function applyEvent(outcome: AgyTurnOutcome, event: ParsedAgyEvent): AgyA
       const result = event.result;
       outcome.finished = true;
       outcome.conversationId = result.conversation_id ?? outcome.conversationId;
-      // Fail closed: only an explicitly successful status completes the turn.
-      // agy >= 1.1.22 reports SUCCESS (older builds: OK); FAILURE, CANCELLED,
-      // and TIMEOUT all exist too, and an unrecognized status must never be
-      // rendered as a normal answer.
-      outcome.status = result.status === "SUCCESS" || result.status === "OK" ? "OK" : "ERROR";
+      const finishedReason =
+        typeof result.finished_reason === "string" && result.finished_reason.trim()
+          ? (result.finished_reason.trim() as AgyFinishedReason)
+          : undefined;
+      // Fail closed: only an explicitly successful status with no early
+      // finished_reason completes the turn. agy 1.4.11+ reports status SUCCESS
+      // even when --print-timeout cut off a partial reply (finished_reason:
+      // "print_timeout"), so finishedReason always forces status "ERROR".
+      const isOk =
+        !finishedReason && (result.status === "SUCCESS" || result.status === "OK");
+      outcome.status = isOk ? "OK" : "ERROR";
+      outcome.finishedReason = finishedReason;
       outcome.response = stripHallucinatedTurnSuffix(result.response ?? "");
-      outcome.error = result.error;
+      outcome.error =
+        result.error ||
+        (finishedReason === "print_timeout"
+          ? "agy turn timed out (--print-timeout expired); response is partial."
+          : finishedReason === "interrupted"
+            ? "agy turn was interrupted before completion."
+            : finishedReason
+              ? `agy turn ended early (${finishedReason}).`
+              : undefined);
       outcome.usage = result.usage ?? outcome.usage;
       activities.push({
         type: "result",
         status: outcome.status,
+        ...(finishedReason ? { finishedReason } : {}),
         response: outcome.response,
         error: outcome.error,
         usage: outcome.usage,

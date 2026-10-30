@@ -109,9 +109,18 @@ export function parseAgyUsageJson(text: string): AgyUsageReport {
     throw new Error("agy-usage: quota response was not valid JSON.");
   }
   const result = unwrapResult(parsed);
+  const finishedReason = asString(result.finished_reason);
+  if (finishedReason === "print_timeout") {
+    throw new Error(asString(result.error) ?? "agy-usage: quota command timed out.");
+  }
+  if (finishedReason === "interrupted") {
+    throw new Error(asString(result.error) ?? "agy-usage: quota command was interrupted.");
+  }
   const status = asString(result.status);
-  if (status && status !== "SUCCESS" && status !== "OK") {
-    throw new Error(asString(result.error) ?? `agy-usage: quota command failed (${status}).`);
+  if ((status && status !== "SUCCESS" && status !== "OK") || finishedReason) {
+    throw new Error(
+      asString(result.error) ?? `agy-usage: quota command failed (${finishedReason ?? status}).`,
+    );
   }
   const command = asRecord(result.command);
   if (command && asString(command.name) && command.name !== "usage") {

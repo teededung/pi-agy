@@ -22,7 +22,9 @@ import { reduceAgyStream, stripHallucinatedTurnSuffix } from "../lib/reducer.ts"
 import {
   installModelSelectorSelectionPatch,
   installSessionSelectorDeletePatch,
+  toProviderModel,
 } from "../index.ts";
+import { parseAgyUsageJson } from "../lib/usage.ts";
 import { isAgyEditTool } from "../lib/diff.ts";
 import { mapAgyToolToNative } from "../lib/native-tools.ts";
 import {
@@ -1710,6 +1712,142 @@ test("streamAntigravity expands /goal, notifies onGoalStarted, and reports settl
     inspectGoalResponseMarkers(settledOutcomes[0]?.responseText ?? ""),
     "complete",
   );
+});
+
+test("finished_reason handling preserves partial text without swallowing print_timeout/interrupted/hook errors, and models declare image input", async (t) => {
+  // 1. toProviderModel enables text + image input
+  const providerModel = toProviderModel(ALL_FALLBACK_MODELS[0]!);
+  assert.deepEqual(providerModel.input, ["text", "image"]);
+
+  // 2. reduceAgyStream turns status: SUCCESS + finished_reason: print_timeout into ERROR
+  const partialTimeoutOutcome = reduceAgyStream(
+    JSON.stringify({
+      event: "result",
+      result: {
+        conversation_id: "conv-timeout",
+        status: "SUCCESS",
+        response: "Half of an answer...",
+        finished_reason: "print_timeout",
+      },
+    }),
+  );
+  assert.equal(partialTimeoutOutcome.status, "ERROR");
+  assert.equal(partialTimeoutOutcome.finishedReason, "print_timeout");
+  assert.equal(partialTimeoutOutcome.response, "Half of an answer...");
+  assert.match(partialTimeoutOutcome.error ?? "", /timed out/);
+
+  // 3. parseAgyUsageJson surfaces print_timeout instead of "no quota groups returned"
+  assert.throws(
+    () =>
+      parseAgyUsageJson(
+        JSON.stringify({
+          status: "SUCCESS",
+          finished_reason: "print_timeout",
+        }),
+      ),
+    /quota command timed out/,
+  );
+
+  // 4. streamAntigravity: verify partial cut-off, hook error, interrupted, and transient tail recovery
+  const runScenario = async (resultEvent: {
+    status: "OK" | "ERROR";
+    finishedReason?: string;
+    response: string;
+    error?: string;
+  }) => {
+    const runtime = createAntigravityRuntime(async (request) => {
+      request.onConversation?.("conv-fr");
+      const activity = {
+        type: "result" as const,
+        ...resultEvent,
+        usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+      };
+      request.onActivity?.(activity);
+      return {
+        conversationId: "conv-fr",
+        status: resultEvent.status,
+        finishedReason: resultEvent.finishedReason,
+        response: resultEvent.response,
+        error: resultEvent.error,
+        activities: [activity],
+        usage: activity.usage,
+        finished: true,
+      };
+    });
+    t.after(() => runtime.dispose());
+
+    const service = runtime.runSync(AntigravityRuntime);
+    const settled: Array<AgySettledTurnOutcome | undefined> = [];
+    const streamFn = streamAntigravity(
+      runtime,
+      service,
+      new AgyReplayStore(),
+      new AgyPiBridge("pi-test"),
+      (o) => settled.push(o),
+    );
+    const model = {
+      id: "gemini-4-argon",
+      name: "Gemini",
+      api: "antigravity-stream-json",
+      provider: "antigravity",
+      baseUrl: "agy://local-stream-json",
+      reasoning: true,
+      input: ["text", "image"] as ("text" | "image")[],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 1_000_000,
+      maxTokens: 64_000,
+    };
+
+    const events: Array<{ type: string; reason?: string; error?: { errorMessage?: string; content?: unknown[] }; message?: { content?: unknown[] } }> = [];
+    for await (const ev of streamFn(model, {
+      messages: [{ role: "user", content: "test", timestamp: Date.now() }],
+    })) {
+      events.push(ev as (typeof events)[number]);
+    }
+    return { events, settled: settled[0] };
+  };
+
+  // 4a. print_timeout with partial text -> stopReason "error", partial text preserved
+  const timeoutRun = await runScenario({
+    status: "ERROR",
+    finishedReason: "print_timeout",
+    response: "Partial output before timeout",
+    error: "agy turn timed out (--print-timeout expired); response is partial.",
+  });
+  assert.equal(timeoutRun.settled?.stopReason, "error");
+  assert.equal(timeoutRun.settled?.responseText, "Partial output before timeout");
+  assert.equal(timeoutRun.events.at(-1)?.type, "error");
+
+  // 4b. Hook/fatal error after partial text -> NOT swallowed, stopReason "error"
+  const hookErrorRun = await runScenario({
+    status: "ERROR",
+    finishedReason: "error",
+    response: "Some partial text",
+    error: "Blocked sensitive prompt",
+  });
+  assert.equal(hookErrorRun.settled?.stopReason, "error");
+  assert.equal(hookErrorRun.settled?.responseText, "Some partial text");
+  assert.equal(hookErrorRun.events.at(-1)?.error?.errorMessage, "Blocked sensitive prompt");
+
+  // 4c. Interrupted turn -> stopReason "aborted"
+  const interruptedRun = await runScenario({
+    status: "ERROR",
+    finishedReason: "interrupted",
+    response: "Interrupted mid-sentence",
+    error: "agy turn was interrupted before completion.",
+  });
+  assert.equal(interruptedRun.settled?.stopReason, "aborted");
+  assert.equal(interruptedRun.events.at(-1)?.reason, "aborted");
+
+  // 4d. Genuine transient tail transport interruption with full text -> still recovered as "stop"
+  const recoveredRun = await runScenario({
+    status: "ERROR",
+    finishedReason: "error",
+    response: "Complete answer before EOF",
+    error: "stream was interrupted: unexpected EOF",
+  });
+  assert.equal(recoveredRun.settled?.stopReason, "stop");
+  assert.equal(recoveredRun.events.at(-1)?.type, "done");
 });
 
 

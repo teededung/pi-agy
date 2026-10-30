@@ -92,10 +92,17 @@ export type AgyResultStatus =
   | "TIMEOUT"
   | (string & {});
 
+/**
+ * Early-termination reason reported by agy 1.4.11+ on `result.finished_reason`.
+ * Omitted when the turn finishes normally.
+ */
+export type AgyFinishedReason = "print_timeout" | "interrupted" | "error" | (string & {});
+
 /** Terminal event of every stream: final text, status, and cumulative usage. */
 export interface AgyResult {
   conversation_id?: string;
   status?: AgyResultStatus;
+  finished_reason?: AgyFinishedReason;
   response?: string;
   error?: string;
   duration_seconds?: number;

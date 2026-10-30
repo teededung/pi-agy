@@ -211,7 +211,7 @@ interface ModelCache {
  * overrides belong in pi's own ~/.pi/agent/models.json under
  * providers.antigravity.modelOverrides — pi applies them over registered models.
  */
-function toProviderModel(model: AgyModelInfo): ProviderModelConfig {
+export function toProviderModel(model: AgyModelInfo): ProviderModelConfig {
   const capabilities = capabilitiesForModel(model.id);
   const thinkingLevelMap = thinkingLevelMapForModel(model);
   return {
@@ -219,7 +219,7 @@ function toProviderModel(model: AgyModelInfo): ProviderModelConfig {
     name: model.name,
     reasoning: true,
     ...(thinkingLevelMap ? { thinkingLevelMap } : {}),
-    input: ["text"],
+    input: ["text", "image"],
     cost: pricingForModel(model.id),
     contextWindow: capabilities.contextWindow,
     maxTokens: capabilities.maxTokens,
