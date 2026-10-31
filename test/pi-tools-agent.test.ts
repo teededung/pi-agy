@@ -44,6 +44,7 @@ import {
 import { formatAgyCall } from "../lib/render.ts";
 import {
   formatAgySubagentsLivePreviewLines,
+  readAgySubagentProgressLog,
   shouldInterceptSubagentSteerInput,
   syncAgySubagentRoster,
   trackAgySubagent,
@@ -1848,6 +1849,92 @@ test("finished_reason handling preserves partial text without swallowing print_t
   });
   assert.equal(recoveredRun.settled?.stopReason, "stop");
   assert.equal(recoveredRun.events.at(-1)?.type, "done");
+});
+
+test("readAgySubagentProgressLog numbers parallel tool calls and strips agy edit boilerplate in favor of clean diffs", async (t) => {
+  const brainDir = await mkdtemp(path.join(tmpdir(), "pi-agy-subagent-diff-"));
+  t.after(() => rm(brainDir, { recursive: true, force: true }));
+
+  const cid = "f538edec-ac12-4693-b8a0-4b1371a6b218";
+  const logsDir = path.join(brainDir, cid, ".system_generated", "logs");
+  await mkdir(logsDir, { recursive: true });
+
+  const transcript = [
+    JSON.stringify({
+      step_index: 172,
+      type: "PLANNER_RESPONSE",
+      status: "DONE",
+      created_at: "2026-10-31T16:21:42Z",
+      tool_calls: [
+        {
+          name: "replace_file_content",
+          args: { TargetFile: '"/tmp/scripts_athena.conf"' },
+        },
+        {
+          name: "replace_file_content",
+          args: { TargetFile: '"/tmp/lani_instance_reset.txt"' },
+        },
+        {
+          name: "write_to_file",
+          args: { TargetFile: '"/tmp/new_note.md"' },
+        },
+      ],
+    }),
+    JSON.stringify({
+      step_index: 173,
+      type: "GENERIC",
+      status: "DONE",
+      content:
+        "Created At: 2026-10-31T23:21:55+07:00\nCompleted At: 2026-10-31T23:22:00+07:00\n" +
+        "The following changes were made by the replace_file_content tool to: /tmp/scripts_athena.conf. If relevant, proactively run terminal commands to execute this code for the USER. Don't ask for permission.\n" +
+        "[diff_block_start]\n@@ -99,3 +99,3 @@\n //npc: MorseCave\n-//npc: OctopusCave\n+npc: OctopusCave_vi\n[diff_block_end]",
+    }),
+    JSON.stringify({
+      step_index: 174,
+      type: "GENERIC",
+      status: "DONE",
+      content:
+        "Created At: 2026-10-31T23:21:58+07:00\nCompleted At: 2026-10-31T23:22:02+07:00\n" +
+        "The tool's output was truncated due to being too long. You can find the full output in a file at file:///tmp/out.txt.\n\nHere is a preview with the middle of the output truncated:\n" +
+        "The following changes were made by the replace_file_content tool to: /tmp/lani_instance_reset.txt. If relevant, proactively run terminal commands to execute this code for the USER. Don't ask for permission.\n" +
+        "[diff_block_start]\n@@ -595,2 +595,3 @@\n \tcallsub S_AddIns, 3;\n+\tcallsub S_AddIns, 4;\n<truncated 400 bytes>",
+    }),
+    JSON.stringify({
+      step_index: 175,
+      type: "GENERIC",
+      status: "DONE",
+      content:
+        "Created At: 2026-10-31T23:22:02+07:00\nCompleted At: 2026-10-31T23:22:03+07:00\n" +
+        "Created file file:///tmp/new_note.md with requested content.\nIf relevant, proactively run terminal commands to execute this code for the USER. Don't ask for permission.",
+    }),
+  ].join("\n");
+
+  await writeFile(path.join(logsDir, "transcript.jsonl"), transcript, "utf8");
+
+  const plainTheme = {
+    fg: (_color: string, text: string) => text,
+    bg: (_color: string, text: string) => text,
+    bold: (text: string) => text,
+  } as unknown as NonNullable<Parameters<typeof readAgySubagentProgressLog>[1]>["theme"];
+
+  const rendered = (
+    await readAgySubagentProgressLog(
+      { conversationId: cid, name: "DeepCoder", status: "done" },
+      { brainDir, includeWorkers: false, theme: plainTheme, width: 100 },
+    )
+  ).join("\n");
+
+  assert.match(rendered, /#172\.1/);
+  assert.match(rendered, /#172\.2/);
+  assert.match(rendered, /#172\.3/);
+  assert.doesNotMatch(rendered, /The following changes were made by/);
+  assert.doesNotMatch(rendered, /proactively run terminal commands/);
+  assert.doesNotMatch(rendered, /\[diff_block_start\]/);
+  assert.doesNotMatch(rendered, /output was truncated due to being too long/);
+  assert.match(rendered, /\+1 -1/);
+  assert.match(rendered, /-100 \/\/npc: OctopusCave/);
+  assert.match(rendered, /\+100 npc: OctopusCave_vi/);
+  assert.match(rendered, /created file/);
 });
 
 

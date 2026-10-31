@@ -15,6 +15,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getMarkdownTheme, type Theme } from "@earendil-works/pi-coding-agent";
 import { Markdown, Text, visibleWidth } from "@earendil-works/pi-tui";
+import { isAgyEditTool, safeRenderDiff } from "./diff.ts";
 import type { AgyActivity } from "./reducer.ts";
 import { cleanToolOutputLines, formatAgyCall, summarizeAgyResult } from "./render.ts";
 import { agyToolStepKey } from "./tool-steps.ts";
@@ -1032,6 +1033,38 @@ function parseStepTimestamps(rawContent: string): { durationSeconds?: number; bo
   return { durationSeconds, body: body.trim() };
 }
 
+const AGY_TRUNCATED_PREVIEW_HEADER_RE =
+  /^The tool's output was truncated due to being too long\.[\s\S]*?Here is a preview with the middle of the output truncated:\s*\n?/i;
+
+const AGY_EDIT_PREAMBLE_RE =
+  /^The following changes were made by the \S+ tool to:\s*[^\n]+?\.\s*/i;
+
+const AGY_PROACTIVE_COMMAND_HINT_RE =
+  /\s*If relevant,\s*proactively run terminal commands to execute this code for the USER\.\s*Don't ask for permission\.\s*/gi;
+
+function extractSubagentEditDiff(text: string): {
+  diff: string;
+  added: number;
+  removed: number;
+} | null {
+  const withoutTailTrunc = text.replace(/\n?<truncated \d+ (?:bytes|lines)>[\s\S]*$/i, "");
+  const startIdx = withoutTailTrunc.indexOf("[diff_block_start]");
+  if (startIdx < 0) return null;
+  const afterStart = withoutTailTrunc
+    .slice(startIdx + "[diff_block_start]".length)
+    .replace(/^\r?\n/, "");
+  const endIdx = afterStart.indexOf("[diff_block_end]");
+  const diff = (endIdx >= 0 ? afterStart.slice(0, endIdx) : afterStart).trim();
+  if (!diff) return null;
+  let added = 0;
+  let removed = 0;
+  for (const line of diff.split("\n")) {
+    if (line.startsWith("+") && !line.startsWith("+++")) added += 1;
+    else if (line.startsWith("-") && !line.startsWith("---")) removed += 1;
+  }
+  return { diff, added, removed };
+}
+
 function renderThemedToolCard(
   toolCall: Record<string, unknown>,
   genericStep: TranscriptStepRecord | undefined,
@@ -1089,7 +1122,7 @@ function renderThemedToolCard(
         );
         resultLines.push(statusParts.join(" "));
       } else {
-        let cleanedBody = body;
+        let cleanedBody = body.replace(AGY_TRUNCATED_PREVIEW_HEADER_RE, "");
         let exitLabel = "";
         if (toolName === "run_command") {
           const exitMatch = cleanedBody.match(/^The command exited with code (\d+)\.\s*/i);
@@ -1101,28 +1134,69 @@ function renderThemedToolCard(
             }
           }
         }
-        const { counts } = summarizeAgyResult(toolName, cleanedBody);
-        const statusParts = [
-          icon,
-          counts ? theme.fg("muted", counts) : "",
-          exitLabel,
-          secs,
-        ].filter(Boolean);
-        resultLines.push(statusParts.join(" "));
 
-        const outputLines = cleanToolOutputLines(cleanedBody).filter(
-          (l) => !/^<truncated \d+ (?:bytes|lines)>$/i.test(l.trim()),
-        );
-        if (outputLines.length > 0 && cleanedBody !== "(no output)") {
-          const maxOutputLines = isError ? 6 : 4;
-          const shown = outputLines.slice(0, maxOutputLines);
-          for (const outLine of shown) {
-            resultLines.push(theme.fg(isError ? "error" : "toolOutput", outLine));
-          }
-          if (outputLines.length > maxOutputLines) {
-            resultLines.push(
-              theme.fg("muted", `… +${outputLines.length - maxOutputLines} lines`),
+        if (isAgyEditTool(toolName) && !isError) {
+          const extracted = extractSubagentEditDiff(cleanedBody);
+          if (extracted) {
+            const deltaCounts =
+              extracted.added > 0 || extracted.removed > 0
+                ? [
+                    extracted.added > 0 ? theme.fg("success", `+${extracted.added}`) : "",
+                    extracted.removed > 0 ? theme.fg("error", `-${extracted.removed}`) : "",
+                  ]
+                    .filter(Boolean)
+                    .join(" ")
+                : "";
+            resultLines.push([icon, deltaCounts, secs].filter(Boolean).join(" "));
+            const rawDiffLines = safeRenderDiff(extracted.diff, theme)
+              .split("\n")
+              .filter((line) => !/^\s*\.\.\.\s*$/.test(line.replace(/\x1b\[[0-9;]*m/g, "")));
+            const maxDiffLines = 10;
+            resultLines.push(...rawDiffLines.slice(0, maxDiffLines));
+            if (rawDiffLines.length > maxDiffLines) {
+              resultLines.push(
+                theme.fg("muted", `… +${rawDiffLines.length - maxDiffLines} diff lines`),
+              );
+            }
+          } else if (/^Created file\s+/i.test(cleanedBody)) {
+            resultLines.push([icon, theme.fg("muted", "created file"), secs].filter(Boolean).join(" "));
+          } else {
+            cleanedBody = cleanedBody
+              .replace(AGY_EDIT_PREAMBLE_RE, "")
+              .replace(AGY_PROACTIVE_COMMAND_HINT_RE, "")
+              .trim();
+            resultLines.push([icon, secs].filter(Boolean).join(" "));
+            const outputLines = cleanToolOutputLines(cleanedBody).filter(
+              (l) => !/^<truncated \d+ (?:bytes|lines)>$/i.test(l.trim()),
             );
+            for (const outLine of outputLines.slice(0, 4)) {
+              resultLines.push(theme.fg("toolOutput", outLine));
+            }
+          }
+        } else {
+          const { counts } = summarizeAgyResult(toolName, cleanedBody);
+          const statusParts = [
+            icon,
+            counts ? theme.fg("muted", counts) : "",
+            exitLabel,
+            secs,
+          ].filter(Boolean);
+          resultLines.push(statusParts.join(" "));
+
+          const outputLines = cleanToolOutputLines(cleanedBody).filter(
+            (l) => !/^<truncated \d+ (?:bytes|lines)>$/i.test(l.trim()),
+          );
+          if (outputLines.length > 0 && cleanedBody !== "(no output)") {
+            const maxOutputLines = isError ? 6 : 4;
+            const shown = outputLines.slice(0, maxOutputLines);
+            for (const outLine of shown) {
+              resultLines.push(theme.fg(isError ? "error" : "toolOutput", outLine));
+            }
+            if (outputLines.length > maxOutputLines) {
+              resultLines.push(
+                theme.fg("muted", `… +${outputLines.length - maxOutputLines} lines`),
+              );
+            }
           }
         }
       }
@@ -1285,28 +1359,37 @@ async function formatConversationTranscriptLines(
       }
 
       if (Array.isArray(step.tool_calls) && step.tool_calls.length > 0) {
+        const validCalls = step.tool_calls.filter(
+          (tc): tc is Record<string, unknown> => Boolean(tc && typeof tc === "object"),
+        );
         let genericCursor = i + 1;
-        for (const tc of step.tool_calls) {
-          if (!tc || typeof tc !== "object") continue;
+        for (let callIdx = 0; callIdx < validCalls.length; callIdx++) {
+          const tc = validCalls[callIdx]!;
           let pairedGeneric: TranscriptStepRecord | undefined;
           if (genericCursor < steps.length && steps[genericCursor]?.type === "GENERIC") {
             pairedGeneric = steps[genericCursor];
             consumedIndices.add(genericCursor);
             genericCursor += 1;
           }
+          const callStepLabel =
+            validCalls.length > 1 ? `#${idx}.${callIdx + 1}` : `#${idx}`;
+          const callPrefix = `[${clock}] ${callStepLabel}`;
+          const callBadge = theme
+            ? `${theme.fg("dim", `[${clock}]`)} ${theme.fg("muted", callStepLabel)}`
+            : callPrefix;
           if (theme) {
             if (out.length > 0 && out[out.length - 1] !== "") out.push("");
             out.push(
               ...renderThemedToolCard(
-                tc as Record<string, unknown>,
+                tc,
                 pairedGeneric,
-                stepBadge,
+                callBadge,
                 theme,
                 width,
               ),
             );
           } else {
-            out.push(`${prefix} 🔧 ${formatDetailedToolCall(tc as Record<string, unknown>)}`);
+            out.push(`${callPrefix} 🔧 ${formatDetailedToolCall(tc)}`);
           }
         }
       }
