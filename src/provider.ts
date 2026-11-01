@@ -55,7 +55,11 @@ import {
   BOOST_DEACTIVATED_PROMPT,
   BOOST_ORCHESTRATOR_PROMPT,
   BRIDGE_PENDING_TOOL_MESSAGE,
+  buildGrillMeContinuationPrompt,
+  buildGrillMePrompt,
   GOAL_INITIAL_PROMPT,
+  GRILL_COMPLETE_MARKER,
+  GRILL_DEACTIVATED_PROMPT,
   omittedImagesPrompt,
   restoredPiContextPrompt,
   TEAMWORK_CONTINUATION_PROMPT,
@@ -622,6 +626,36 @@ export function contextHasPriorTeamworkActivity(messages: TranscriptContext["mes
   return false;
 }
 
+export function contextHasPriorGrillActivity(messages: TranscriptContext["messages"]): boolean {
+  for (const msg of messages) {
+    const text = messageUserText(msg);
+    if (
+      text &&
+      (/^\/(?:agy-)?grill(?:-me)?\b/i.test(text.trim()) || text.includes("<GRILL_ME>"))
+    ) {
+      return true;
+    }
+    if (msg.role === "assistant") {
+      const assistantText =
+        typeof msg.content === "string"
+          ? msg.content
+          : Array.isArray(msg.content)
+            ? msg.content
+                .map((p) =>
+                  p && typeof p === "object" && "text" in p && typeof p.text === "string"
+                    ? p.text
+                    : "",
+                )
+                .join("\n")
+            : "";
+      if (assistantText.includes(GRILL_COMPLETE_MARKER)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 export interface AgySettledTurnOutcome {
   stopReason: AssistantMessage["stopReason"];
   responseText: string;
@@ -680,12 +714,16 @@ export function streamAntigravity(
   isGoalActive?: () => boolean,
   /** Notifies the extension when a turn starts with an explicit `/goal <task>` directive. */
   onGoalStarted?: (request: string, options?: { boost?: boolean }) => void,
+  /** Whether `/grill-me` design interview mode is currently active. */
+  isGrillActive?: () => boolean,
 ) {
   let hadBoostInConversation = false;
   let hadTeamworkInConversation = false;
+  let hadGrillInConversation = false;
   let currentTurnBatchStart = -1;
   let currentTurnHadBoostBefore = false;
   let currentTurnHadTeamworkBefore = false;
+  let currentTurnHadGrillBefore = false;
 
   return (
     model: Model<string>,
@@ -817,14 +855,17 @@ export function streamAntigravity(
         }
         let isBoost = false;
         let isTeamwork = false;
+        let isGrill = false;
         let isGoal = false;
         let explicitBoostCommand = false;
         let explicitTeamworkCommand = false;
+        let explicitGrillCommand = false;
         if (!isolatedRequest) {
           if (userBatch.start !== currentTurnBatchStart) {
             if (userBatch.start <= 0) {
               hadBoostInConversation = false;
               hadTeamworkInConversation = false;
+              hadGrillInConversation = false;
             }
             currentTurnBatchStart = userBatch.start;
             currentTurnHadBoostBefore =
@@ -835,12 +876,24 @@ export function streamAntigravity(
               hadTeamworkInConversation ||
               (userBatch.start > 0 &&
                 contextHasPriorTeamworkActivity(context.messages.slice(0, userBatch.start)));
+            currentTurnHadGrillBefore =
+              hadGrillInConversation ||
+              (userBatch.start > 0 &&
+                contextHasPriorGrillActivity(context.messages.slice(0, userBatch.start)));
           }
           if (/^\/(?:agy-)?goal\b/i.test(prompt)) {
             isGoal = true;
             prompt = prompt.replace(/^\/(?:agy-)?goal\s*/i, "").trim();
           }
-          if (/^\/(?:agy-)?teamwork\b/i.test(prompt)) {
+          if (/^\/(?:agy-)?grill(?:-me)?\b/i.test(prompt)) {
+            isGrill = true;
+            explicitGrillCommand = true;
+            prompt = prompt.replace(/^\/(?:agy-)?grill(?:-me)?\s*/i, "").trim();
+            if (!prompt) {
+              prompt =
+                "Grill mode is ready. Share the plan, idea, or design you want me to stress-test, and I will interview you until we reach a shared understanding.";
+            }
+          } else if (/^\/(?:agy-)?teamwork\b/i.test(prompt)) {
             isTeamwork = true;
             explicitTeamworkCommand = true;
             prompt = prompt.replace(/^\/(?:agy-)?teamwork\s*/i, "").trim();
@@ -856,6 +909,8 @@ export function streamAntigravity(
               prompt =
                 "Boost mode is ready. What coding or investigation task would you like to tackle? Please share the details or requirements, and I will orchestrate the work.";
             }
+          } else if (isGrillActive?.() && !isGoal) {
+            isGrill = true;
           } else if (isTeamworkActive?.()) {
             isTeamwork = true;
           } else if (isBoostActive?.()) {
@@ -874,6 +929,9 @@ export function streamAntigravity(
             }
             prompt = `${GOAL_INITIAL_PROMPT}\n\n${prompt}`;
           }
+          if (isGrill) {
+            hadGrillInConversation = true;
+          }
           if (isTeamwork) {
             hadTeamworkInConversation = true;
           }
@@ -881,17 +939,6 @@ export function streamAntigravity(
             hadBoostInConversation = true;
           }
         }
-        const turnPrompt = isTeamwork
-          ? explicitTeamworkCommand || !currentTurnHadTeamworkBefore
-            ? `${TEAMWORK_ORCHESTRATOR_PROMPT}\n\n${prompt}`
-            : `${TEAMWORK_CONTINUATION_PROMPT}\n\n${prompt}`
-          : isBoost
-            ? `${BOOST_ORCHESTRATOR_PROMPT}\n\n${prompt}`
-            : !isolatedRequest && currentTurnHadTeamworkBefore
-              ? `${TEAMWORK_DEACTIVATED_PROMPT}\n\n${prompt}`
-              : !isolatedRequest && currentTurnHadBoostBefore
-                ? `${BOOST_DEACTIVATED_PROMPT}\n\n${prompt}`
-                : prompt;
 
         if (isolatedRequest) {
           // Pi invokes compaction, branch summarization, and side conversations (/btw)
@@ -918,6 +965,31 @@ export function streamAntigravity(
           resolveBridgeResultsFromContext(bridge, context.messages);
           bridgeRevision = getBridgeRevision();
         }
+        const canUseAskUserQuestion =
+          !isolatedRequest &&
+          bridge.hasTool("ask_user_question") &&
+          (bridge.running
+            ? Boolean(processProfile.mcpDirectory)
+            : Boolean(processProfile.agent?.startsWith("pi-tools")));
+        const baseTurnPrompt = isGrill
+          ? explicitGrillCommand || !currentTurnHadGrillBefore
+            ? `${buildGrillMePrompt({ useAskUserQuestion: canUseAskUserQuestion })}\n\n${prompt}`
+            : `${buildGrillMeContinuationPrompt({ useAskUserQuestion: canUseAskUserQuestion })}\n\n${prompt}`
+          : isTeamwork
+            ? explicitTeamworkCommand || !currentTurnHadTeamworkBefore
+              ? `${TEAMWORK_ORCHESTRATOR_PROMPT}\n\n${prompt}`
+              : `${TEAMWORK_CONTINUATION_PROMPT}\n\n${prompt}`
+            : isBoost
+              ? `${BOOST_ORCHESTRATOR_PROMPT}\n\n${prompt}`
+              : !isolatedRequest && currentTurnHadTeamworkBefore
+                ? `${TEAMWORK_DEACTIVATED_PROMPT}\n\n${prompt}`
+                : !isolatedRequest && currentTurnHadBoostBefore
+                  ? `${BOOST_DEACTIVATED_PROMPT}\n\n${prompt}`
+                  : prompt;
+        const turnPrompt =
+          !isolatedRequest && !isGrill && currentTurnHadGrillBefore
+            ? `${GRILL_DEACTIVATED_PROMPT}\n\n${baseTurnPrompt}`
+            : baseTurnPrompt;
         const requestedEffort =
           consultOverride?.effort ?? mapThinkingToEffort(options?.reasoning);
         const effort = resolveAgyModelEffort(getModelInfo(effectiveModelId), requestedEffort);

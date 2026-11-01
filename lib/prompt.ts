@@ -582,4 +582,97 @@ export function decideGoalSettlement(
   return "continue";
 }
 
+export const GRILL_COMPLETE_MARKER = "<!-- GRILL_COMPLETE -->";
+
+export interface GrillPromptOptions {
+  /** True when `pi__ask_user_question` is exposed on the active Pi MCP bridge. */
+  useAskUserQuestion?: boolean;
+}
+
+/**
+ * Initial prompt for `/grill-me` (aliases `/grill`, `/agy-grill`).
+ *
+ * Combines dependency-ordered frontier rounds (resolving upstream branches of
+ * the design tree before downstream choices, inspecting the codebase directly
+ * for facts rather than asking the user, and holding a hard gate against premature
+ * implementation) with adaptive question delivery:
+ *   - Interactive TUI cards via `pi__ask_user_question` when bridged in Pi tools mode.
+ *   - Structured Markdown rounds (`❓ **Q1**` + `➡️ *Recommended*:`) when `ask_user_question`
+ *     is unavailable or Pi tools mode is off — never calling headless `ask_question`.
+ */
+export function buildGrillMePrompt(options?: GrillPromptOptions): string {
+  const useAskUserQuestion = Boolean(options?.useAskUserQuestion);
+  const deliverySection = useAskUserQuestion
+    ? [
+        "### How to Ask Each Round (`pi__ask_user_question`)",
+        "- Present each frontier round by calling `pi__ask_user_question` through the Pi MCP bridge (1–4 independent frontier questions per call; if more than 4 are unblocked, pick the 4 highest-leverage ones first).",
+        "- Give every question 2–4 distinct options (`header` <= 16 chars, `label` <= 60 chars, concise `description` explaining trade-offs).",
+        "- Put your recommended option **first** and append `(Recommended)` to its `label`.",
+        "- Use `multiSelect: true` when multiple choices can apply together, or `preview` (single-select only) when comparing concrete snippets, layouts, or schemas helps.",
+        '- Do NOT author `"Other"` or `"Type something."` options yourself — Pi appends a custom-answer row automatically.',
+        "- Do NOT call native `ask_question` (headless print mode cannot render native TUI prompts). If the user dismisses the questionnaire or replies in chat instead, continue seamlessly from their message.",
+      ].join("\n")
+    : [
+        "### How to Ask Each Round (Structured Markdown)",
+        "- Do NOT call native `ask_question` or `pi__ask_user_question` — ask the current frontier round directly in Markdown and **end your turn** to wait for the user's reply.",
+        "- Keep each round focused (1–4 currently unblocked frontier questions), separated by `---`, using this exact scannable layout:",
+        "",
+        "❓ **Q1** - **<short title>**: <concise question and key trade-off>",
+        "",
+        '➡️ *Recommended*: <your concrete recommendation and brief rationale — worded so replying `"yes"` accepts it>',
+      ].join("\n");
+
+  return [
+    "<GRILL_ME>",
+    "Interview the user relentlessly about every aspect of this plan, idea, or design until you reach a shared understanding.",
+    "Walk down each branch of the design tree, resolving dependencies between decisions before moving to downstream choices.",
+    "",
+    "### Frontier Rounds",
+    "- Treat the design as a dependency graph of decisions. The **frontier** is the set of questions whose upstream dependencies are already settled.",
+    "- Ask **all currently unblocked frontier questions** together in one round, wait for the user's answers, fold them in, and advance to the newly unlocked frontier in the next round.",
+    "- Never speculate on downstream questions whose framing depends on an undecided upstream choice.",
+    "",
+    "### Facts vs. Decisions",
+    "- **Explore the codebase first**: if a question can be answered by reading files, searching symbols, or inspecting configs in the workspace, check the codebase yourself using your read/search tools instead of asking the user.",
+    "- **Ask the user only what code cannot decide**: product intent, scope boundaries, UX/behavior trade-offs, and architectural preferences.",
+    "- Always lead with your concrete recommendation for every question so the user never faces a blank slate.",
+    "",
+    deliverySection,
+    "",
+    "### Hard Gate & Completion",
+    "- **Do NOT act yet**: while interviewing, do NOT edit/write project files, run state-changing commands, spawn coding subagents, or implement anything unless the user explicitly tells you to stop interviewing and execute immediately.",
+    `- Do NOT include \`${GRILL_COMPLETE_MARKER}\` while any frontier questions remain unanswered.`,
+    `- Once the frontier is empty and shared understanding is reached, present a concise summary of the agreed design/plan, ask the user to confirm before you act, and include \`${GRILL_COMPLETE_MARKER}\` at the end of your response (or if the user explicitly asks to skip remaining questions and implement right now, include \`${GRILL_COMPLETE_MARKER}\` and proceed).`,
+    "</GRILL_ME>",
+  ].join("\n");
+}
+
+/**
+ * Compact continuation reminder for follow-up turns in an active `<GRILL_ME>` session
+ * (e.g. Markdown rounds or free-form chat replies).
+ */
+export function buildGrillMeContinuationPrompt(options?: GrillPromptOptions): string {
+  const deliveryHint = options?.useAskUserQuestion
+    ? "Ask the next round of unblocked frontier questions via `pi__ask_user_question` (1–4 questions, recommended option first with `(Recommended)`, no manual `Other` option; never call native `ask_question`)."
+    : 'Ask the next round of unblocked frontier questions directly in Markdown (`❓ **Q1** - **<title>**: ...` + `➡️ *Recommended*: ...`, separated by `---`; never call `ask_question` or `pi__ask_user_question`) and end your turn.';
+  return (
+    "[System note: Continue `<GRILL_ME>` design interview mode. Fold the user's answers into your understanding, inspect workspace files yourself for any factual questions, and check whether new frontier branches unlocked. " +
+    `${deliveryHint} ` +
+    `Do NOT edit files or implement yet unless the user explicitly instructs you in this message to stop interviewing and execute immediately (in which case include \`${GRILL_COMPLETE_MARKER}\` and proceed). ` +
+    `When no frontier questions remain, present the concise agreed-plan summary, ask for confirmation to proceed, and include \`${GRILL_COMPLETE_MARKER}\` at the end of your response.]`
+  );
+}
+
+/**
+ * Directive injected on turns after `<GRILL_ME>` completes or is turned off so
+ * agy's persisted trajectory lifts the interview-only restriction immediately.
+ */
+export const GRILL_DEACTIVATED_PROMPT =
+  "[System note: Grill interview mode (`<GRILL_ME>`) is now OFF for this turn, superseding earlier interview-only restrictions in this conversation. " +
+  "You may now act directly on the user's request — edit files, run commands, and implement the agreed design using your available tools.]";
+
+export function inspectGrillResponseMarker(text: string): boolean {
+  return Boolean(text && text.includes(GRILL_COMPLETE_MARKER));
+}
+
 

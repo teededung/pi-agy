@@ -11,6 +11,7 @@ Use **Google Antigravity** (`agy`) models inside the [pi coding agent](https://p
   - [Consult another model (`/m`)](#consult-another-model-m)
   - [Boost mode (`/boost`)](#boost-mode-boost)
   - [Teamwork mode (`/teamwork`)](#teamwork-mode-teamwork)
+  - [Grill mode (`/grill-me`)](#grill-mode-grill-me)
   - [Side conversations (`/btw`)](#side-conversations-btw)
   - [Pi tools mode (`/agy-tools`)](#pi-tools-mode-agy-tools)
   - [Private MCP discovery](#private-mcp-discovery)
@@ -43,6 +44,7 @@ pi update git:github.com/teededung/pi-agy
 | **Persistent stream driver** | Ordinary user turns reuse one healthy `agy` process. Conversation, model, workspace, agent, mode, and bridge changes recycle it safely. |
 | **One-shot consult** (`/m`) | Ask another Antigravity model or any configured Pi `provider/model` at another thinking effort for a single turn without changing your session model. |
 | **Boost & Teamwork** (`/boost`, `/teamwork`) | Multi-agent orchestration with `DeepCoder` / `DeepInvestigator` subagents (`/boost`), or two-phase collaborative planning and autonomous team execution (`/teamwork`). |
+| **Grill mode** (`/grill-me`, `/grill`) | Relentless design-tree interviewing in dependency-ordered frontier rounds — automatically using `pi__ask_user_question` TUI cards when available or structured Markdown rounds otherwise. |
 | **Side conversations** (`/btw`) | Non-blocking side thread overlay (`Esc` / `Alt+m` to minimize) that runs in an isolated runtime without interrupting or polluting the main session. |
 | **Live thinking stream** (`/clear`) | Real-time reasoning traces from agy's state database. `/clear` resets the agy conversation and the Pi session together. |
 | **Diagnostics** (`/agy-doctor`) | Executable selection, version checks, driver counters, bridge revision, and conversation database, without spending model tokens. |
@@ -63,6 +65,7 @@ pi update git:github.com/teededung/pi-agy
 | `/agy-boost` | Alias for `/boost` |
 | `/teamwork` | Toggle Teamwork two-phase multi-agent mode (`prompt_draft.md` crafting → `teamwork_preview` orchestration), or start a project (`/teamwork <idea>`) |
 | `/agy-teamwork` | Alias for `/teamwork` |
+| `/grill-me [plan]` | Stress-test a plan or design via dependency-ordered frontier interview rounds (`/grill-me` toggles; `on` / `off` / `status`; aliases `/grill`, `/agy-grill`) |
 | `/btw [prompt]` | Open or ask in a non-blocking side-conversation overlay (alias `/side`, subcommands `/btw:model`, `/btw:thinking`, `/btw:copy`, `/btw:new`) |
 | `/clear [prompt]` | Clear the agy conversation and start a fresh Pi session (optionally sending an initial prompt) |
 | `/rename [name]` | Set or view the session display name (alias for `/name`, immediately synced to agy conversation metadata) |
@@ -116,6 +119,17 @@ Port of Antigravity's native `/teamwork` two-phase workflow:
 2. **Phase 2 — Autonomous team orchestration**: Once approved, delegates across specialized teammates (`define_subagent` / `invoke_subagent`) to implement and verify the plan end-to-end.
 
 Use `/teamwork <idea>` to start a project, or `/teamwork` (`on` / `off` / `status`) to control session-wide Teamwork mode (`[teamwork]` in the status bar).
+
+### Grill mode (`/grill-me`)
+
+Stress-tests a plan, idea, or design before any code is written:
+
+- **Frontier rounds**: Walks the design tree in dependency order — asking all currently unblocked frontier questions in one round before moving to downstream choices.
+- **Codebase-first facts**: Inspects workspace files directly for factual questions and asks you only about intent, scope, and trade-offs, always leading with a recommended answer.
+- **Zero-dependency adaptive UI**: Uses interactive `pi__ask_user_question` TUI cards when `ask_user_question` is active on the Pi bridge, and automatically falls back to scannable Markdown (`❓ **Q1**` + `➡️ *Recommended*:`) when `ask_user_question` is not installed or `pi-tools` is off.
+- **Hard gate**: Blocks premature implementation until shared understanding is reached (`<!-- GRILL_COMPLETE -->`), then lifts the gate automatically on your next reply.
+
+Use `/grill-me <plan>` (or `/grill <plan>`, `/agy-grill <plan>`) to start an interview, or `/grill-me` (`on` / `off` / `status`) to toggle session Grill mode (`[grill]` in the status bar).
 
 ### Side conversations (`/btw`)
 

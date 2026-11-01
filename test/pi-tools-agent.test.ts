@@ -59,6 +59,7 @@ import {
 } from "../lib/models.ts";
 import {
   contextHasPriorBoostActivity,
+  contextHasPriorGrillActivity,
   contextHasPriorTeamworkActivity,
   isBridgedMcpStep,
   latestUserPrompt,
@@ -69,12 +70,17 @@ import {
 } from "../src/provider.ts";
 import {
   buildGoalContinuationPrompt,
+  buildGrillMeContinuationPrompt,
+  buildGrillMePrompt,
   decideGoalSettlement,
   formatGoalElapsed,
   GOAL_CANCELLED_MARKER,
   GOAL_COMPLETE_MARKER,
   GOAL_INITIAL_PROMPT,
+  GRILL_COMPLETE_MARKER,
+  GRILL_DEACTIVATED_PROMPT,
   inspectGoalResponseMarkers,
+  inspectGrillResponseMarker,
 } from "../lib/prompt.ts";
 import { AgyPiBridge } from "../lib/bridge.ts";
 import { AgyReplayStore } from "../lib/replay.ts";
@@ -1973,6 +1979,180 @@ test("readAgySubagentProgressLog numbers parallel tool calls and strips agy edit
   assert.match(rendered, /-100 \/\/npc: OctopusCave/);
   assert.match(rendered, /\+100 npc: OctopusCave_vi/);
   assert.match(rendered, /created file/);
+});
+
+test("/grill-me adapts between pi__ask_user_question and Markdown fallback, continues across rounds, and lifts the gate on completion", async (t) => {
+  // 1. Prompt helpers & marker detection
+  const tuiPrompt = buildGrillMePrompt({ useAskUserQuestion: true });
+  assert.match(tuiPrompt, /<GRILL_ME>/);
+  assert.match(tuiPrompt, /pi__ask_user_question/);
+  assert.match(tuiPrompt, /Do NOT call native `ask_question`/);
+  assert.doesNotMatch(tuiPrompt, /❓ \*\*Q1\*\*/);
+
+  const mdPrompt = buildGrillMePrompt({ useAskUserQuestion: false });
+  assert.match(mdPrompt, /<GRILL_ME>/);
+  assert.match(mdPrompt, /❓ \*\*Q1\*\*/);
+  assert.match(mdPrompt, /➡️ \*Recommended\*/);
+  assert.match(mdPrompt, /Do NOT call native `ask_question` or `pi__ask_user_question`/);
+
+  assert.match(buildGrillMeContinuationPrompt({ useAskUserQuestion: true }), /pi__ask_user_question/);
+  assert.match(buildGrillMeContinuationPrompt({ useAskUserQuestion: false }), /❓ \*\*Q1\*\*/);
+  assert.equal(inspectGrillResponseMarker("Still interviewing..."), false);
+  assert.equal(
+    inspectGrillResponseMarker(`Agreed plan summary.\n${GRILL_COMPLETE_MARKER}`),
+    true,
+  );
+  assert.equal(
+    contextHasPriorGrillActivity([
+      { role: "user", content: "/grill build a rate limiter", timestamp: 1 },
+    ]),
+    true,
+  );
+
+  // 2. End-to-end provider stream:
+  //    a) Without ask_user_question bridged (e.g. another user without rpiv-ask-user-question) -> Markdown fallback
+  //    b) With ask_user_question bridged in pi-tools mode -> pi__ask_user_question
+  //    c) Round 2 continuation -> buildGrillMeContinuationPrompt until <!-- GRILL_COMPLETE -->
+  //    d) Post-completion turn -> GRILL_DEACTIVATED_PROMPT lifts interview-only gate
+  const capturedPrompts: string[] = [];
+  let responseForTurn = "Round 1 questions...";
+  const runtime = createAntigravityRuntime(async (request) => {
+    capturedPrompts.push(request.prompt);
+    request.onConversation?.("conv-grill");
+    const activity = {
+      type: "result" as const,
+      status: "OK" as const,
+      response: responseForTurn,
+      usage: { input_tokens: 20, output_tokens: 10, total_tokens: 30 },
+    };
+    request.onActivity?.(activity);
+    return {
+      conversationId: "conv-grill",
+      status: "OK",
+      response: responseForTurn,
+      activities: [activity],
+      usage: activity.usage,
+      finished: true,
+    };
+  });
+  t.after(() => runtime.dispose());
+
+  const service = runtime.runSync(AntigravityRuntime);
+  const bridge = new AgyPiBridge("pi-grill-test");
+  let exposeAskUserQuestion = false;
+  bridge.setToolSource(() =>
+    exposeAskUserQuestion
+      ? [{ name: "ask_user_question", description: "Ask user", parameters: {} }]
+      : [{ name: "read", description: "Read file", parameters: {} }],
+  );
+
+  let grillActive = true;
+  const settled: Array<AgySettledTurnOutcome | undefined> = [];
+  const streamFn = streamAntigravity(
+    runtime,
+    service,
+    new AgyReplayStore(),
+    bridge,
+    (outcome) => {
+      settled.push(outcome);
+      if (grillActive && inspectGrillResponseMarker(outcome?.responseText ?? "")) {
+        grillActive = false;
+      }
+    },
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    () => ({ agent: "pi-tools-test" }),
+    () => "rev-1",
+    undefined,
+    () => false,
+    undefined,
+    undefined,
+    undefined,
+    () => false,
+    undefined,
+    () => false,
+    undefined,
+    () => grillActive,
+  );
+
+  const model = {
+    id: "gemini-4-argon",
+    name: "Gemini",
+    api: "antigravity-stream-json",
+    provider: "antigravity",
+    baseUrl: "agy://local-stream-json",
+    reasoning: true,
+    input: ["text", "image"] as ("text" | "image")[],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 1_000_000,
+    maxTokens: 64_000,
+  };
+
+  // Turn 1: user has NO ask_user_question package installed -> Markdown fallback
+  exposeAskUserQuestion = false;
+  responseForTurn = "❓ **Q1** - **Storage**: Redis or in-memory?\n\n➡️ *Recommended*: Redis";
+  for await (const _ev of streamFn(model, {
+    messages: [{ role: "user", content: "/grill-me Design a webhook retry queue", timestamp: 1 }],
+  } as unknown as Parameters<typeof streamFn>[1])) {
+    // consume
+  }
+  assert.equal(grillActive, true);
+  assert.match(capturedPrompts[0]!, /<GRILL_ME>/);
+  assert.match(capturedPrompts[0]!, /❓ \*\*Q1\*\*/);
+  assert.match(capturedPrompts[0]!, /Design a webhook retry queue$/);
+  assert.equal(bridge.hasTool("ask_user_question"), false);
+
+  // Turn 2: user answers Q1 while ask_user_question IS bridged -> continuation uses pi__ask_user_question and finishes with <!-- GRILL_COMPLETE -->
+  exposeAskUserQuestion = true;
+  responseForTurn = `Here is the agreed design summary. Ready to implement?\n${GRILL_COMPLETE_MARKER}`;
+  for await (const _ev of streamFn(model, {
+    messages: [
+      { role: "user", content: "/grill-me Design a webhook retry queue", timestamp: 1 },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "❓ **Q1** - **Storage**: Redis?" }],
+        api: model.api,
+        provider: model.provider,
+        model: model.id,
+        usage: mapUsage(undefined),
+        stopReason: "stop",
+        timestamp: 2,
+      },
+      { role: "user", content: "yes", timestamp: 3 },
+    ],
+  } as unknown as Parameters<typeof streamFn>[1])) {
+    // consume
+  }
+  assert.equal(bridge.hasTool("ask_user_question"), true);
+  assert.match(capturedPrompts[1]!, /Continue `<GRILL_ME>` design interview mode/);
+  assert.match(capturedPrompts[1]!, /pi__ask_user_question/);
+  assert.equal(grillActive, false);
+
+  // Turn 3: user confirms implementation -> GRILL_DEACTIVATED_PROMPT lifts the interview-only gate
+  responseForTurn = "Implementing the webhook retry queue now.";
+  for await (const _ev of streamFn(model, {
+    messages: [
+      { role: "user", content: "/grill-me Design a webhook retry queue", timestamp: 1 },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: `Summary\n${GRILL_COMPLETE_MARKER}` }],
+        api: model.api,
+        provider: model.provider,
+        model: model.id,
+        usage: mapUsage(undefined),
+        stopReason: "stop",
+        timestamp: 2,
+      },
+      { role: "user", content: "yes, implement it", timestamp: 4 },
+    ],
+  } as unknown as Parameters<typeof streamFn>[1])) {
+    // consume
+  }
+  assert.ok(capturedPrompts[2]!.startsWith(GRILL_DEACTIVATED_PROMPT));
+  assert.match(capturedPrompts[2]!, /yes, implement it$/);
 });
 
 

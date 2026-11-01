@@ -168,6 +168,11 @@ export class AgyPiBridge {
     return this.#updateCatalogRevision();
   }
 
+  /** True when `name` (unprefixed Pi tool name) is currently exposed on the bridge. */
+  hasTool(name: string): boolean {
+    return this.#tools.some((tool) => tool.name === name) || this.#dynamic.has(name);
+  }
+
   get catalogRevision(): number {
     return this.#catalogRevision;
   }

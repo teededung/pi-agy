@@ -8,6 +8,7 @@
 //   /m              one-shot model consult: /m <opus|sonnet|argon|flash>[1|2|3] <prompt>
 //   /boost          toggle Boost multi-agent mode or run a task with orchestration
 //   /teamwork       toggle Teamwork two-phase multi-agent mode or start a project
+//   /grill-me       stress-test a plan or design via frontier-round interviews
 //   /agy            show agy conversation and persistent-driver status
 //   /agy-tools      toggle Pi tools on/off or show the current mode
 //   /agy-footer     toggle 2-row custom footer on/off or show status
@@ -19,6 +20,7 @@
 //   /agy-usage      show Antigravity model quotas (weekly and 5-hour limits)
 //   /agy-boost      alias for /boost
 //   /agy-teamwork   alias for /teamwork
+//   /grill          alias for /grill-me (also /agy-grill)
 //   /consult        alias for /m
 //   /clear          clear agy conversation and start a new Pi session
 //   /rename         alias for /name (set session display name and sync to agy)
@@ -157,6 +159,7 @@ import {
   buildGoalContinuationPrompt,
   decideGoalSettlement,
   formatGoalElapsed,
+  inspectGrillResponseMarker,
   MAX_GOAL_CONTINUATIONS,
   WRAPPER_TOOL_DESCRIPTION,
   WRAPPER_TOOL_NAME,
@@ -552,6 +555,8 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   let oneShotBoost = false;
   let sessionTeamworkMode = false;
   let oneShotTeamwork = false;
+  let sessionGrillMode = false;
+  let oneShotGrill = false;
   let teamworkLaunchedThisTurn = false;
   let subagentSpawnedThisTurn = false;
   let lastSettledSpawnedSubagent = false;
@@ -584,6 +589,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   const isBoostActive = (): boolean =>
     sessionBoostMode || oneShotBoost || Boolean(activeGoal?.boost);
   const isTeamworkActive = (): boolean => sessionTeamworkMode || oneShotTeamwork;
+  const isGrillActive = (): boolean => sessionGrillMode || oneShotGrill;
   const isGoalActive = (): boolean => Boolean(activeGoal);
   const getOneShotConsult = (): OneShotConsultOverride | undefined => oneShotConsult;
 
@@ -597,6 +603,10 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       ui.setStatus(
         "agy-teamwork",
         isTeamworkActive() ? ui.theme.fg("accent", "[teamwork]\u00A0") : undefined,
+      );
+      ui.setStatus(
+        "agy-grill",
+        isGrillActive() ? ui.theme.fg("accent", "[grill]\u00A0") : undefined,
       );
       ui.setStatus(
         "agy-goal",
@@ -1605,11 +1615,17 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
           subagentSpawnedThisTurn = false;
           const hadOneShotBoost = oneShotBoost;
           oneShotBoost = false;
-          if (hadOneShotBoost || teamworkLaunchedThisTurn) {
+          const grillCompleted =
+            isGrillActive() && inspectGrillResponseMarker(outcome?.responseText ?? "");
+          if (hadOneShotBoost || teamworkLaunchedThisTurn || grillCompleted) {
             if (teamworkLaunchedThisTurn) {
               teamworkLaunchedThisTurn = false;
               oneShotTeamwork = false;
               sessionTeamworkMode = false;
+            }
+            if (grillCompleted) {
+              oneShotGrill = false;
+              sessionGrillMode = false;
             }
             updateOrchestrationStatus(tasksUi);
           }
@@ -1639,6 +1655,8 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
             : undefined,
         isGoalActive,
         (request, options) => {
+          sessionGrillMode = false;
+          oneShotGrill = false;
           if (!activeGoal || activeGoal.request !== request) {
             activeGoal = {
               request,
@@ -1651,6 +1669,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
           }
           updateOrchestrationStatus(tasksUi);
         },
+        isGrillActive,
       ),
     });
   };
@@ -1788,11 +1807,25 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     subagentSpawnedThisTurn = false;
     const hadOneShotBoost = oneShotBoost;
     oneShotBoost = false;
-    if (hadOneShotBoost || teamworkLaunchedThisTurn) {
+    let grillCompleted = false;
+    if (isGrillActive()) {
+      const branchProbe = probeCtx(() => ctx.sessionManager.getBranch());
+      const branchInfo = collectLatestTurnAssistantInfo(
+        branchProbe.stale ? undefined : branchProbe.value,
+      );
+      grillCompleted = inspectGrillResponseMarker(
+        branchInfo.text || settledOutcome?.responseText || "",
+      );
+    }
+    if (hadOneShotBoost || teamworkLaunchedThisTurn || grillCompleted) {
       if (teamworkLaunchedThisTurn) {
         teamworkLaunchedThisTurn = false;
         oneShotTeamwork = false;
         sessionTeamworkMode = false;
+      }
+      if (grillCompleted) {
+        oneShotGrill = false;
+        sessionGrillMode = false;
       }
       const ui = probeCtx(() => ctx.ui);
       if (!ui.stale && ui.value) updateOrchestrationStatus(ui.value);
@@ -1904,6 +1937,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     lastConsultUsed = undefined;
     oneShotBoost = false;
     oneShotTeamwork = false;
+    oneShotGrill = false;
     teamworkLaunchedThisTurn = false;
     activeGoal = undefined;
     lastSettledOutcome = undefined;
@@ -1911,6 +1945,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     if (event.reason === "new") {
       sessionBoostMode = false;
       sessionTeamworkMode = false;
+      sessionGrillMode = false;
     }
     ensureSessionNamePolling();
     syncWrapperToolActivation(ctx.model?.provider);
@@ -2026,6 +2061,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         try {
           ui.value.setStatus("agy-boost", undefined);
           ui.value.setStatus("agy-teamwork", undefined);
+          ui.value.setStatus("agy-grill", undefined);
           ui.value.setStatus("agy-goal", undefined);
           ui.value.setStatus("agy-consult", undefined);
         } catch {
@@ -2152,6 +2188,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       tasksUi?.setWidget(AGY_ARTIFACTS_WIDGET_KEY, undefined);
       tasksUi?.setStatus("agy-boost", undefined);
       tasksUi?.setStatus("agy-teamwork", undefined);
+      tasksUi?.setStatus("agy-grill", undefined);
       tasksUi?.setStatus("agy-consult", undefined);
     } catch {
       // UI may already be gone.
@@ -2213,7 +2250,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       if (action === "footer") return handleAgyFooterCommand(rest.join(" "), ctx);
       if (args.trim()) {
         ctx.ui.notify(
-          'antigravity: use "/agy-tools", "/agy-footer", "/m", "/boost", "/teamwork", "/agy-reset", "/agy-models", "/agy-agents", "/agy-doctor", "/agy-subagents", "/agy-tasks", "/agy-artifacts", or "/agy-usage".',
+          'antigravity: use "/agy-tools", "/agy-footer", "/m", "/boost", "/teamwork", "/grill-me", "/agy-reset", "/agy-models", "/agy-agents", "/agy-doctor", "/agy-subagents", "/agy-tasks", "/agy-artifacts", or "/agy-usage".',
           "error",
         );
         return;
@@ -2246,7 +2283,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       try {
         const configured = readAgyProcessProfile();
         const agent = getToolMode() === "pi" ? piToolsAgent.name : configured.agent;
-        const boostState = ` · boost: ${sessionBoostMode ? "ON" : "OFF"} · teamwork: ${isTeamworkActive() ? "ON" : "OFF"}`;
+        const boostState = ` · boost: ${sessionBoostMode ? "ON" : "OFF"} · teamwork: ${isTeamworkActive() ? "ON" : "OFF"} · grill: ${isGrillActive() ? "ON" : "OFF"}`;
         profile = `agent: ${agent ?? "none"} · mode: ${configured.mode ?? "default"} · tools: ${getToolMode()} · footer: ${getFooterMode()}${boostState}`;
       } catch (error) {
         profile = `profile error: ${error instanceof Error ? error.message : String(error)}`;
@@ -2414,8 +2451,10 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       detachConversationMetadata(previousConversationId);
       oneShotBoost = false;
       oneShotTeamwork = false;
+      oneShotGrill = false;
       teamworkLaunchedThisTurn = false;
       sessionTeamworkMode = false;
+      sessionGrillMode = false;
       activeGoal = undefined;
       updateOrchestrationStatus(ctx.ui);
       subagentRoster.clear();
@@ -2435,8 +2474,10 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       detachConversationMetadata(previousConversationId);
       oneShotBoost = false;
       oneShotTeamwork = false;
+      oneShotGrill = false;
       teamworkLaunchedThisTurn = false;
       sessionTeamworkMode = false;
+      sessionGrillMode = false;
       activeGoal = undefined;
       updateOrchestrationStatus(ctx.ui);
       subagentRoster.clear();
@@ -2873,6 +2914,8 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         if (next) {
           sessionTeamworkMode = false;
           oneShotTeamwork = false;
+          sessionGrillMode = false;
+          oneShotGrill = false;
         }
       } else {
         sessionTeamworkMode = next;
@@ -2880,6 +2923,8 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         if (next) {
           sessionBoostMode = false;
           oneShotBoost = false;
+          sessionGrillMode = false;
+          oneShotGrill = false;
           if (activeGoal) activeGoal.boost = false;
         }
       }
@@ -2911,6 +2956,8 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       oneShotBoost = true;
       sessionTeamworkMode = false;
       oneShotTeamwork = false;
+      sessionGrillMode = false;
+      oneShotGrill = false;
       updateOrchestrationStatus(ctx.ui);
       if (ctx.isIdle()) {
         pi.sendUserMessage(`/boost ${trimmed}`);
@@ -2926,6 +2973,8 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     oneShotTeamwork = true;
     sessionBoostMode = false;
     oneShotBoost = false;
+    sessionGrillMode = false;
+    oneShotGrill = false;
     updateOrchestrationStatus(ctx.ui);
     if (ctx.isIdle()) {
       pi.sendUserMessage(`/teamwork ${trimmed}`);
@@ -2940,6 +2989,59 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   };
   const handleTeamworkCommand = async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
     handleOrchestrationCommand("teamwork", args, ctx);
+  };
+
+  const handleGrillCommand = async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
+    const trimmed = args.trim();
+    const enabledMessage =
+      "Grill mode enabled — share a plan or idea to start frontier-round design interviewing (/grill-me off to exit).";
+    const setActive = (next: boolean) => {
+      sessionGrillMode = next;
+      if (!next) oneShotGrill = false;
+      if (next) {
+        sessionBoostMode = false;
+        oneShotBoost = false;
+        sessionTeamworkMode = false;
+        oneShotTeamwork = false;
+        if (activeGoal) activeGoal.boost = false;
+      }
+      updateOrchestrationStatus(ctx.ui);
+    };
+
+    if (!trimmed) {
+      const next = !isGrillActive();
+      setActive(next);
+      ctx.ui.notify(next ? enabledMessage : "Grill mode disabled.", "info");
+      return;
+    }
+    if (/^(on|enable|true)$/i.test(trimmed)) {
+      setActive(true);
+      ctx.ui.notify(enabledMessage, "info");
+      return;
+    }
+    if (/^(off|disable|false)$/i.test(trimmed)) {
+      setActive(false);
+      ctx.ui.notify("Grill mode disabled.", "info");
+      return;
+    }
+    if (/^status$/i.test(trimmed)) {
+      ctx.ui.notify(`Grill mode is currently ${isGrillActive() ? "ON" : "OFF"}.`, "info");
+      return;
+    }
+
+    // Keep oneShotGrill active across frontier Q&A rounds until <!-- GRILL_COMPLETE --> settles.
+    oneShotGrill = true;
+    sessionBoostMode = false;
+    oneShotBoost = false;
+    sessionTeamworkMode = false;
+    oneShotTeamwork = false;
+    updateOrchestrationStatus(ctx.ui);
+    if (ctx.isIdle()) {
+      pi.sendUserMessage(`/grill-me ${trimmed}`);
+    } else {
+      pi.sendUserMessage(`/grill-me ${trimmed}`, { deliverAs: "followUp" });
+      ctx.ui.notify("Grill interview queued as follow-up.", "info");
+    }
   };
 
   pi.registerCommand("boost", {
@@ -2966,6 +3068,27 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       "Toggle Teamwork two-phase multi-agent mode or start a project with teamwork_preview orchestration (alias for /teamwork)",
     getArgumentCompletions: toggleCommandCompletions,
     handler: handleTeamworkCommand,
+  });
+
+  pi.registerCommand("grill-me", {
+    description:
+      "Stress-test a plan or design through dependency-ordered frontier interview rounds (/grill-me [plan|on|off|status])",
+    getArgumentCompletions: toggleCommandCompletions,
+    handler: handleGrillCommand,
+  });
+
+  pi.registerCommand("grill", {
+    description:
+      "Stress-test a plan or design through dependency-ordered frontier interview rounds (alias for /grill-me)",
+    getArgumentCompletions: toggleCommandCompletions,
+    handler: handleGrillCommand,
+  });
+
+  pi.registerCommand("agy-grill", {
+    description:
+      "Stress-test a plan or design through dependency-ordered frontier interview rounds (alias for /grill-me)",
+    getArgumentCompletions: toggleCommandCompletions,
+    handler: handleGrillCommand,
   });
 
   const goalCommandCompletions = (prefix: string) =>
@@ -3000,6 +3123,8 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     const wantsBoost = /^\/(?:agy-)?boost\b/i.test(trimmed);
     const cleanRequest = trimmed.replace(/^\/(?:agy-)?boost\s*/i, "").trim() || trimmed;
     if (ctx.isIdle()) {
+      sessionGrillMode = false;
+      oneShotGrill = false;
       activeGoal = {
         request: cleanRequest,
         startedAt: Date.now(),
