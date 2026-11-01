@@ -340,18 +340,64 @@ export function extractAgyConversationIdsFromSessionFile(
   sessionFilePath: string | undefined,
 ): string[] {
   if (!sessionFilePath || !existsSync(sessionFilePath)) return [];
-  const ids = new Set<string>();
+  const ownedIds = new Set<string>();
+  const unscopedIds = new Set<string>();
+  let headerSessionId: string | undefined;
+  let sawScopedEntry = false;
+
   try {
     const content = readFileSync(sessionFilePath, "utf-8");
-    const regex = /"conversationId"\s*:\s*"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"/g;
-    let match: RegExpExecArray | null;
-    while ((match = regex.exec(content)) !== null) {
-      if (match[1]) ids.add(match[1].toLowerCase());
+    const lines = content.split(/\r?\n/);
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line) continue;
+      try {
+        const parsed = record(JSON.parse(line));
+        if (!parsed) continue;
+        if (parsed.type === "session" && typeof parsed.id === "string" && parsed.id.trim()) {
+          headerSessionId = parsed.id.trim();
+          continue;
+        }
+        if (
+          parsed.type === "custom" &&
+          (parsed.customType === "pi-agy-conversation-state" ||
+            parsed.customType === "pi-antigravity-conversation-state")
+        ) {
+          const data = record(parsed.data);
+          const cid = typeof data?.conversationId === "string" ? data.conversationId.trim() : "";
+          const entrySessionId =
+            typeof data?.sessionId === "string" ? data.sessionId.trim() : undefined;
+          if (entrySessionId) {
+            sawScopedEntry = true;
+          }
+          if (cid && /^[0-9a-f-]{36}$/i.test(cid)) {
+            if (entrySessionId) {
+              if (!headerSessionId || entrySessionId === headerSessionId) {
+                ownedIds.add(cid.toLowerCase());
+              }
+            } else {
+              unscopedIds.add(cid.toLowerCase());
+            }
+          }
+        }
+      } catch {
+        // Fallback for non-JSONL or malformed lines
+      }
+    }
+
+    if (ownedIds.size === 0 && !sawScopedEntry && !headerSessionId) {
+      const regex =
+        /"conversationId"\s*:\s*"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"/g;
+      let match: RegExpExecArray | null;
+      while ((match = regex.exec(content)) !== null) {
+        if (match[1]) unscopedIds.add(match[1].toLowerCase());
+      }
     }
   } catch {
     // Best-effort
   }
-  return Array.from(ids);
+
+  return Array.from(ownedIds.size > 0 || sawScopedEntry ? ownedIds : unscopedIds);
 }
 
 /**

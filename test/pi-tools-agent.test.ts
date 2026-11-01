@@ -750,6 +750,44 @@ test("installSessionSelectorDeletePatch and deleteAgyConversationsForSessionFile
 
   assert.deepEqual(extractAgyConversationIdsFromSessionFile(sessionPath), [cid]);
 
+  // Forked session inheriting parent's custom entry with parent's sessionId must not extract parent's conversationId
+  const forkedSessionPath = path.join(home, "forked-session.jsonl");
+  const parentCid = "99999999-9999-4999-8999-999999999999";
+  await writeFile(
+    forkedSessionPath,
+    [
+      JSON.stringify({ type: "session", version: 3, id: "forked-session-id", parentSession: sessionPath }),
+      JSON.stringify({
+        type: "custom",
+        customType: "pi-agy-conversation-state",
+        data: { sessionId: "parent-session-id", conversationId: parentCid },
+      }),
+    ].join("\n"),
+    "utf8",
+  );
+  assert.deepEqual(extractAgyConversationIdsFromSessionFile(forkedSessionPath), []);
+
+  // Once the forked session creates its own conversation entry, only the forked session's conversationId is extracted
+  const forkedCid = "88888888-8888-4888-8888-888888888888";
+  await writeFile(
+    forkedSessionPath,
+    [
+      JSON.stringify({ type: "session", version: 3, id: "forked-session-id", parentSession: sessionPath }),
+      JSON.stringify({
+        type: "custom",
+        customType: "pi-agy-conversation-state",
+        data: { sessionId: "parent-session-id", conversationId: parentCid },
+      }),
+      JSON.stringify({
+        type: "custom",
+        customType: "pi-agy-conversation-state",
+        data: { sessionId: "forked-session-id", conversationId: forkedCid },
+      }),
+    ].join("\n"),
+    "utf8",
+  );
+  assert.deepEqual(extractAgyConversationIdsFromSessionFile(forkedSessionPath), [forkedCid]);
+
   const eventsOrder: string[] = [];
   class FakeSessionSelector {
     sessionList = {
