@@ -69,6 +69,7 @@ import {
   type AgySettledTurnOutcome,
 } from "../src/provider.ts";
 import {
+  buildAgyRelayedInstructions,
   buildGoalContinuationPrompt,
   buildGrillMeContinuationPrompt,
   buildGrillMePrompt,
@@ -81,6 +82,7 @@ import {
   GRILL_DEACTIVATED_PROMPT,
   inspectGoalResponseMarkers,
   inspectGrillResponseMarker,
+  stripPiToolInventory,
 } from "../lib/prompt.ts";
 import { AgyPiBridge } from "../lib/bridge.ts";
 import { AgyReplayStore } from "../lib/replay.ts";
@@ -2153,6 +2155,74 @@ test("/grill-me adapts between pi__ask_user_question and Markdown fallback, cont
   }
   assert.ok(capturedPrompts[2]!.startsWith(GRILL_DEACTIVATED_PROMPT));
   assert.match(capturedPrompts[2]!, /yes, implement it$/);
+});
+
+test("stripPiToolInventory strips Pi 1.5.0 <tools>, Pi 1.4.0 <tools>, and legacy Available tools while preserving project_instructions", () => {
+  // Pi 1.5.0 tightened system prompt format
+  const pi150Prompt = [
+    "You are a coding assistant running inside pi, a coding agent harness. Help users inspect files, run commands, and modify code.",
+    "",
+    "<tools>",
+    "- read: Read file contents",
+    "- bash: Execute bash commands (ls, grep, find, etc.)",
+    "- ask_user_question: Ask the user up to 4 structured questions",
+    "",
+    "Additional tools may be available.",
+    "</tools>",
+    "",
+    "<rules>",
+    "- Be concise in your responses",
+    "</rules>",
+    "",
+    '<project_instructions path="/repo/AGENTS.md">',
+    "<tools>",
+    "- terraform: infra tool",
+    "Additional tools may be available.",
+    "</tools>",
+    "</project_instructions>",
+  ].join("\n");
+
+  const stripped150 = stripPiToolInventory(pi150Prompt);
+  assert.doesNotMatch(stripped150, /- ask_user_question:/);
+  assert.match(stripped150, /<rules>/);
+  // Project instructions must remain untouched
+  assert.match(stripped150, /- terraform: infra tool/);
+
+  // Pi 1.4.0 <tools> format
+  const pi140Prompt = [
+    "Preamble",
+    "<tools>",
+    "- read: Read file contents",
+    "",
+    "In addition to the tools above, you may have access to other custom tools depending on the project.",
+    "</tools>",
+    "<cwd>/tmp</cwd>",
+  ].join("\n");
+  const stripped140 = stripPiToolInventory(pi140Prompt);
+  assert.doesNotMatch(stripped140, /<tools>/);
+  assert.match(stripped140, /<cwd>\/tmp<\/cwd>/);
+
+  // Legacy Available tools: format
+  const legacyPrompt = [
+    "Preamble",
+    "Available tools:",
+    "- read: Read file contents",
+    "In addition to the tools above, you may have access to other custom tools.",
+    "After",
+  ].join("\n");
+  const strippedLegacy = stripPiToolInventory(legacyPrompt);
+  assert.doesNotMatch(strippedLegacy, /Available tools:/);
+  assert.match(strippedLegacy, /After/);
+
+  // Relayed docs include Pi 1.5.0 mcp.md and codemode.md references
+  const relayedDocs = buildAgyRelayedInstructions({
+    readme: "/pi/README.md",
+    docs: "/pi/docs",
+    examples: "/pi/examples",
+    cwd: "/work",
+  });
+  assert.match(relayedDocs, /docs\/mcp\.md/);
+  assert.match(relayedDocs, /docs\/codemode\.md/);
 });
 
 

@@ -1586,7 +1586,17 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         const shown = expanded ? outputLines : outputLines.slice(0, maxLines);
         text += `\n${shown.map((line) => theme.fg("toolOutput", line)).join("\n")}`;
         if (!expanded && outputLines.length > maxLines) {
-          text += theme.fg("muted", `\n… +${outputLines.length - maxLines} lines (ctrl+o to expand)`);
+          const expandHint =
+            typeof (context as { keyHint?: unknown }).keyHint === "function"
+              ? (context as { keyHint: (id: string, desc: string) => string }).keyHint(
+                  "app.tools.expand",
+                  "to expand",
+                )
+              : "";
+          text += theme.fg(
+            "muted",
+            `\n… +${outputLines.length - maxLines} lines (${expandHint || "ctrl+o to expand"})`,
+          );
         }
       } else if (isError && !exitSuffix) {
         text += `\n${theme.fg("error", "failed")}`;
@@ -1649,10 +1659,11 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
           if (tasksUi) updateConsultStatus(tasksUi);
         },
         isTeamworkActive,
-        () =>
-          activeSessionCtx
-            ? probeCtx(() => activeSessionCtx?.sessionManager.getBranch()).value
-            : undefined,
+        () => {
+          if (!activeSessionCtx) return undefined;
+          const probedBranch = probeCtx(() => activeSessionCtx?.sessionManager.getBranch());
+          return probedBranch.stale ? undefined : probedBranch.value;
+        },
         isGoalActive,
         (request, options) => {
           sessionGrillMode = false;
@@ -3354,20 +3365,23 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
           currentEffort,
         ) ?? [];
       const prefix = argumentPrefix.trim().toLowerCase();
-      const otherItems = activeSessionCtx
-        ? (probeCtx(() => listOtherPiModels(activeSessionCtx!.modelRegistry)).value ?? [])
-            .map((m) => ({
-              value: `${m.provider}/${m.id} `,
-              label: `${m.provider}/${m.id}`,
-              description: `${m.name || m.id} · pi model`,
-            }))
-            .filter(
-              (item) =>
-                !prefix ||
-                item.label.toLowerCase().includes(prefix) ||
-                item.description.toLowerCase().includes(prefix),
-            )
-        : [];
+      const probedOtherModels = activeSessionCtx
+        ? probeCtx(() => listOtherPiModels(activeSessionCtx!.modelRegistry))
+        : undefined;
+      const otherItems = (
+        probedOtherModels && !probedOtherModels.stale ? probedOtherModels.value : []
+      )
+        .map((m) => ({
+          value: `${m.provider}/${m.id} `,
+          label: `${m.provider}/${m.id}`,
+          description: `${m.name || m.id} · pi model`,
+        }))
+        .filter(
+          (item) =>
+            !prefix ||
+            item.label.toLowerCase().includes(prefix) ||
+            item.description.toLowerCase().includes(prefix),
+        );
       if (argumentPrefix.includes(" ")) return null;
       const all = [...agyItems, ...otherItems];
       return all.length > 0 ? all : null;

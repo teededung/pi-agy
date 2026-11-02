@@ -100,31 +100,63 @@ export function attachedImagesPrompt(imagePaths: readonly string[]): string {
  * the block appears before any project-context section, every line in it is a
  * `- name: description` bullet, and it ends with Pi's own trailing caveat.
  */
+const PI_TOOL_CAVEAT_RE =
+  /^(?:In addition to the tools above\b|Additional tools may be available\.)/;
+const PI_TOOL_BULLET_RE = /^(?:-\s+\w[\w.[\]-]*:\s+\S|\(none\)\s*$)/;
+
 export function stripPiToolInventory(instructions: string): string {
   const lines = instructions.split("\n");
-  const start = lines.findIndex((line) => /^Available tools:\s*$/.test(line));
-  if (start < 0) return instructions;
-
   // Project instructions are relayed verbatim; never edit inside them.
   const projectStart = lines.findIndex((line) =>
     /^\s*<(project_context|project_instructions)\b/.test(line),
   );
-  if (projectStart >= 0 && start > projectStart) return instructions;
+
+  // Structured Pi 1.4+ / 1.5+ `<tools>...</tools>` section.
+  const xmlStart = lines.findIndex((line) => /^<tools>\s*$/.test(line));
+  if (xmlStart >= 0 && (projectStart < 0 || xmlStart < projectStart)) {
+    const xmlEnd = lines.findIndex(
+      (line, idx) =>
+        idx > xmlStart &&
+        (projectStart < 0 || idx < projectStart) &&
+        /^<\/tools>\s*$/.test(line),
+    );
+    if (xmlEnd > xmlStart) {
+      const innerNonEmpty = lines
+        .slice(xmlStart + 1, xmlEnd)
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0);
+      const caveatLine = innerNonEmpty.at(-1) ?? "";
+      const bodyLines = innerNonEmpty.slice(0, -1);
+      if (
+        bodyLines.length > 0 &&
+        PI_TOOL_CAVEAT_RE.test(caveatLine) &&
+        bodyLines.every((line) => PI_TOOL_BULLET_RE.test(line))
+      ) {
+        const kept = [...lines.slice(0, xmlStart), ...lines.slice(xmlEnd + 1)];
+        return kept
+          .join("\n")
+          .replace(/\n{3,}/g, "\n\n")
+          .trim();
+      }
+    }
+  }
+
+  // Legacy `Available tools:` block (Pi <= 1.3).
+  const start = lines.findIndex((line) => /^Available tools:\s*$/.test(line));
+  if (start < 0 || (projectStart >= 0 && start > projectStart)) return instructions;
 
   let end = start + 1;
   let bullets = 0;
   for (; end < lines.length; end += 1) {
-    const line = lines[end];
+    const line = lines[end]!;
     if (line.trim() === "") continue;
-    // Pi renders each builtin as "- name: description" (names may hyphenate).
-    if (/^-\s+\w[\w.[\]-]*:\s+\S/.test(line)) {
+    if (PI_TOOL_BULLET_RE.test(line.trim())) {
       bullets += 1;
       continue;
     }
     break;
   }
-  // The block must be closed by Pi's own caveat, and must have listed tools.
-  if (bullets === 0 || !/^In addition to the tools above/.test(lines[end] ?? "")) {
+  if (bullets === 0 || !PI_TOOL_CAVEAT_RE.test((lines[end] ?? "").trim())) {
     return instructions;
   }
 
@@ -160,14 +192,13 @@ export interface PiDocsPaths {
 export function buildAgyRelayedInstructions(piDocs: PiDocsPaths): string {
   return [
     ...(piDocs.cwd ? [`Current working directory: ${piDocs.cwd}`, ""] : []),
-    "Pi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):",
+    "Pi documentation (read only when the user asks about the harness itself, its SDK, extensions, themes, skills, or TUI):",
     `- Main documentation: ${piDocs.readme}`,
     `- Additional docs: ${piDocs.docs}`,
     `- Examples: ${piDocs.examples} (extensions, custom tools, SDK)`,
     "- When reading pi docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory",
-    "- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), pi packages (docs/packages.md), environment variables (docs/environment-variables.md)",
-    "- When working on pi topics, read the docs and examples, and follow .md cross-references before implementing",
-    "- Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)",
+    "- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), packages (docs/packages.md), environment variables (docs/environment-variables.md), MCP servers (docs/mcp.md), codemode scripts and non-LLM models such as classifiers and image models (docs/codemode.md)",
+    "- Before implementing harness changes, read the relevant docs and examples in full, following related cross-references.",
   ].join("\n");
 }
 

@@ -1964,8 +1964,8 @@ export class BtwOverlayComponent extends Container implements Focusable {
 
     if (
       this.keybindings.matches(data, "tui.altScreen.top") ||
-      matchesKey(data, "ctrl+pageup") ||
-      matchesKey(data, "ctrl+home")
+      matchesKey(data, Key.ctrl("pageUp")) ||
+      matchesKey(data, Key.ctrl("home"))
     ) {
       this.followTranscript = false;
       this.transcriptScrollOffset = 0;
@@ -1975,8 +1975,8 @@ export class BtwOverlayComponent extends Container implements Focusable {
 
     if (
       this.keybindings.matches(data, "tui.altScreen.bottom") ||
-      matchesKey(data, "ctrl+pagedown") ||
-      matchesKey(data, "ctrl+end")
+      matchesKey(data, Key.ctrl("pageDown")) ||
+      matchesKey(data, Key.ctrl("end"))
     ) {
       this.followTranscript = true;
       this.tui.requestRender();
