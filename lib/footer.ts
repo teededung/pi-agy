@@ -13,6 +13,8 @@ export const AGY_EFFECTIVE_CONTEXT_LIMIT = 300_000;
 export const AGY_CLAUDE_CONTEXT_LIMIT = 1_000_000;
 export const DEFAULT_CONTEXT_BAR_WIDTH = 16;
 export const MIN_CONTEXT_BAR_WIDTH = 6;
+export const FOOTER_BRANCH_MAX_WIDTH = 28;
+export const FOOTER_SESSION_NAME_MAX_WIDTH = 28;
 
 const AGY_1M_CLAUDE_MODEL_RE = /^claude-(?:opus|sonnet)-(?:4-6|4-8|5-5)(?:$|[-@])/i;
 
@@ -329,6 +331,14 @@ export function computeSessionUsageSnapshot(entries: readonly unknown[]): Sessio
   return { usageTotals, latestCacheHitRate };
 }
 
+export function clipFooterLabel(text: string, maxWidth: number): string {
+  const clean = sanitizeFooterStatusText(text);
+  if (!clean || maxWidth <= 0) return "";
+  if (visibleWidth(clean) <= maxWidth) return clean;
+  // Strip truncateToWidth's \x1b[0m wrapper around the ellipsis so outer theme.fg() keeps coloring "…".
+  return truncateToWidth(clean, maxWidth, "…").replace(/\x1b\[0m/g, "");
+}
+
 function joinLeftRight(left: string, right: string, width: number, minPadding = 2): string {
   const leftW = visibleWidth(left);
   if (!right) {
@@ -347,6 +357,25 @@ function joinLeftRight(left: string, right: string, width: number, minPadding = 
   return leftW > width ? truncateToWidth(left, width, "...") : left;
 }
 
+/** Row 1 prioritizes keeping Model + Thinking intact on the right, truncating location on the left when tight. */
+function joinRow1LeftRight(left: string, right: string, width: number, minPadding = 2): string {
+  if (!right) {
+    return visibleWidth(left) > width ? truncateToWidth(left, width, "…") : left;
+  }
+  const leftW = visibleWidth(left);
+  const rightW = visibleWidth(right);
+  if (leftW + minPadding + rightW <= width) {
+    return left + " ".repeat(width - leftW - rightW) + right;
+  }
+  const availableForLeft = width - rightW - minPadding;
+  if (availableForLeft > 4) {
+    const truncatedLeft = truncateToWidth(left, availableForLeft, "…");
+    const truncatedLeftW = visibleWidth(truncatedLeft);
+    return truncatedLeft + " ".repeat(Math.max(0, width - truncatedLeftW - rightW)) + right;
+  }
+  return joinLeftRight(left, right, width, minPadding);
+}
+
 /**
  * Render the 2-row footer:
  * Row 1: Path + Git branch + Session name (left)  ───  Provider/Model + Thinking level (right)
@@ -358,13 +387,15 @@ export function renderFooterLines(input: FooterRenderInput): string[] {
 
   // --- Row 1: Path + Branch + Session (left) & Model + Thinking (right) ---
   const pwd = formatFooterCwd(input.cwd, input.home);
+  const branchLabel = input.gitBranch ? clipFooterLabel(input.gitBranch, FOOTER_BRANCH_MAX_WIDTH) : "";
+  const sessionLabel = input.sessionName ? clipFooterLabel(input.sessionName, FOOTER_SESSION_NAME_MAX_WIDTH) : "";
   let row1Left = theme.fg("dim", pwd);
-  if (input.gitBranch) {
+  if (branchLabel) {
     row1Left +=
-      theme.fg("dim", " (") + theme.fg("mdLink", `⎇ ${input.gitBranch}`) + theme.fg("dim", ")");
+      theme.fg("dim", " (") + theme.fg("mdLink", `⎇ ${branchLabel}`) + theme.fg("dim", ")");
   }
-  if (input.sessionName) {
-    row1Left += theme.fg("dim", " • ") + theme.fg("muted", input.sessionName);
+  if (sessionLabel) {
+    row1Left += theme.fg("dim", " • ") + theme.fg("muted", sessionLabel);
   }
 
   const modelName = input.modelId || "no-model";
@@ -389,7 +420,7 @@ export function renderFooterLines(input: FooterRenderInput): string[] {
       row1Right = withProvider;
     }
   }
-  const row1 = joinLeftRight(row1Left, row1Right, width, minPadding);
+  const row1 = joinRow1LeftRight(row1Left, row1Right, width, minPadding);
 
   // --- Row 2: Context Bar + Stats (left) & Extension Statuses (right) ---
   const isAntigravity = input.provider === "antigravity";

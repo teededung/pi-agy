@@ -2225,5 +2225,51 @@ test("stripPiToolInventory strips Pi 1.5.0 <tools>, Pi 1.4.0 <tools>, and legacy
   assert.match(relayedDocs, /docs\/codemode\.md/);
 });
 
+test("renderFooterLines clips long gitBranch/sessionName and keeps model + thinking intact on Row 1", () => {
+  const plainTheme = {
+    fg: (_color: string, text: string) => text,
+  };
+  const emptyTotals = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+
+  const longLabels = renderFooterLines({
+    width: 120,
+    cwd: "/Users/rongmauhong/Documents/Repo/ragnarok",
+    home: "/Users/rongmauhong",
+    gitBranch: "worktree/feat-very-long-branch-name-that-would-crowd-row1",
+    sessionName: "Investigate TianZuo555 pi-extensions commits and port reload guards",
+    provider: "antigravity",
+    modelId: "gemini-4-argon",
+    reasoning: true,
+    thinkingLevel: "medium",
+    availableProviderCount: 2,
+    usageTotals: emptyTotals,
+    theme: plainTheme,
+  });
+
+  assert.match(longLabels[0]!, /\(⎇ worktree\/feat-very-long-bra…\)/);
+  assert.match(longLabels[0]!, /• Investigate TianZuo555 pi-e…/);
+  assert.match(longLabels[0]!, /gemini-4-argon • medium$/);
+
+  // Even on a narrow 72-column pane, Row 1 truncates the left location instead of chopping the model name.
+  const narrow = renderFooterLines({
+    width: 72,
+    cwd: "/Users/rongmauhong/Documents/Repo/ragnarok/tools/lani-web-sidecar",
+    home: "/Users/rongmauhong",
+    gitBranch: "worktree/feat-very-long-branch-name",
+    sessionName: "Long session name on narrow pane",
+    provider: "antigravity",
+    modelId: "gemini-4-argon",
+    reasoning: true,
+    thinkingLevel: "medium",
+    availableProviderCount: 2,
+    usageTotals: emptyTotals,
+    theme: plainTheme,
+  });
+
+  const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
+  assert.match(stripAnsi(narrow[0]!), /…\s+gemini-4-argon • medium$/);
+});
+
+
 
 

@@ -14,6 +14,7 @@
 
 ### Changed
 
+- **Row 1 footer label clipping & model display priority**: Automatically clip overlong `gitBranch` and `sessionName` with `…` (while stripping inner ANSI resets to preserve styling) and prioritize keeping the `Model • thinkingLevel → routedModel` label intact on narrow terminals or deep directory paths.
 - **Pi 1.5.0 compatibility**: Strip structured `<tools>...</tools>` sections (including Pi 1.5.0's tightened `"Additional tools may be available."` wording) when relaying Pi instructions to `agy`, align relayed `<docs>` paths (`docs/mcp.md`, `docs/codemode.md`), and use injected `context.keyHint("app.tools.expand", "to expand")` in tool result renderers.
 - Default `agy` invocation to `--model <base> --effort <level>` with automatic fallback to legacy model-effort suffixes; bump recommended `agy` version to `1.4.9+`.
 
