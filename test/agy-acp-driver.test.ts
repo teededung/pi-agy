@@ -31,7 +31,15 @@ import { newTurnOutcome } from "../lib/reducer.ts";
 import { AgyPiBridge } from "../lib/bridge.ts";
 import { createAgyTurnExecutor } from "../lib/agy-driver.ts";
 import { createPrivateMcpConfig } from "../lib/mcp-config.ts";
+import { formatAgyCall } from "../lib/render.ts";
 import { AgyReplayStore } from "../lib/replay.ts";
+import {
+  AGY_TOOL_SUMMARIES_ENTRY,
+  ToolSummaryTracker,
+  createSummaryToolRendererResolver,
+} from "../lib/tool-summary.ts";
+import { Text } from "@earendil-works/pi-tui";
+import type { Theme, ToolRenderers } from "@earendil-works/pi-coding-agent";
 import { isBridgedMcpStep, streamAntigravity } from "../src/provider.ts";
 import { AntigravityRuntime, createAntigravityRuntime, runAntigravity } from "../src/runtime.ts";
 
@@ -1058,4 +1066,151 @@ test("Group B1..B5: MCP HTTP bridge injection, loopback NO_PROXY, refusal/quota 
   assert.equal(authErr.isAuthRequired, true);
   assert.match(authErr.message, /\/agy-login/);
 });
+
+test("ToolSummaryTracker + createSummaryToolRendererResolver render muted toolSummary titles on bridged Pi cards while leaving Codex cards untouched", () => {
+  const tracker = new ToolSummaryTracker();
+  const serverName = "pi-0d291d88a423";
+
+  // 1. Parallel out-of-order read calls match deterministically by canonical args
+  tracker.recordToolStart(
+    {
+      name: `Run mcp_${serverName}_pi__read`,
+      args: { path: "/repo/a.ts", offset: 1, limit: 50, toolSummary: "Read header of a.ts" },
+    },
+    serverName,
+  );
+  tracker.recordToolStart(
+    {
+      name: `Run mcp_${serverName}_pi__read`,
+      args: { path: "/repo/b.ts", offset: 10, limit: 20, toolSummary: "Read helper in b.ts" },
+    },
+    serverName,
+  );
+
+  // Bridge calls arrive in reverse order (#2 before #1)
+  const cleanB = tracker.recordBridgeCall({
+    id: "pi-bridge-2",
+    tool: "read",
+    args: { limit: 20, offset: 10, path: "/repo/b.ts" },
+  });
+  const cleanA = tracker.recordBridgeCall({
+    id: "pi-bridge-1",
+    tool: "read",
+    args: { limit: 50, offset: 1, path: "/repo/a.ts", toolSummary: "Read header of a.ts" },
+  });
+
+  // Strict-schema safety: toolSummary is stripped from returned bridge args
+  assert.deepEqual(cleanA, { limit: 50, offset: 1, path: "/repo/a.ts" });
+  assert.deepEqual(cleanB, { limit: 20, offset: 10, path: "/repo/b.ts" });
+  assert.equal(tracker.get("pi-bridge-1"), "Read header of a.ts");
+  assert.equal(tracker.get("pi-bridge-2"), "Read helper in b.ts");
+
+  // 2. Late tool_start (after bridge_call) binds summary and invalidates live TUI card
+  tracker.recordBridgeCall({
+    id: "pi-bridge-3",
+    tool: "bash",
+    args: { command: "git status -s" },
+  });
+  let invalidated = 0;
+  const mockTheme = {
+    fg: (color: string, text: string) => `[${color}]${text}[/${color}]`,
+    bold: (text: string) => `<b>${text}</b>`,
+  } as unknown as Theme;
+
+  let innerRenderReused = false;
+  const resolver = createSummaryToolRendererResolver(tracker);
+  const bashRenderer = resolver("bash", () => ({
+    renderCall(args, theme, context) {
+      if (context.lastComponent instanceof Text) innerRenderReused = true;
+      const t = context.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
+      t.setText(theme.fg("toolTitle", theme.bold(`$ ${(args as { command: string }).command}`)));
+      return t;
+    },
+  }))!;
+
+  type RenderCallCtx = Parameters<NonNullable<ToolRenderers["renderCall"]>>[2];
+  const mkCtx = (
+    toolCallId: string,
+    lastComponent: unknown,
+    isPartial = true,
+  ): RenderCallCtx =>
+    ({
+      args: { command: "git status -s" },
+      toolCallId,
+      invalidate: () => {
+        invalidated += 1;
+      },
+      lastComponent,
+      state: {},
+      cwd: "/repo",
+      executionStarted: true,
+      argsComplete: true,
+      isPartial,
+      expanded: false,
+      showImages: false,
+      isError: false,
+      durationMs: undefined,
+      outputPad: 1,
+      keyText: (k: string) => k,
+      keyHint: (k: string) => k,
+    }) as unknown as RenderCallCtx;
+
+  // Before tool_start arrives (or on a Codex call with no summary): renders exact native 1-line component
+  const firstComp = bashRenderer.renderCall!(
+    { command: "git status -s" },
+    mockTheme,
+    mkCtx("pi-bridge-3", undefined, true),
+  );
+  assert.deepEqual(
+    firstComp.render(120).map((l) => l.trimEnd()),
+    ["[toolTitle]<b>$ git status -s</b>[/toolTitle]"],
+  );
+
+  // Now tool_start arrives on stdout -> triggers live invalidate and wraps with muted title above native $ line
+  tracker.recordToolStart(
+    {
+      name: `Run mcp_${serverName}_pi__bash`,
+      args: {
+        command: "git status -s",
+        toolSummary: "Check git status across both repos",
+      },
+    },
+    serverName,
+  );
+  assert.equal(invalidated, 1);
+
+  const wrappedComp = bashRenderer.renderCall!(
+    { command: "git status -s" },
+    mockTheme,
+    mkCtx("pi-bridge-3", firstComp, false),
+  );
+  assert.equal(innerRenderReused, true);
+  assert.deepEqual(
+    wrappedComp.render(120).map((l) => l.trimEnd()),
+    [
+      "[muted]Check git status across both repos[/muted]",
+      "[toolTitle]<b>$ git status -s</b>[/toolTitle]",
+    ],
+  );
+
+  // Persistence round-trip across session reload
+  const dirty = tracker.flushDirty();
+  assert.ok(dirty);
+  const restored = new ToolSummaryTracker();
+  restored.restoreFromEntries([
+    { type: "custom", customType: AGY_TOOL_SUMMARIES_ENTRY, data: { version: 1, summaries: dirty } },
+  ]);
+  assert.equal(restored.get("pi-bridge-3"), "Check git status across both repos");
+
+  // Historical / native formatAgyCall also renders toolSummary cleanly and normalizes Run mcp_..._pi__bash
+  assert.equal(
+    formatAgyCall(
+      `Run mcp_${serverName}_pi__bash`,
+      { command: "npm test", toolSummary: "Run full test suite" },
+      mockTheme,
+    ),
+    "[muted]Run full test suite[/muted]\n[toolTitle]<b>bash</b>[/toolTitle] [accent]npm test[/accent]",
+  );
+});
+
 

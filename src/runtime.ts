@@ -34,6 +34,7 @@ import {
 import {
   createSlidingDeadline,
   isAgyProgressActivity,
+  type AgyActivity,
   type AgyTurnOutcome,
   type AgyUsage,
 } from "../lib/reducer.ts";
@@ -261,7 +262,10 @@ function runnerExecutor(turnRunner: AgyTurnRunner): AgyTurnExecutor {
   };
 }
 
-const makeRuntime = (executor: AgyTurnExecutor) =>
+const makeRuntime = (
+  executor: AgyTurnExecutor,
+  options?: { onLiveActivity?: (activity: AgyActivity) => void },
+) =>
   Effect.gen(function* () {
     let conversationId: string | undefined;
     /** Terminal usage counters from the last turn; agy reports them cumulatively on resume. */
@@ -556,6 +560,11 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                     // runner retries below with bounded branch history.
                     restoredResultMissing = true;
                     return;
+                  }
+                  try {
+                    options?.onLiveActivity?.(activity);
+                  } catch {
+                    // Best-effort UI side channel; must never interrupt the turn.
                   }
                   controller.push(activity);
                 },
@@ -862,8 +871,11 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
     });
   });
 
-const runtimeLayer = (executor: AgyTurnExecutor): Layer.Layer<AntigravityRuntime> =>
-  Layer.effect(AntigravityRuntime, makeRuntime(executor));
+const runtimeLayer = (
+  executor: AgyTurnExecutor,
+  options?: { onLiveActivity?: (activity: AgyActivity) => void },
+): Layer.Layer<AntigravityRuntime> =>
+  Layer.effect(AntigravityRuntime, makeRuntime(executor, options));
 
 export const AntigravityRuntimeLive: Layer.Layer<AntigravityRuntime> = runtimeLayer(
   createAgyTurnExecutor(),
@@ -871,10 +883,11 @@ export const AntigravityRuntimeLive: Layer.Layer<AntigravityRuntime> = runtimeLa
 
 export function createAntigravityRuntime(
   executorOrRunner: AgyTurnExecutor | AgyTurnRunner = createAgyTurnExecutor(),
+  options?: { onLiveActivity?: (activity: AgyActivity) => void },
 ) {
   const executor =
     typeof executorOrRunner === "function" ? runnerExecutor(executorOrRunner) : executorOrRunner;
-  return ManagedRuntime.make(runtimeLayer(executor));
+  return ManagedRuntime.make(runtimeLayer(executor, options));
 }
 
 export type AntigravityRuntimeInstance = ReturnType<typeof createAntigravityRuntime>;

@@ -187,6 +187,11 @@ import { openArtifact, openAgyArtifactsPicker } from "./src/artifacts-ui.ts";
 import { openAgySubagentsPicker } from "./src/subagents-ui.ts";
 import { openAgyUsagePicker } from "./src/usage-ui.ts";
 import { agyToolLabel, cleanToolOutputLines, formatAgyCall, summarizeAgyResult } from "./lib/render.ts";
+import {
+  AGY_TOOL_SUMMARIES_ENTRY,
+  ToolSummaryTracker,
+  createSummaryToolRendererResolver,
+} from "./lib/tool-summary.ts";
 import { computeAgyToolDiff, isAgyEditTool, safeRenderDiff } from "./lib/diff.ts";
 import {
   mapThinkingToEffort,
@@ -566,7 +571,24 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   installSessionSelectorDeletePatch();
   installModelSelectorSelectionPatch();
   installAgyDeathHooks();
-  const runtime = createAntigravityRuntime();
+  const toolSummaries = new ToolSummaryTracker();
+  const persistToolSummaries = (): void => {
+    const dirty = toolSummaries.flushDirty();
+    if (!dirty) return;
+    try {
+      pi.appendEntry(AGY_TOOL_SUMMARIES_ENTRY, { version: 1, summaries: dirty });
+    } catch {
+      // Session may be stale or read-only.
+    }
+  };
+  const runtime = createAntigravityRuntime(undefined, {
+    onLiveActivity: (activity) => {
+      if (activity.type === "tool_start") {
+        toolSummaries.recordToolStart(activity, mcpConfig.serverName);
+        persistToolSummaries();
+      }
+    },
+  });
   const service = runtime.runSync(AntigravityRuntime);
   const replay = new AgyReplayStore();
   let currentCache = getInitialModelCache();
@@ -1070,7 +1092,11 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   const bridgeToken = randomUUID();
   const piToolsAgent = createPiToolsAgent(path.join(mcpConfig.directory, ".agents", "agents"));
   bridge.requireToken(bridgeToken);
-  bridge.setOnCall((call) => service.pushBridgeCall(call));
+  bridge.setOnCall((call) => {
+    const cleanedArgs = toolSummaries.recordBridgeCall(call);
+    persistToolSummaries();
+    return service.pushBridgeCall({ ...call, args: cleanedArgs });
+  });
 
   const bridgeManager = createBridgeLifecycleManager({
     bridge,
@@ -1575,6 +1601,10 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   }
 
   function handleAgyActivity(activity: AgyActivity): void {
+    if (activity.type === "tool_start") {
+      toolSummaries.recordToolStart(activity, mcpConfig.serverName);
+      persistToolSummaries();
+    }
     if (activity.type === "conversation_fallback") {
       setAgyCompactingUi(false);
       observedContextTokens = undefined;
@@ -1770,6 +1800,8 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       return new Text(text, 0, 0);
     },
   });
+
+  pi.registerToolRenderer?.(createSummaryToolRendererResolver(toolSummaries));
 
   const registerAntigravityProvider = (models: AgyModelInfo[]) => {
     const visibleModels = models.filter((model) => !isAgyModelHidden(model.id));
@@ -2001,6 +2033,8 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   };
 
   pi.on("agent_settled", async (event, ctx: ExtensionContext) => {
+    persistToolSummaries();
+    toolSummaries.clearTransient();
     setAgyCompactingUi(false);
     const settledOutcome = lastSettledOutcome;
     lastSettledOutcome = undefined;
@@ -2166,6 +2200,12 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
 
   pi.on("session_start", async (event, ctx: ExtensionContext) => {
     activeSessionCtx = ctx;
+    const entriesProbe = probeCtx(() =>
+      typeof ctx.sessionManager.getEntries === "function"
+        ? ctx.sessionManager.getEntries()
+        : ctx.sessionManager.getBranch(),
+    );
+    toolSummaries.restoreFromEntries(entriesProbe.stale ? [] : entriesProbe.value);
     setAgyCompactingUi(false);
     lastSyncedSessionTitleKey = undefined;
     oneShotConsult = undefined;

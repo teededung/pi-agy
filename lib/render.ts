@@ -27,7 +27,28 @@ const LABELS: Record<string, string> = {
 };
 
 export function agyToolLabel(tool: string): string {
-  return LABELS[tool] ?? tool;
+  const cleaned = normalizeAgyToolKey(tool);
+  return LABELS[cleaned] ?? cleaned;
+}
+
+const PI_BRIDGE_TO_AGY_TOOL: Record<string, string> = {
+  bash: "run_command",
+  read: "read_file",
+  edit: "edit_file",
+  write: "write_file",
+  ls: "list_dir",
+  find: "find_by_name",
+  grep: "grep_search",
+};
+
+function normalizeAgyToolKey(tool: string): string {
+  const strippedRun = tool.replace(/^Run\s+/i, "").trim();
+  const bridgedMatch = strippedRun.match(/^(?:mcp_[^_]+_|[^/:\s]+[/:]\s*)?pi__(.+)$/);
+  if (bridgedMatch?.[1]) {
+    const inner = bridgedMatch[1];
+    return PI_BRIDGE_TO_AGY_TOOL[inner] ?? inner;
+  }
+  return strippedRun;
 }
 
 function cleanString(val: string): string {
@@ -79,13 +100,16 @@ function asRecord(input: unknown): Record<string, unknown> {
   return typeof input === "object" && input !== null ? (input as Record<string, unknown>) : {};
 }
 
+const SUMMARY_META_KEYS = new Set(["toolSummary", "toolAction", "waitForPreviousTools"]);
+
 /**
  * Generic bounded key/value summary for tools without a dedicated shape
  * (subagent orchestration, scheduling, media, …).
  */
 function formatGenericArgs(input: Record<string, unknown>, theme: Theme): string {
   const entries = Object.entries(input).filter(
-    ([, value]) => value !== undefined && value !== null && value !== "",
+    ([key, value]) =>
+      !SUMMARY_META_KEYS.has(key) && value !== undefined && value !== null && value !== "",
   );
   if (entries.length === 0) return "";
   const bound = (text: string, max = 48) =>
@@ -108,7 +132,10 @@ function formatGenericArgs(input: Record<string, unknown>, theme: Theme): string
  */
 export function formatAgyCall(tool: string, input: unknown, theme: Theme): string {
   const args = asRecord(input);
-  const label = theme.fg("toolTitle", theme.bold(agyToolLabel(tool)));
+  const normalizedTool = normalizeAgyToolKey(tool);
+  const summary = pickArg(args, ["toolSummary", "toolAction"])?.replace(/\s+/g, " ").trim();
+  const prefix = summary ? `${theme.fg("muted", summary)}\n` : "";
+  const label = theme.fg("toolTitle", theme.bold(agyToolLabel(normalizedTool)));
   const invalid = theme.fg("error", "[invalid arg]");
   const path = (fallback: string) => {
     const raw = pickArg(args, [
@@ -132,7 +159,8 @@ export function formatAgyCall(tool: string, input: unknown, theme: Theme): strin
     return theme.fg("accent", shortenPath(raw));
   };
 
-  switch (tool) {
+  const body = ((): string => {
+    switch (normalizedTool) {
     case "search_web": {
       const query = pickArg(args, ["query", "Query", "search_query", "q"]);
       return `${label} ${query === undefined ? invalid : theme.fg("accent", `"${query}"`)}`;
@@ -236,11 +264,13 @@ export function formatAgyCall(tool: string, input: unknown, theme: Theme): strin
       const taskText = task === undefined ? "" : theme.fg("accent", ` ${task}`);
       return `${label} ${actionText}${taskText}`;
     }
-    default: {
-      const generic = formatGenericArgs(args, theme);
-      return generic ? `${label} ${generic}` : label;
+      default: {
+        const generic = formatGenericArgs(args, theme);
+        return generic ? `${label} ${generic}` : label;
+      }
     }
-  }
+  })();
+  return `${prefix}${body}`;
 }
 
 export interface AgyResultSummary {
