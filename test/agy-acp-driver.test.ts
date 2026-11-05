@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { PassThrough } from "node:stream";
 import test from "node:test";
 import type { ChildProcess } from "node:child_process";
@@ -7,6 +11,7 @@ import type { Model, TranscriptContext } from "@earendil-works/pi-ai";
 import { AgyAcpDriverSession } from "../lib/agy-acp-driver.ts";
 import {
   ACP_AUTH_REQUIRED_CODE,
+  AcpTurnNormalizer,
   AgyAcpClient,
   AgyAcpRpcError,
   acpUsageToAgyUsage,
@@ -16,10 +21,13 @@ import {
   extractAcpQuotaSnapshot,
   formatAcpStopError,
   modelsFromAcpSessionState,
+  normalizeAcpTurnUsageForStepCount,
   readAcpMcpServersFromDirectory,
   selectAcpPermissionOutcome,
   type AcpChildProcess,
 } from "../lib/agy-acp-client.ts";
+import { extractUsageFromStepPayload } from "../lib/agy-thoughts.ts";
+import { newTurnOutcome } from "../lib/reducer.ts";
 import { AgyPiBridge } from "../lib/bridge.ts";
 import { createAgyTurnExecutor } from "../lib/agy-driver.ts";
 import { createPrivateMcpConfig } from "../lib/mcp-config.ts";
@@ -662,8 +670,8 @@ test("AntigravityRuntime with native ACP executor falls back to fresh session on
 });
 
 test("ACP helper unit checks: usage deduplication, bridged MCP step matching, permission selection, and driver mode factory", () => {
-  // 1. acpUsageToAgyUsage subtracts cachedReadTokens from raw inputTokens so total context isn't double-counted
-  const mappedUsage = acpUsageToAgyUsage({
+  // 1a. acpUsageToAgyUsage subtracts cachedReadTokens when inputTokens is inclusive (1000 + 120 === 1120)
+  const inclusiveUsage = acpUsageToAgyUsage({
     stopReason: "end_turn",
     usage: {
       inputTokens: 1_000,
@@ -673,13 +681,48 @@ test("ACP helper unit checks: usage deduplication, bridged MCP step matching, pe
       totalTokens: 1_120,
     },
   });
-  assert.deepEqual(mappedUsage, {
+  assert.deepEqual(inclusiveUsage, {
     input_tokens: 400,
     cache_read_tokens: 600,
     output_tokens: 120,
     thinking_tokens: 30,
     total_tokens: 1_120,
   });
+
+  // 1b. acpUsageToAgyUsage preserves already-uncached inputTokens from live agy acp 1.5.0 (2716 + 8013 + 430 === 11159)
+  const uncachedUsage = acpUsageToAgyUsage({
+    stopReason: "end_turn",
+    usage: {
+      inputTokens: 2_716,
+      cachedReadTokens: 8_013,
+      outputTokens: 430,
+      thoughtTokens: 225,
+      totalTokens: 11_159,
+    },
+  });
+  assert.deepEqual(uncachedUsage, {
+    input_tokens: 2_716,
+    cache_read_tokens: 8_013,
+    output_tokens: 430,
+    thinking_tokens: 225,
+    total_tokens: 11_159,
+  });
+
+  // 1c. normalizeAcpTurnUsageForStepCount prevents multi-step 3.38M cachedRead sums from looking like single-call overflow
+  const normalizedMultiStep = normalizeAcpTurnUsageForStepCount(
+    {
+      input_tokens: 76_000,
+      cache_read_tokens: 3_388_516,
+      output_tokens: 14_583,
+      thinking_tokens: 6_862,
+      total_tokens: 3_479_099,
+    },
+    19,
+  );
+  assert.equal(normalizedMultiStep.input_tokens, 4_000);
+  assert.equal(normalizedMultiStep.cache_read_tokens, Math.round(3_388_516 / 19));
+  assert.equal(normalizedMultiStep.output_tokens, 14_583);
+  assert.ok((normalizedMultiStep.input_tokens ?? 0) + (normalizedMultiStep.cache_read_tokens ?? 0) < 200_000);
 
   // 2. buildAcpAgyArgs deduplicates identical cwd/mcpDirectory
   assert.deepEqual(buildAcpAgyArgs({ cwd: "/a", mcpDirectory: "/a" }), ["acp", "--add-dir", "/a"]);
@@ -699,7 +742,25 @@ test("ACP helper unit checks: usage deduplication, bridged MCP step matching, pe
     outcome: { outcome: "selected", optionId: "deny" },
   });
 
-  // 4. isBridgedMcpStep recognizes both stream-json and ACP bridged Pi tool names
+  // 4. AcpTurnNormalizer + isBridgedMcpStep strip `agy acp`'s "Run " title prefix so bridged tools never emit duplicate cards
+  const normOutcome = newTurnOutcome();
+  const norm = new AcpTurnNormalizer(normOutcome);
+  const bridgedActs = norm.consumeUpdate({
+    sessionId: "s1",
+    update: {
+      sessionUpdate: "tool_call",
+      toolCallId: "tc-bridge-1",
+      title: "Run mcp_pi-123_pi__read",
+      status: "in_progress",
+      rawInput: { path: "/tmp/x", toolSummary: "Read file" },
+    },
+  });
+  assert.equal(bridgedActs[0]?.type, "tool_start");
+  if (bridgedActs[0]?.type === "tool_start") {
+    assert.equal(bridgedActs[0].name, "mcp_pi-123_pi__read");
+    assert.equal(isBridgedMcpStep(bridgedActs[0], "pi-123"), true);
+  }
+  assert.equal(isBridgedMcpStep({ name: "Run mcp_pi-123_pi__read", args: {} }, "pi-123"), true);
   assert.equal(isBridgedMcpStep({ name: "mcp_pi-123_pi__read", args: {} }, "pi-123"), true);
   assert.equal(isBridgedMcpStep({ name: "pi-123/pi__edit", args: {} }, "pi-123"), true);
   assert.equal(isBridgedMcpStep({ name: "pi__bash", args: {} }, "pi-123"), true);
@@ -714,7 +775,7 @@ test("ACP helper unit checks: usage deduplication, bridged MCP step matching, pe
   assert.equal(createAgyTurnExecutor({ PI_ANTIGRAVITY_DRIVER: "0" }).snapshot().mode, "one-shot");
 });
 
-test("streamAntigravity bypasses typewriter pacer in acp mode so chunks stream with zero artificial latency", async () => {
+test("streamAntigravity animates text smoothly in acp mode by default and honors PI_ANTIGRAVITY_THINKING_PACE=0", async () => {
   const fake = createFakeAcpSpawn({ requestPermissionOnPrompt: true });
   const innerDriver = new AgyAcpDriverSession();
   const testExecutor = {
@@ -733,8 +794,10 @@ test("streamAntigravity bypasses typewriter pacer in acp mode so chunks stream w
   const service = runtime.runSync(AntigravityRuntime);
   const replay = new AgyReplayStore();
   const bridge = new AgyPiBridge("pi-test");
+  const prevPaceEnv = process.env.PI_ANTIGRAVITY_THINKING_PACE;
 
   try {
+    delete process.env.PI_ANTIGRAVITY_THINKING_PACE;
     const streamFn = streamAntigravity(runtime, service, replay, bridge);
     const model: Model<string> = {
       id: "gemini-4-argon",
@@ -752,18 +815,104 @@ test("streamAntigravity bypasses typewriter pacer in acp mode so chunks stream w
       messages: [{ role: "user", content: "NEED_PERMISSION direct stream check", timestamp: 1 }],
     } as unknown as TranscriptContext;
 
-    const textDeltas: string[] = [];
+    const animatedDeltas: string[] = [];
     for await (const ev of streamFn(model, ctx)) {
       if (ev.type === "text_delta" && ev.delta) {
-        textDeltas.push(ev.delta);
+        animatedDeltas.push(ev.delta);
       }
     }
+    assert.equal(animatedDeltas.join(""), "perm=selected:allow-once");
+    assert.ok(animatedDeltas.length > 1, "expected smooth multi-tick animation by default");
 
-    // With makePacer bypassed on ACP, the entire chunk arrives intact as 1 delta
-    // instead of being segmented into 1-char grapheme ticks!
-    assert.deepEqual(textDeltas, ["perm=selected:allow-once"]);
+    // Verify PI_ANTIGRAVITY_THINKING_PACE=0 disables pacing cleanly
+    process.env.PI_ANTIGRAVITY_THINKING_PACE = "0";
+    const ctx2 = {
+      messages: [{ role: "user", content: "NEED_PERMISSION unpaced check", timestamp: 2 }],
+    } as unknown as TranscriptContext;
+    const unpacedDeltas: string[] = [];
+    for await (const ev of streamFn(model, ctx2)) {
+      if (ev.type === "text_delta" && ev.delta) {
+        unpacedDeltas.push(ev.delta);
+      }
+    }
+    assert.deepEqual(unpacedDeltas, ["perm=selected:allow-once"]);
   } finally {
+    if (prevPaceEnv === undefined) delete process.env.PI_ANTIGRAVITY_THINKING_PACE;
+    else process.env.PI_ANTIGRAVITY_THINKING_PACE = prevPaceEnv;
     await runAntigravity(runtime, service.close);
+  }
+});
+
+test("AgyAcpDriverSession reads exact single-step usage from SQLite PLANNER_RESPONSE protobuf instead of multi-step cumulative sums", async () => {
+  const encodeVarint = (n: number): number[] => {
+    const out: number[] = [];
+    let v = n;
+    while (v >= 0x80) {
+      out.push((v & 0x7f) | 0x80);
+      v = Math.floor(v / 128);
+    }
+    out.push(v);
+    return out;
+  };
+  const encodeSubmsg = (fieldNo: number, body: number[]): number[] => [
+    ...encodeVarint((fieldNo << 3) | 2),
+    ...encodeVarint(body.length),
+    ...body,
+  ];
+  const encodeVarintField = (fieldNo: number, val: number): number[] => [
+    ...encodeVarint((fieldNo << 3) | 0),
+    ...encodeVarint(val),
+  ];
+
+  // Build CortexStep protobuf: field 5 (metadata) -> field 9 (generator_metadata):
+  // f2=4319 (input), f3=353 (output), f5=107684 (cache_read), f9=237 (thinking)
+  const genMeta = [
+    ...encodeVarintField(2, 4_319),
+    ...encodeVarintField(3, 353),
+    ...encodeVarintField(5, 107_684),
+    ...encodeVarintField(9, 237),
+  ];
+  const stepPayload = Buffer.from(encodeSubmsg(5, encodeSubmsg(9, genMeta)));
+  assert.deepEqual(extractUsageFromStepPayload(stepPayload), {
+    input_tokens: 4_319,
+    output_tokens: 353,
+    cache_read_tokens: 107_684,
+    thinking_tokens: 237,
+    total_tokens: 112_356,
+  });
+
+  const convDir = mkdtempSync(path.join(tmpdir(), "pi-agy-acp-sqlite-usage-"));
+  const driver = new AgyAcpDriverSession({ conversationsDir: convDir });
+  try {
+    // Prepare `<sessionId>.db` matching fake spawn's `acp-conv-1`
+    const dbPath = path.join(convDir, "acp-conv-1.db");
+    const db = new DatabaseSync(dbPath);
+    db.exec("CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, step_payload BLOB)");
+    db.prepare("INSERT INTO steps VALUES (?, ?, ?, ?)").run(0, 14, 3, Buffer.alloc(0));
+    db.prepare("INSERT INTO steps VALUES (?, ?, ?, ?)").run(1, 15, 3, stepPayload);
+    db.close();
+
+    const fake = createFakeAcpSpawn();
+    const outcome = await driver.run({
+      prompt: "Check SQLite per-step usage",
+      model: "gemini-4-argon",
+      cwd: "/tmp/pi-agy-sqlite-test",
+      spawnOverride: fake.spawnOverride,
+    });
+
+    assert.deepEqual(outcome.usage, {
+      input_tokens: 4_319,
+      output_tokens: 353,
+      cache_read_tokens: 107_684,
+      thinking_tokens: 237,
+      total_tokens: 112_356,
+    });
+    const usageActs = outcome.activities.filter((a) => a.type === "usage");
+    assert.equal(usageActs.length, 1);
+    assert.deepEqual(usageActs[0]?.usage, outcome.usage);
+  } finally {
+    await driver.close("shutdown");
+    rmSync(convDir, { recursive: true, force: true });
   }
 });
 

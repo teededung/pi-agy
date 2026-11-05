@@ -2376,12 +2376,16 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     activeSessionCtx = ctx;
     const providerProbe = probeCtx(() => ctx.model?.provider);
     const isAgy = !providerProbe.stale && providerProbe.value === "antigravity";
-    // Antigravity manages threshold compaction natively inside `agy` (~300k for
-    // Gemini, 1M for Claude). Client-side threshold compaction in Pi only triggers
-    // when multi-day raw transcript chars/4 (e.g. after retry `context_edit`s)
-    // exceed the 1M scheduling window, which would needlessly destroy the live
-    // `agy` conversation. Non-antigravity providers remain completely untouched.
-    if (isAgy && event.reason === "threshold") {
+    // Antigravity manages compaction natively inside `agy` (~300k for Gemini,
+    // 1M for Claude). Cancel client-side post-turn threshold compaction AND
+    // post-`stop` silent-overflow heuristics (`reason === "overflow" && !willRetry`),
+    // which would needlessly destroy a healthy live `agy` conversation after a
+    // completed turn. Real overflow errors (`willRetry === true`) and manual
+    // `/compact` (`reason === "manual"`) remain active.
+    if (
+      isAgy &&
+      (event.reason === "threshold" || (event.reason === "overflow" && !event.willRetry))
+    ) {
       return { cancel: true };
     }
     const footprint = resolveBranchContextFootprint(event.branchEntries);
@@ -2550,10 +2554,10 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     // Sweep any remaining tracked agy process trees (including earlier turns
     // that finished logically while grandchildren held stdio open).
     killAllAgyTrees();
-    // When `/drop quit` runs in an extension loaded before `pi-agy`, `<cid>.db`
-    // is deleted while warm `agy acp` still holds the session in memory, and
-    // `agy acp` re-flushes a ghost row into `conversation_summaries.db` on SIGTERM.
-    // Re-sweep once `agy acp` has exited so `agy --resume` stays completely clean.
+    // Storage invariant: if `<cid>.db` was already deleted from disk before warm
+    // `agy acp` exited, `agy acp`'s SIGTERM handler can flush an orphan summary
+    // row into `conversation_summaries.db`. Purge any orphan index entry once the
+    // daemon has terminated so `conversation_summaries.db` matches `conversations/*.db`.
     if (shutdownConversationId && !(await agyConversationExists(shutdownConversationId))) {
       await deleteDisposableAgyConversation(shutdownConversationId).catch(() => {});
     }

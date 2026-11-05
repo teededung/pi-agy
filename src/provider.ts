@@ -727,15 +727,16 @@ export function isBridgedMcpStep(
   serverName: string,
 ): boolean {
   if (!serverName) return false;
-  if (activity.name === "call_mcp_tool" && activity.args?.ServerName === serverName) {
+  const cleanName = activity.name.replace(/^Run\s+/i, "");
+  if (cleanName === "call_mcp_tool" && activity.args?.ServerName === serverName) {
     return true;
   }
   return (
-    activity.name.startsWith(`mcp_${serverName}_pi__`) ||
-    activity.name.startsWith(`${serverName}/pi__`) ||
-    activity.name.startsWith(`${serverName}:pi__`) ||
-    activity.name.startsWith(`${serverName}: pi__`) ||
-    /^pi__[A-Za-z0-9_]+$/.test(activity.name)
+    cleanName.startsWith(`mcp_${serverName}_pi__`) ||
+    cleanName.startsWith(`${serverName}/pi__`) ||
+    cleanName.startsWith(`${serverName}:pi__`) ||
+    cleanName.startsWith(`${serverName}: pi__`) ||
+    /^pi__[A-Za-z0-9_]+$/.test(cleanName)
   );
 }
 
@@ -1288,14 +1289,12 @@ export function streamAntigravity(
           thoughtIndex = null;
         };
 
-        // Non-blocking typewriter pacing for legacy stream-json / one-shot modes
-        // where thinking is polled from SQLite every 250ms. In native `acp` mode,
-        // `agy acp` streams `agent_thought_chunk` and `agent_message_chunk` live
-        // over JSON-RPC, so pacing is bypassed by default (zero added latency)
-        // unless explicitly forced with PI_ANTIGRAVITY_THINKING_PACE=1.
+        // Non-blocking 60fps typewriter pacing for both legacy `stream-json` (250ms
+        // SQLite polls) and native `acp` (`agy acp` delivers coarse ~140-char text
+        // chunks every 110–200ms and ~600-char thought bursts every ~1s rather than
+        // per-token deltas). Set PI_ANTIGRAVITY_THINKING_PACE=0 to disable.
         const paceEnv = process.env.PI_ANTIGRAVITY_THINKING_PACE?.trim();
-        const paceEnabled =
-          paceEnv === "1" ? true : paceEnv === "0" ? false : executorMode !== "acp";
+        const paceEnabled = paceEnv !== "0";
         const makePacer = (emit: (piece: string) => void, isOpen: () => boolean) => {
           let pending: string[] = [];
           let timer: ReturnType<typeof setInterval> | undefined;

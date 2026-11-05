@@ -23,7 +23,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { cleanAgyCheckpointSummary } from "./agy-compaction.ts";
-import type { AgyActivity } from "./reducer.ts";
+import type { AgyActivity, AgyUsage } from "./reducer.ts";
 
 const STEP_TYPE_USER_INPUT = 14;
 const STEP_TYPE_PLANNER_RESPONSE = 15;
@@ -57,6 +57,8 @@ export interface AgyThoughtPollResult {
   deltas: AgyThinkingDeltaActivity[];
   /** Newly completed checkpoint steps (`step_type = 23, status = 3`) observed in SQLite. */
   checkpoints: AgyCheckpointSummaryInfo[];
+  /** Newly completed planner response usages (`step_type = 15, status = 3`) in this turn. */
+  stepUsages: Array<{ stepId: number; usage: AgyUsage }>;
   /** True when new rows, status transitions, or growing step_payload bytes were observed. */
   dbProgressed: boolean;
   /** True when non-input/system agent steps (planner, tool, checkpoint) progressed in SQLite. */
@@ -86,6 +88,13 @@ export interface AgyThoughtTrackerOptions {
    * compaction, checkpoints, retries, and DB liveness. Defaults to true.
    */
   emitThinkingDeltas?: boolean;
+  /**
+   * When true (ACP mode, where JSON-RPC `PromptResponse.usage` only reports a
+   * turn-end sum across all internal sub-calls), emit per-step `{ type: "usage" }`
+   * activities directly from completed SQLite `PLANNER_RESPONSE` rows so Pi
+   * observes accurate single-step context window tokens. Defaults to false.
+   */
+  emitStepUsage?: boolean;
 }
 
 function defaultConversationsDir(): string {
@@ -192,15 +201,16 @@ function extractThinkingFromPlannerResponse(buf: Buffer): string {
 }
 
 /**
- * Extract `input_tokens + cache_read_tokens` from `CortexStep.metadata` (field 5)
- * -> `generator_metadata` (field 9: field 2 = `input_tokens`, field 5 = `cache_read_tokens`).
+ * Extract full single-step `AgyUsage` from `CortexStep.metadata` (field 5) ->
+ * `generator_metadata` (field 9: field 2 = `input_tokens`, field 3 =
+ * `output_tokens`, field 5 = `cache_read_tokens`, field 9 = `thinking_tokens`).
  */
-export function extractContextTokensFromStepPayload(
+export function extractUsageFromStepPayload(
   payload: Uint8Array | Buffer,
-): number | undefined {
+): AgyUsage | undefined {
   const buf = toBuffer(payload);
   let pos = 0;
-  let latestTotal: number | undefined;
+  let latestUsage: AgyUsage | undefined;
   while (pos < buf.length) {
     const tag = readVarint(buf, pos);
     if (!tag) break;
@@ -212,8 +222,8 @@ export function extractContextTokensFromStepPayload(
       if (!len) break;
       const start = len[1];
       const end = Math.min(buf.length, start + len[0]);
-      const metaTokens = extractTokensFromStepMetadata(buf.subarray(start, end));
-      if (metaTokens !== undefined) latestTotal = metaTokens;
+      const metaUsage = extractUsageFromStepMetadata(buf.subarray(start, end));
+      if (metaUsage !== undefined) latestUsage = metaUsage;
       pos = end;
       continue;
     }
@@ -221,12 +231,25 @@ export function extractContextTokensFromStepPayload(
     if (next === undefined) break;
     pos = next;
   }
-  return latestTotal;
+  return latestUsage;
 }
 
-function extractTokensFromStepMetadata(buf: Buffer): number | undefined {
+/**
+ * Extract `input_tokens + cache_read_tokens` from `CortexStep.metadata` (field 5)
+ * -> `generator_metadata` (field 9: field 2 = `input_tokens`, field 5 = `cache_read_tokens`).
+ */
+export function extractContextTokensFromStepPayload(
+  payload: Uint8Array | Buffer,
+): number | undefined {
+  const usage = extractUsageFromStepPayload(payload);
+  if (!usage) return undefined;
+  const total = (usage.input_tokens ?? 0) + (usage.cache_read_tokens ?? 0);
+  return Number.isFinite(total) && total > 0 ? total : undefined;
+}
+
+function extractUsageFromStepMetadata(buf: Buffer): AgyUsage | undefined {
   let pos = 0;
-  let latestTotal: number | undefined;
+  let latestUsage: AgyUsage | undefined;
   while (pos < buf.length) {
     const tag = readVarint(buf, pos);
     if (!tag) break;
@@ -238,8 +261,8 @@ function extractTokensFromStepMetadata(buf: Buffer): number | undefined {
       if (!len) break;
       const start = len[1];
       const end = Math.min(buf.length, start + len[0]);
-      const genTokens = extractTokensFromGeneratorMetadata(buf.subarray(start, end));
-      if (genTokens !== undefined) latestTotal = genTokens;
+      const genUsage = extractUsageFromGeneratorMetadata(buf.subarray(start, end));
+      if (genUsage !== undefined) latestUsage = genUsage;
       pos = end;
       continue;
     }
@@ -247,24 +270,28 @@ function extractTokensFromStepMetadata(buf: Buffer): number | undefined {
     if (next === undefined) break;
     pos = next;
   }
-  return latestTotal;
+  return latestUsage;
 }
 
-function extractTokensFromGeneratorMetadata(buf: Buffer): number | undefined {
+function extractUsageFromGeneratorMetadata(buf: Buffer): AgyUsage | undefined {
   let pos = 0;
-  let inputTokens = 0;
-  let cacheReadTokens = 0;
+  let inputTokens: number | undefined;
+  let outputTokens: number | undefined;
+  let cacheReadTokens: number | undefined;
+  let thinkingTokens: number | undefined;
   while (pos < buf.length) {
     const tag = readVarint(buf, pos);
     if (!tag) break;
     pos = tag[1];
     const fieldNumber = Math.floor(tag[0] / 8);
     const wireType = tag[0] & 7;
-    if ((fieldNumber === 2 || fieldNumber === 5) && wireType === 0) {
+    if ((fieldNumber === 2 || fieldNumber === 3 || fieldNumber === 5 || fieldNumber === 9) && wireType === 0) {
       const v = readVarint(buf, pos);
       if (!v) break;
       if (fieldNumber === 2) inputTokens = v[0];
-      else cacheReadTokens = v[0];
+      else if (fieldNumber === 3) outputTokens = v[0];
+      else if (fieldNumber === 5) cacheReadTokens = v[0];
+      else if (fieldNumber === 9) thinkingTokens = v[0];
       pos = v[1];
       continue;
     }
@@ -272,8 +299,23 @@ function extractTokensFromGeneratorMetadata(buf: Buffer): number | undefined {
     if (next === undefined) break;
     pos = next;
   }
-  const total = inputTokens + cacheReadTokens;
-  return Number.isFinite(total) && total > 0 ? total : undefined;
+  if (
+    inputTokens === undefined &&
+    outputTokens === undefined &&
+    cacheReadTokens === undefined &&
+    thinkingTokens === undefined
+  ) {
+    return undefined;
+  }
+  const totalTokens = (inputTokens ?? 0) + (outputTokens ?? 0) + (cacheReadTokens ?? 0);
+  if (!Number.isFinite(totalTokens) || totalTokens <= 0) return undefined;
+  return {
+    ...(inputTokens !== undefined ? { input_tokens: inputTokens } : {}),
+    ...(outputTokens !== undefined ? { output_tokens: outputTokens } : {}),
+    ...(thinkingTokens !== undefined ? { thinking_tokens: thinkingTokens } : {}),
+    ...(cacheReadTokens !== undefined ? { cache_read_tokens: cacheReadTokens } : {}),
+    total_tokens: totalTokens,
+  };
 }
 
 /**
@@ -451,6 +493,8 @@ export class AgyThoughtTracker {
   /** Cached context footprint across completed planner/checkpoint steps. */
   #lastUsageIdx = -1;
   #lastContextTokens: number | undefined;
+  #lastTurnStepUsage: AgyUsage | undefined;
+  #emittedStepUsages = new Set<number>();
   #compactedAfterIdx = -1;
 
   /** Incremental CLI log tail state for live compaction detection. */
@@ -471,6 +515,7 @@ export class AgyThoughtTracker {
   #lastAwaitingPlannerAfterStep = false;
   #emittedCompacting = false;
   #emitThinkingDeltas = true;
+  #emitStepUsage = false;
   #checkpointDetailsByStepId = new Map<number, AgyCheckpointSummaryInfo>();
   #streamEmittedCheckpoints = new Set<number>();
 
@@ -483,6 +528,7 @@ export class AgyThoughtTracker {
     this.#logDir = options?.logDir ?? defaultLogDirFromConversationsDir(conversationsDir);
     this.#now = options?.now ?? Date.now;
     this.#emitThinkingDeltas = options?.emitThinkingDeltas ?? true;
+    this.#emitStepUsage = options?.emitStepUsage ?? false;
     this.#createdAtMs = this.#now();
     if (conversationId) {
       this.#conversationId = conversationId;
@@ -529,6 +575,7 @@ export class AgyThoughtTracker {
       return {
         deltas: [],
         checkpoints: [],
+        stepUsages: [],
         dbProgressed: false,
         agentProgressed: retryAttempted,
         isGenerating: false,
@@ -567,6 +614,7 @@ export class AgyThoughtTracker {
       return {
         deltas: [],
         checkpoints: [],
+        stepUsages: [],
         dbProgressed: false,
         agentProgressed: retryAttempted,
         isGenerating: false,
@@ -607,6 +655,7 @@ export class AgyThoughtTracker {
     let sqlCheckpointActive = false;
     const deltas: AgyThinkingDeltaActivity[] = [];
     const checkpoints: AgyCheckpointSummaryInfo[] = [];
+    const stepUsages: Array<{ stepId: number; usage: AgyUsage }> = [];
 
     for (const row of rows) {
       if (row.idx < this.#minStepIndex) continue;
@@ -650,10 +699,22 @@ export class AgyThoughtTracker {
             });
           }
         }
-        if (row.status === STEP_STATUS_DONE && row.idx > this.#lastUsageIdx) {
-          const tokens = extractContextTokensFromStepPayload(row.step_payload);
-          if (tokens !== undefined) this.#lastContextTokens = tokens;
-          this.#lastUsageIdx = row.idx;
+        if (row.status === STEP_STATUS_DONE) {
+          const stepUsage = extractUsageFromStepPayload(row.step_payload);
+          if (stepUsage) {
+            const ctxTokens = (stepUsage.input_tokens ?? 0) + (stepUsage.cache_read_tokens ?? 0);
+            if (row.idx > this.#lastUsageIdx && ctxTokens > 0) {
+              this.#lastContextTokens = ctxTokens;
+            }
+            if (!this.#emittedStepUsages.has(row.idx)) {
+              this.#emittedStepUsages.add(row.idx);
+              this.#lastTurnStepUsage = stepUsage;
+              stepUsages.push({ stepId: row.idx, usage: stepUsage });
+            }
+          }
+          if (row.idx > this.#lastUsageIdx) {
+            this.#lastUsageIdx = row.idx;
+          }
         }
       } else if (
         row.step_type === STEP_TYPE_CHECKPOINT &&
@@ -710,6 +771,7 @@ export class AgyThoughtTracker {
     return {
       deltas,
       checkpoints,
+      stepUsages,
       dbProgressed,
       agentProgressed,
       isGenerating,
@@ -719,6 +781,11 @@ export class AgyThoughtTracker {
       lastContextTokens: this.#lastContextTokens,
       awaitingPlannerAfterStep,
     };
+  }
+
+  /** Latest single-step `AgyUsage` observed on a completed `PLANNER_RESPONSE` in this turn. */
+  get lastTurnStepUsage(): AgyUsage | undefined {
+    return this.#lastTurnStepUsage;
   }
 
   /** Latest SQLite step-generating state observed by sync(). */
@@ -813,7 +880,19 @@ export class AgyThoughtTracker {
         emitSideActivity(delta);
       }
     }
-    return res.deltas.length > 0 || res.dbProgressed || res.retryAttempted || compactingFlipped;
+    if (this.#emitStepUsage) {
+      for (const item of res.stepUsages) {
+        this.flushUnemittedCheckpoints(conversationId, emitSideActivity, item.stepId);
+        emitSideActivity({ type: "usage", usage: item.usage });
+      }
+    }
+    return (
+      res.deltas.length > 0 ||
+      res.stepUsages.length > 0 ||
+      res.dbProgressed ||
+      res.retryAttempted ||
+      compactingFlipped
+    );
   }
 
   /**
@@ -883,15 +962,18 @@ export class AgyThoughtTracker {
         .prepare(
           `SELECT idx, step_type, step_payload
              FROM steps
-            WHERE step_type IN (?, ?) AND status = ?
+            WHERE step_type IN (?, ?) AND status = ? AND idx < ?
             ORDER BY idx DESC
             LIMIT 1`,
         )
-        .get(STEP_TYPE_PLANNER_RESPONSE, STEP_TYPE_CHECKPOINT, STEP_STATUS_DONE) as
-        | { idx: number; step_type: number; step_payload: Uint8Array | null }
-        | undefined;
+        .get(
+          STEP_TYPE_PLANNER_RESPONSE,
+          STEP_TYPE_CHECKPOINT,
+          STEP_STATUS_DONE,
+          this.#minStepIndex,
+        ) as { idx: number; step_type: number; step_payload: Uint8Array | null } | undefined;
       if (!row) {
-        this.#lastUsageIdx = 0;
+        this.#lastUsageIdx = this.#minStepIndex - 1;
         return;
       }
       this.#lastUsageIdx = row.idx;

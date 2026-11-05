@@ -438,9 +438,11 @@ export function selectAcpPermissionOutcome(
 
 /**
  * Convert an ACP `PromptResponse` usage payload into `AgyUsage`.
- * Note: `agy acp` reports total prompt tokens (including cached read tokens) in
- * `inputTokens` / `_meta.quota.token_count.input_tokens`, whereas `pi-agy`'s
- * `AgyUsage` expects uncached `input_tokens` + `cache_read_tokens`.
+ *
+ * Handles both uncached `usage.inputTokens` (`agy acp` 1.5.0 native format, where
+ * `inputTokens + cachedReadTokens + outputTokens === totalTokens`) and inclusive
+ * `inputTokens` / `_meta.quota.token_count.input_tokens` (where `inputTokens`
+ * includes `cachedReadTokens` and `inputTokens + outputTokens === totalTokens`).
  */
 export function acpUsageToAgyUsage(response: AcpPromptResponse): AgyUsage | undefined {
   const standard = asRecord(response.usage);
@@ -449,10 +451,11 @@ export function acpUsageToAgyUsage(response: AcpPromptResponse): AgyUsage | unde
   const tokenCount = asRecord(quota?.token_count);
 
   const cacheRead = safeNonNegativeInt(standard?.cachedReadTokens);
-  const rawInput =
-    safeNonNegativeInt(tokenCount?.input_tokens) ?? safeNonNegativeInt(standard?.inputTokens);
+  const standardInput = safeNonNegativeInt(standard?.inputTokens);
+  const quotaInput = safeNonNegativeInt(tokenCount?.input_tokens);
+  const rawInput = standardInput ?? quotaInput;
   const output =
-    safeNonNegativeInt(tokenCount?.output_tokens) ?? safeNonNegativeInt(standard?.outputTokens);
+    safeNonNegativeInt(standard?.outputTokens) ?? safeNonNegativeInt(tokenCount?.output_tokens);
   const thinking = safeNonNegativeInt(standard?.thoughtTokens);
   const explicitTotal = safeNonNegativeInt(standard?.totalTokens);
 
@@ -466,8 +469,23 @@ export function acpUsageToAgyUsage(response: AcpPromptResponse): AgyUsage | unde
     return undefined;
   }
 
-  const uncachedInput =
-    rawInput !== undefined ? Math.max(0, rawInput - (cacheRead ?? 0)) : undefined;
+  let uncachedInput = rawInput;
+  if (rawInput !== undefined && cacheRead !== undefined && cacheRead > 0) {
+    let includesCacheRead = false;
+    if (explicitTotal !== undefined) {
+      const diffIfInclusive =
+        rawInput >= cacheRead
+          ? Math.abs(rawInput + (output ?? 0) - explicitTotal)
+          : Number.POSITIVE_INFINITY;
+      const diffIfUncached = Math.abs(rawInput + cacheRead + (output ?? 0) - explicitTotal);
+      includesCacheRead = diffIfInclusive < diffIfUncached;
+    } else if (standardInput === undefined && rawInput >= cacheRead) {
+      includesCacheRead = true;
+    }
+    if (includesCacheRead) {
+      uncachedInput = Math.max(0, rawInput - cacheRead);
+    }
+  }
   const computedTotal = (uncachedInput ?? 0) + (output ?? 0) + (cacheRead ?? 0);
 
   return {
@@ -476,6 +494,35 @@ export function acpUsageToAgyUsage(response: AcpPromptResponse): AgyUsage | unde
     ...(thinking !== undefined ? { thinking_tokens: thinking } : {}),
     ...(cacheRead !== undefined ? { cache_read_tokens: cacheRead } : {}),
     total_tokens: Math.max(explicitTotal ?? 0, computedTotal),
+  };
+}
+
+/**
+ * Fallback normalization when SQLite per-step `generator_metadata` is unavailable:
+ * `agy acp` sums `inputTokens` and `cachedReadTokens` across every internal LLM
+ * sub-request in a multi-tool turn, whereas Pi treats one `AssistantMessage.usage`
+ * as that message's context window size (`input + cacheRead`).
+ */
+export function normalizeAcpTurnUsageForStepCount(
+  usage: AgyUsage,
+  modelCalls: number,
+): AgyUsage {
+  const divisor = Math.max(1, Math.floor(modelCalls));
+  if (divisor <= 1) return usage;
+  const input =
+    usage.input_tokens !== undefined ? Math.round(usage.input_tokens / divisor) : undefined;
+  const cacheRead =
+    usage.cache_read_tokens !== undefined
+      ? Math.round(usage.cache_read_tokens / divisor)
+      : undefined;
+  const output = usage.output_tokens;
+  const total = (input ?? 0) + (cacheRead ?? 0) + (output ?? 0);
+  return {
+    ...(input !== undefined ? { input_tokens: input } : {}),
+    ...(output !== undefined ? { output_tokens: output } : {}),
+    ...(usage.thinking_tokens !== undefined ? { thinking_tokens: usage.thinking_tokens } : {}),
+    ...(cacheRead !== undefined ? { cache_read_tokens: cacheRead } : {}),
+    total_tokens: total,
   };
 }
 
@@ -753,14 +800,25 @@ function inferAcpToolName(
 
   const rawTitle = typeof update.title === "string" ? update.title.trim() : "";
   if (rawTitle) {
-    if (/^[A-Za-z0-9_.:/-]+$/.test(rawTitle)) {
-      return rawTitle;
+    // `agy acp` prefixes MCP and built-in tool titles with "Run " (e.g. "Run mcp_pi-..._pi__read").
+    const cleanTitle = rawTitle.replace(/^Run\s+(?=[A-Za-z0-9_.:/-]+)/i, "");
+    if (
+      /^[A-Za-z0-9_.:/-]+$/.test(cleanTitle) &&
+      (KNOWN_AGY_TOOLS.has(cleanTitle) ||
+        cleanTitle === "call_mcp_tool" ||
+        cleanTitle.startsWith("mcp_") ||
+        cleanTitle.startsWith("pi__") ||
+        cleanTitle.includes("/pi__") ||
+        cleanTitle === rawTitle)
+    ) {
+      return cleanTitle;
     }
-    const prefixMatch = /^([A-Za-z0-9_.:/-]+)(?:\s*[:·—(-]|\s+)/.exec(rawTitle);
+    const prefixMatch = /^([A-Za-z0-9_.:/-]+)(?:\s*[:·—(-]|\s+)/.exec(cleanTitle);
     if (prefixMatch) {
       const prefix = prefixMatch[1]!;
       if (
         KNOWN_AGY_TOOLS.has(prefix) ||
+        prefix === "call_mcp_tool" ||
         prefix.startsWith("mcp_") ||
         prefix.startsWith("pi__") ||
         prefix.includes("/pi__")
@@ -848,6 +906,9 @@ export class AcpTurnNormalizer {
   readonly #tools = new Map<string, TrackedAcpToolCall>();
   #nextToolStepId = 1;
   #responseStepIndex = 0;
+  #toolBatches = 0;
+  #inToolBatch = false;
+  #sawPostToolChunk = false;
   #streamedTextSegments: string[] = [];
   #currentSegment = "";
 
@@ -869,6 +930,8 @@ export class AcpTurnNormalizer {
         if (content?.type === "text" && typeof content.text === "string" && content.text) {
           const clean = content.text.replace(/[\uFFF9-\uFFFB]/g, "");
           if (clean) {
+            if (this.#toolBatches > 0) this.#sawPostToolChunk = true;
+            this.#inToolBatch = false;
             activities.push({
               type: "thinking_delta",
               delta: clean,
@@ -887,6 +950,8 @@ export class AcpTurnNormalizer {
             content.text,
           );
           if (delta) {
+            if (this.#toolBatches > 0) this.#sawPostToolChunk = true;
+            this.#inToolBatch = false;
             this.#currentSegment += delta;
             activities.push({
               type: "text",
@@ -972,6 +1037,11 @@ export class AcpTurnNormalizer {
           }
         } else if (!tracked.started) {
           tracked.started = true;
+          if (!this.#inToolBatch) {
+            this.#toolBatches += 1;
+            this.#inToolBatch = true;
+            this.#sawPostToolChunk = false;
+          }
           activities.push({
             type: "tool_start",
             stepId: tracked.stepId,
@@ -1002,6 +1072,14 @@ export class AcpTurnNormalizer {
 
     this.#outcome.activities.push(...activities);
     return activities;
+  }
+
+  /** Estimated number of internal LLM calls in this turn (tool batches + final response). */
+  estimatedModelCallCount(): number {
+    return Math.max(
+      1,
+      this.#toolBatches + (this.#toolBatches === 0 || this.#sawPostToolChunk ? 1 : 0),
+    );
   }
 
   /** Final assistant text assembled from the latest post-tool response segment (or full text). */

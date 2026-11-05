@@ -21,6 +21,7 @@ import {
   extractAcpQuotaSnapshot,
   formatAcpStopError,
   modelsFromAcpSessionState,
+  normalizeAcpTurnUsageForStepCount,
   readAcpMcpServersFromDirectory,
   selectAcpPermissionOutcome,
   type AcpAuthMethod,
@@ -142,11 +143,12 @@ export interface AgyAcpDriverSessionOptions {
 }
 
 function isBridgedToolName(name: string): boolean {
+  const clean = name.replace(/^Run\s+/i, "");
   return (
-    name === "call_mcp_tool" ||
-    /^pi__[A-Za-z0-9_]+$/.test(name) ||
-    /^mcp_[^_]+_pi__/.test(name) ||
-    /\/pi__[A-Za-z0-9_]+$/.test(name)
+    clean === "call_mcp_tool" ||
+    /^pi__[A-Za-z0-9_]+$/.test(clean) ||
+    /^mcp_[^_]+_pi__/.test(clean) ||
+    /\/pi__[A-Za-z0-9_]+$/.test(clean)
   );
 }
 
@@ -422,6 +424,7 @@ export class AgyAcpDriverSession implements AgyTurnExecutor {
       {
         ...(this.#logDir ? { logDir: this.#logDir } : {}),
         emitThinkingDeltas: false,
+        emitStepUsage: true,
       },
     );
 
@@ -1219,12 +1222,21 @@ async function awaitTurnExecution(
     hooks.onQuota(quota);
   }
 
+  const sqliteStepUsage = thoughtTracker.lastTurnStepUsage;
   const turnUsage = acpUsageToAgyUsage(promptResponse);
-  if (turnUsage) {
-    // Emit per-turn step usage before `result` so `provider.ts` attaches live
-    // per-turn context/output token counts directly rather than treating ACP's
-    // per-turn counters as cumulative conversation totals.
-    const usageActivity: AgyActivity = { type: "usage", usage: turnUsage };
+  if (sqliteStepUsage) {
+    // SQLite `PLANNER_RESPONSE` steps already emitted exact per-step `{ type: "usage" }`
+    // activities via `thoughtTracker.sync()`. Record the latest step's context footprint
+    // instead of ACP `PromptResponse.usage` (which sums every internal sub-call in a
+    // multi-tool turn and would falsely inflate single-message context to millions of tokens).
+    outcome.usage = sqliteStepUsage;
+  } else if (turnUsage) {
+    const normalizedUsage = normalizeAcpTurnUsageForStepCount(
+      turnUsage,
+      normalizer.estimatedModelCallCount(),
+    );
+    outcome.usage = normalizedUsage;
+    const usageActivity: AgyActivity = { type: "usage", usage: normalizedUsage };
     outcome.activities.push(usageActivity);
     hooks.onRecordProgress();
     request.onActivity?.(usageActivity);
