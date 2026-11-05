@@ -214,16 +214,21 @@ export function resolveBranchContextFootprint(branch: readonly unknown[]): Branc
           agyTokens = entry.data.contextTokens;
           latestIsAgy = true;
         }
-      } else if (
-        entry.customType === AGY_COMPACTION_ENTRY &&
-        entry.data &&
-        typeof entry.data.afterTokens === "number" &&
-        Number.isFinite(entry.data.afterTokens) &&
-        entry.data.afterTokens > 0
-      ) {
-        agyTokens = entry.data.afterTokens;
-        latestIsAgy = true;
-        awaitingPostCompactionTurn = false;
+      } else if (entry.customType === AGY_COMPACTION_ENTRY && entry.data) {
+        if (
+          typeof entry.data.afterTokens === "number" &&
+          Number.isFinite(entry.data.afterTokens) &&
+          entry.data.afterTokens > 0
+        ) {
+          agyTokens = entry.data.afterTokens;
+          latestIsAgy = true;
+          awaitingPostCompactionTurn = false;
+        } else {
+          // Checkpoint just landed mid-turn before post-compaction usage arrived:
+          // clear the stale pre-compaction context count until the next step reports usage.
+          agyTokens = undefined;
+          latestIsAgy = false;
+        }
       }
       continue;
     }

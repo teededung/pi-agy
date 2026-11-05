@@ -33,13 +33,24 @@ import type {
   ProviderModelConfig,
 } from "@earendil-works/pi-coding-agent";
 import {
+  CompactionSummaryMessageComponent,
   getDocsPath,
   getExamplesPath,
   getReadmePath,
+  keyText,
   ModelSelectorComponent,
   SessionSelectorComponent,
 } from "@earendil-works/pi-coding-agent";
-import { Marked, stripTerminalSequences, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import {
+  Box,
+  Container,
+  Marked,
+  Spacer,
+  stripTerminalSequences,
+  Text,
+  truncateToWidth,
+  visibleWidth,
+} from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
@@ -561,6 +572,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   let subagentSpawnedThisTurn = false;
   let lastSettledSpawnedSubagent = false;
   let lastSettledOutcome: AgySettledTurnOutcome | undefined;
+  let compactingWorkingUiActive = false;
 
   interface ActiveGoalState {
     request: string;
@@ -642,19 +654,42 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     }
   };
 
-  pi.registerEntryRenderer(AGY_COMPACTION_ENTRY, (entry, _options, theme) => {
-    const marker = entry.data as AgyCompactionMarker;
-    const text =
-      theme.fg("dim", "── ") +
-      theme.fg("accent", "agy compacted context") +
-      theme.fg(
-        "dim",
-        ` · ~${formatAgyContextTokens(marker.beforeTokens)} → ~${formatAgyContextTokens(marker.afterTokens)} ──`,
-      );
-    return {
-      render: (width: number) => [truncateToWidth(text, width, "")],
-      invalidate: () => {},
-    };
+  pi.registerEntryRenderer(AGY_COMPACTION_ENTRY, (entry, options, theme) => {
+    const marker = entry.data as AgyCompactionMarker | undefined;
+    if (!marker) return undefined;
+    const beforeTokens =
+      typeof marker.beforeTokens === "number" && Number.isFinite(marker.beforeTokens)
+        ? Math.max(0, Math.round(marker.beforeTokens))
+        : 0;
+    if (typeof marker.summary === "string" && marker.summary.trim().length > 0) {
+      const comp = new CompactionSummaryMessageComponent({
+        role: "compactionSummary",
+        summary: marker.summary,
+        tokensBefore: beforeTokens,
+        timestamp: Date.parse(marker.detectedAt) || Date.now(),
+      });
+      comp.setExpanded(options.expanded);
+      return comp;
+    }
+    const afterTokens =
+      typeof marker.afterTokens === "number" &&
+      Number.isFinite(marker.afterTokens) &&
+      marker.afterTokens > 0
+        ? Math.round(marker.afterTokens)
+        : undefined;
+    const detail =
+      beforeTokens > 0 && afterTokens !== undefined
+        ? `Compacted from ${beforeTokens.toLocaleString()} → ${afterTokens.toLocaleString()} tokens`
+        : beforeTokens > 0
+          ? `Compacted from ${beforeTokens.toLocaleString()} tokens`
+          : "Compacted context";
+    const box = new Box(1, 1, (t) => theme.bg("customMessageBg", t));
+    const content = new Container();
+    content.addChild(new Text(theme.fg("customMessageLabel", "\x1b[1m[compaction]\x1b[22m"), 0, 0));
+    content.addChild(new Spacer(1));
+    content.addChild(new Text(theme.fg("customMessageText", detail), 0, 0));
+    box.addChild(content);
+    return box;
   });
 
   pi.registerEntryRenderer(AGY_CONSULT_ENTRY, (entry, _options, theme) => {
@@ -1446,14 +1481,81 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     })();
   }
 
+  function setAgyCompactingUi(active: boolean, beforeTokens?: number): void {
+    const probedUi = activeSessionCtx ? probeCtx(() => activeSessionCtx?.ui) : undefined;
+    const ui = tasksUi ?? (probedUi && !probedUi.stale ? probedUi.value : undefined);
+    if (!active) {
+      if (!compactingWorkingUiActive) return;
+      compactingWorkingUiActive = false;
+      try {
+        ui?.setWorkingMessage(undefined);
+      } catch {
+        // UI may already be disposed.
+      }
+      return;
+    }
+    if (!ui) return;
+    const tokenHint =
+      typeof beforeTokens === "number" && Number.isFinite(beforeTokens) && beforeTokens > 0
+        ? ` (~${formatAgyContextTokens(beforeTokens)})`
+        : "";
+    let cancelHint = "(esc to cancel)";
+    try {
+      cancelHint = `(${keyText("app.interrupt")} to cancel)`;
+    } catch {}
+    try {
+      ui.setWorkingMessage(`Auto-compacting${tokenHint}... ${cancelHint}`);
+      compactingWorkingUiActive = true;
+    } catch {
+      // Non-interactive UI stub may not implement setWorkingMessage.
+    }
+  }
+
   function handleAgyActivity(activity: AgyActivity): void {
     if (activity.type === "conversation_fallback") {
+      setAgyCompactingUi(false);
       observedContextTokens = undefined;
       persistedConversationKey = undefined;
       subagentRoster.clear();
       renderAgyStatusWidget(true);
       requestFooterRender?.();
       return;
+    }
+    if (activity.type === "compacting") {
+      setAgyCompactingUi(activity.active, activity.beforeTokens ?? observedContextTokens);
+      return;
+    }
+    if (activity.type === "checkpoint") {
+      setAgyCompactingUi(false);
+      const beforeTokens = activity.beforeTokens ?? observedContextTokens ?? 0;
+      const marker: AgyCompactionMarker = {
+        version: 1,
+        beforeTokens,
+        ...(activity.summary ? { summary: activity.summary } : {}),
+        ...(activity.stepId !== undefined ? { stepId: activity.stepId } : {}),
+        ...(activity.durationSeconds !== undefined
+          ? { durationSeconds: activity.durationSeconds }
+          : {}),
+        detectedAt: new Date().toISOString(),
+      };
+      try {
+        pi.appendEntry(AGY_COMPACTION_ENTRY, marker);
+      } catch {
+        // Session replaced mid-activity; the marker is advisory only.
+      }
+      observedContextTokens = undefined;
+      requestFooterRender?.();
+      return;
+    }
+    if (
+      compactingWorkingUiActive &&
+      (activity.type === "thinking_delta" ||
+        activity.type === "text" ||
+        activity.type === "tool_start" ||
+        activity.type === "result" ||
+        activity.type === "stall")
+    ) {
+      setAgyCompactingUi(false);
     }
     trackAgySubagent(subagentRoster, activity);
     if (
@@ -1620,6 +1722,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         replay,
         bridge,
         (outcome) => {
+          setAgyCompactingUi(false);
           lastSettledOutcome = outcome;
           lastSettledSpawnedSubagent = subagentSpawnedThisTurn;
           subagentSpawnedThisTurn = false;
@@ -1811,6 +1914,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   };
 
   pi.on("agent_settled", async (event, ctx: ExtensionContext) => {
+    setAgyCompactingUi(false);
     const settledOutcome = lastSettledOutcome;
     lastSettledOutcome = undefined;
     const hadSubagentThisTurn = lastSettledSpawnedSubagent || subagentSpawnedThisTurn;
@@ -1943,6 +2047,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
 
   pi.on("session_start", async (event, ctx: ExtensionContext) => {
     activeSessionCtx = ctx;
+    setAgyCompactingUi(false);
     lastSyncedSessionTitleKey = undefined;
     oneShotConsult = undefined;
     lastConsultUsed = undefined;
@@ -2067,6 +2172,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         updateConsultStatus(ui.value);
       }
     } else {
+      setAgyCompactingUi(false);
       const ui = probeCtx(() => ctx?.ui);
       if (!ui.stale && ui.value) {
         try {
@@ -2089,6 +2195,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     // An agy conversation cannot be rewound to match a different pi branch.
     // Restart it and bootstrap the selected branch on the next provider call.
     activeSessionCtx = ctx;
+    setAgyCompactingUi(false);
     const provider = probeCtx(() => ctx.model?.provider);
     if (!provider.stale) syncWrapperToolActivation(provider.value);
     const cwd = probeCtx(() => ctx.cwd);
@@ -2113,6 +2220,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     // branch. Reset the agy conversation so the next turn bootstraps from the
     // compacted branch and the footer immediately clears pre-compaction tokens.
     activeSessionCtx = ctx;
+    setAgyCompactingUi(false);
     const cwd = probeCtx(() => ctx.cwd);
     if (cwd.stale) return;
     const previousConversationId = await captureActiveConversationId();
@@ -2193,6 +2301,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     await teardownBridge();
     sweepStalePiToolsConversations();
     try {
+      setAgyCompactingUi(false);
       tasksUi?.setStatus("antigravity", undefined);
       tasksUi?.setWidget(AGY_STATUS_WIDGET_KEY, undefined);
       tasksUi?.setWidget(AGY_TASKS_WIDGET_KEY, undefined);

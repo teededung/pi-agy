@@ -316,6 +316,12 @@ async function runSingleAgyTurn(request: AgyTurnRequest): Promise<AgyTurnOutcome
     let untracked = false;
     let stallTimer: NodeJS.Timeout | undefined;
     let thoughtPollTimer: NodeJS.Timeout | undefined;
+    let stallGraces = 0;
+
+    const emitSideActivity = (activity: AgyActivity) => {
+      outcome.activities.push(activity);
+      request.onActivity?.(activity);
+    };
 
     const untrack = () => {
       if (untracked) return;
@@ -327,6 +333,7 @@ async function runSingleAgyTurn(request: AgyTurnRequest): Promise<AgyTurnOutcome
     const finishLogical = (fn: () => void) => {
       if (settled) return;
       settled = true;
+      thoughtTracker.finishCompacting(emitSideActivity);
       clearTimeout(killTimer);
       if (stallTimer !== undefined) {
         clearTimeout(stallTimer);
@@ -356,6 +363,12 @@ async function runSingleAgyTurn(request: AgyTurnRequest): Promise<AgyTurnOutcome
       });
     }, request.timeoutMs ?? 1_800_000);
 
+    const syncThoughtTracker = () =>
+      thoughtTracker.sync(
+        outcome.conversationId ?? request.conversationId,
+        emitSideActivity,
+      );
+
     // Stall watchdog: any stdout/stderr bytes count as liveness (chunk level,
     // not parsed events — unknown shapes must still reset the timer). A tool
     // step that is legitimately quiet gets the longer tool budget.
@@ -368,12 +381,14 @@ async function runSingleAgyTurn(request: AgyTurnRequest): Promise<AgyTurnOutcome
         if (stallTimer !== undefined) clearTimeout(stallTimer);
         const budgetMs = activeTools.size > 0 ? stallToolMs : stallBaseMs;
         stallTimer = setTimeout(() => {
-          const pollRes = thoughtTracker.poll();
-          for (const delta of pollRes.deltas) {
-            outcome.activities.push(delta);
-            request.onActivity?.(delta);
+          if (syncThoughtTracker()) {
+            stallGraces = 0;
+            armStall();
+            return;
           }
-          if (pollRes.deltas.length > 0 || pollRes.dbProgressed || pollRes.isGenerating) {
+          const likelyCompacting = thoughtTracker.isLikelyCompacting(activeTools.size > 0);
+          if ((thoughtTracker.isGenerating || likelyCompacting) && stallGraces < 6) {
+            stallGraces += 1;
             armStall();
             return;
           }
@@ -384,21 +399,18 @@ async function runSingleAgyTurn(request: AgyTurnRequest): Promise<AgyTurnOutcome
           });
         }, budgetMs);
       };
-      rearmStall = armStall;
+      rearmStall = () => {
+        stallGraces = 0;
+        armStall();
+      };
       armStall();
-      child.stdout?.on("data", armStall);
-      child.stderr?.on("data", armStall);
+      child.stdout?.on("data", rearmStall);
+      child.stderr?.on("data", rearmStall);
     }
 
     const pollThoughts = () => {
       if (settled || outcome.finished) return;
-      if (outcome.conversationId) thoughtTracker.setConversationId(outcome.conversationId);
-      const res = thoughtTracker.poll();
-      for (const delta of res.deltas) {
-        outcome.activities.push(delta);
-        request.onActivity?.(delta);
-      }
-      if (res.deltas.length > 0 || res.dbProgressed) {
+      if (syncThoughtTracker()) {
         rearmStall();
       }
     };
@@ -453,6 +465,15 @@ async function runSingleAgyTurn(request: AgyTurnRequest): Promise<AgyTurnOutcome
       }
       pollThoughts();
       for (const activity of applyEvent(outcome, parsed)) {
+        if (
+          !thoughtTracker.prepareStreamActivity(
+            activity,
+            outcome.conversationId ?? request.conversationId,
+            emitSideActivity,
+          )
+        ) {
+          continue;
+        }
         trackActiveToolStep(activeTools, activity);
         request.onActivity?.(activity);
       }

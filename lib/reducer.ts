@@ -9,6 +9,7 @@
  */
 
 import type { JsonObject } from "@earendil-works/pi-ai";
+import { agyContextTokens } from "./agy-compaction.ts";
 import type { AgyFinishedReason, AgyStepUpdate, AgyUsage, ParsedAgyEvent } from "./events.ts";
 import { parseAgyLine } from "./events.ts";
 
@@ -71,6 +72,21 @@ export type AgyActivity =
       tokens: number;
       durationSeconds?: number;
       stepId?: number;
+    }
+  | {
+      /** Live compaction state transition (detected via SQLite/CLI-log or active checkpoint step). */
+      type: "compacting";
+      active: boolean;
+      beforeTokens?: number;
+    }
+  | {
+      /** Completed native context compaction (`step_type: "checkpoint", state: "DONE"`). */
+      type: "checkpoint";
+      stepId?: number;
+      conversationId?: string;
+      durationSeconds?: number;
+      beforeTokens?: number;
+      summary?: string;
     }
   | { type: "usage"; usage: AgyUsage }
   | {
@@ -286,6 +302,25 @@ export function applyEvent(outcome: AgyTurnOutcome, event: ParsedAgyEvent): AgyA
               stepId: step.step_index,
             });
           }
+        }
+      } else if (step.step_type === "checkpoint") {
+        const cid = step.conversation_id ?? outcome.conversationId;
+        const stepBeforeTokens = agyContextTokens(step.usage);
+        if (step.state === "ACTIVE") {
+          activities.push({
+            type: "compacting",
+            active: true,
+            ...(stepBeforeTokens !== undefined ? { beforeTokens: stepBeforeTokens } : {}),
+          });
+        } else if (step.state === "DONE") {
+          activities.push({
+            type: "checkpoint",
+            stepId: step.step_index,
+            conversationId: cid,
+            durationSeconds:
+              typeof step.duration_seconds === "number" ? step.duration_seconds : undefined,
+            ...(stepBeforeTokens !== undefined ? { beforeTokens: stepBeforeTokens } : {}),
+          });
         }
       }
       break;

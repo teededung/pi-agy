@@ -234,6 +234,14 @@ function isAgyCompactionEntry(entry: unknown): boolean {
   return record.type === "custom" && record.customType === AGY_COMPACTION_ENTRY;
 }
 
+function extractAgyCompactionSummary(entry: unknown): string | undefined {
+  if (!isAgyCompactionEntry(entry)) return undefined;
+  const data = (entry as { data?: { summary?: unknown } }).data;
+  return typeof data?.summary === "string" && data.summary.trim().length > 0
+    ? data.summary.trim()
+    : undefined;
+}
+
 function isBranchMessageEntry(entry: unknown): entry is { type: "message"; message: unknown } {
   if (!entry || typeof entry !== "object") return false;
   return (entry as { type?: unknown }).type === "message" && "message" in entry;
@@ -255,8 +263,8 @@ function countsAsContextMessage(entry: unknown): boolean {
 function sliceMessagesAfterCompaction(
   priorMessages: TranscriptContext["messages"],
   branch?: readonly unknown[],
-): { messages: TranscriptContext["messages"]; compacted: boolean } {
-  if (!branch || branch.length === 0 || priorMessages.length === 0) {
+): { messages: TranscriptContext["messages"]; compacted: boolean; summary?: string } {
+  if (!branch || branch.length === 0) {
     return { messages: priorMessages, compacted: false };
   }
   let lastAgyCompactionIdx = -1;
@@ -275,6 +283,14 @@ function sliceMessagesAfterCompaction(
   }
   if (lastAgyCompactionIdx < 0 || lastAgyCompactionIdx < lastNativeCompactionIdx) {
     return { messages: priorMessages, compacted: false };
+  }
+  const summary = extractAgyCompactionSummary(branch[lastAgyCompactionIdx]);
+  if (priorMessages.length === 0) {
+    return {
+      messages: priorMessages,
+      compacted: Boolean(summary),
+      ...(summary ? { summary } : {}),
+    };
   }
 
   let firstPostCompactionIdx = -1;
@@ -320,7 +336,11 @@ function sliceMessagesAfterCompaction(
   }
 
   if (firstPostCompactionIdx <= 0) {
-    return { messages: priorMessages, compacted: false };
+    return {
+      messages: priorMessages,
+      compacted: Boolean(summary),
+      ...(summary ? { summary } : {}),
+    };
   }
   const postCompaction = priorMessages.slice(firstPostCompactionIdx);
   if (postCompaction.length > 0 && postCompaction[0]!.role !== "user") {
@@ -328,13 +348,19 @@ function sliceMessagesAfterCompaction(
       if (priorMessages[i]!.role !== "user") continue;
       const end = i + 1;
       while (i > 0 && priorMessages[i - 1]!.role === "user") i--;
+      const compacted = i > 0 || end < firstPostCompactionIdx || Boolean(summary);
       return {
         messages: [...priorMessages.slice(i, end), ...postCompaction],
-        compacted: i > 0 || end < firstPostCompactionIdx,
+        compacted,
+        ...(compacted && summary ? { summary } : {}),
       };
     }
   }
-  return { messages: postCompaction, compacted: true };
+  return {
+    messages: postCompaction,
+    compacted: true,
+    ...(summary ? { summary } : {}),
+  };
 }
 
 /** Serialize the active pi branch before its latest user request. */
@@ -346,10 +372,11 @@ export function piHistoryBootstrap(
   const { start: latestUser } = latestUserBatch(context);
   if (latestUser <= 0) return undefined;
 
-  const { messages: historyMessages, compacted } = sliceMessagesAfterCompaction(
-    context.messages.slice(0, latestUser),
-    branch,
-  );
+  const {
+    messages: historyMessages,
+    compacted,
+    summary: compactionSummary,
+  } = sliceMessagesAfterCompaction(context.messages.slice(0, latestUser), branch);
   const entries: string[] = [];
   for (const raw of historyMessages) {
     if (raw.role === "system") continue;
@@ -391,15 +418,23 @@ export function piHistoryBootstrap(
         : (message.role ?? "message");
     entries.push(`${role}:\n${rendered.join("\n")}`);
   }
-  if (entries.length === 0) return undefined;
+  if (entries.length === 0 && !compactionSummary) return undefined;
   const transcript = entries.join("\n\n");
   const maxHistoryChars = Math.max(10_000, MAX_RESTORED_HISTORY_CHARS - promptReserveChars);
+  const compactionPrefix = compactionSummary
+    ? `[Earlier history compacted]\n<summary>\n${compactionSummary}\n</summary>`
+    : "[Earlier history compacted]";
+  const fullTranscript = compacted
+    ? transcript
+      ? `${compactionPrefix}\n${transcript}`
+      : compactionPrefix
+    : transcript;
   const bounded =
-    transcript.length <= maxHistoryChars
-      ? compacted
-        ? `[Earlier history compacted]\n${transcript}`
-        : transcript
-      : `[Earlier history omitted]\n${transcript.slice(-maxHistoryChars)}`;
+    fullTranscript.length <= maxHistoryChars
+      ? fullTranscript
+      : compacted
+        ? `[Earlier history compacted]\n${fullTranscript.slice(-maxHistoryChars)}`
+        : `[Earlier history omitted]\n${transcript.slice(-maxHistoryChars)}`;
   return restoredPiContextPrompt(bounded);
 }
 
@@ -1550,7 +1585,9 @@ export function streamAntigravity(
             // UI side channels are best-effort and must never fail the turn.
           }
           switch (activity.type) {
-            case "conversation_fallback": {
+            case "conversation_fallback":
+            case "compacting":
+            case "checkpoint": {
               // Runtime/index side channel only; no assistant content.
               break;
             }

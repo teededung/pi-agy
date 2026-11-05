@@ -108,7 +108,6 @@ interface ActiveTurn {
   conversationReported: boolean;
   thoughtTracker: AgyThoughtTracker;
   thoughtPollTimer?: NodeJS.Timeout;
-  dbGenerating: boolean;
   overallTimer?: NodeJS.Timeout;
   deadlineAt: number;
   stallTimer?: NodeJS.Timeout;
@@ -279,6 +278,9 @@ export class AgyDriverSession implements AgyTurnExecutor {
   #probeSubagents: (
     conversationId: string | undefined,
   ) => Promise<AgySubagentProbeResult> = agyProbeSubagents;
+  /** Test seam for creating per-turn SQLite/CLI-log thought & compaction trackers. */
+  #createThoughtTracker: (conversationId?: string) => AgyThoughtTracker = (conversationId) =>
+    new AgyThoughtTracker(conversationId);
   #parkedPollMs = STALL_PARKED_POLL_MS;
   #parkedLimit = STALL_PARKED_LIMIT;
   /** Early parked-answer watch interval; 0 disables it (stall budget only). */
@@ -322,6 +324,11 @@ export class AgyDriverSession implements AgyTurnExecutor {
     probe: (conversationId: string | undefined) => Promise<AgySubagentProbeResult>,
   ): void {
     this.#probeSubagents = probe;
+  }
+
+  /** Test hook: override the per-turn AgyThoughtTracker factory. */
+  setThoughtTrackerFactory(factory: (conversationId?: string) => AgyThoughtTracker): void {
+    this.#createThoughtTracker = factory;
   }
 
   snapshot(): AgyExecutorSnapshot {
@@ -551,8 +558,9 @@ export class AgyDriverSession implements AgyTurnExecutor {
       outcome: newTurnOutcome(),
       activeTools: new Set(),
       conversationReported: false,
-      thoughtTracker: new AgyThoughtTracker(request.conversationId ?? this.#boundConversationId),
-      dbGenerating: false,
+      thoughtTracker: this.#createThoughtTracker(
+        request.conversationId ?? this.#boundConversationId,
+      ),
       deadlineAt: performance.now() + (request.timeoutMs ?? 1_800_000),
       stallGraces: 0,
       parkedChecks: 0,
@@ -565,17 +573,18 @@ export class AgyDriverSession implements AgyTurnExecutor {
     };
   }
 
+  #emitSideActivity(turn: ActiveTurn, activity: AgyActivity): void {
+    turn.outcome.activities.push(activity);
+    turn.request.onActivity?.(activity);
+  }
+
   #pollThoughts(turn: ActiveTurn): boolean {
     if (this.#active !== turn || turn.outcome.finished) return false;
     const cid = turn.outcome.conversationId ?? this.#boundConversationId;
-    if (cid) turn.thoughtTracker.setConversationId(cid);
-    const res = turn.thoughtTracker.poll();
-    turn.dbGenerating = res.isGenerating;
-    for (const delta of res.deltas) {
-      turn.outcome.activities.push(delta);
-      turn.request.onActivity?.(delta);
-    }
-    if (res.deltas.length > 0 || res.dbProgressed) {
+    const progressed = turn.thoughtTracker.sync(cid, (activity) =>
+      this.#emitSideActivity(turn, activity),
+    );
+    if (progressed) {
       turn.silenceMs = 0;
       turn.stallGraces = 0;
       this.#rearmStall(turn);
@@ -872,14 +881,23 @@ export class AgyDriverSession implements AgyTurnExecutor {
     const conversationId = turn.outcome.conversationId ?? this.#boundConversationId;
 
     // If SQLite shows the current step is actively GENERATING/PENDING (status 8 or 1),
-    // do not count this window as a dead stream while within the grace ceiling.
-    if (turn.dbGenerating && (graceRemainingMs > 0 || turn.stallGraces < this.#stallGraceLimit)) {
+    // or agy is actively compacting a large trajectory in memory before writing the
+    // CHECKPOINT step, do not count this window as a dead stream while within the grace ceiling.
+    const likelyCompacting = turn.thoughtTracker.isLikelyCompacting(toolActive);
+    if (
+      (turn.thoughtTracker.isGenerating || likelyCompacting) &&
+      (graceRemainingMs > 0 || turn.stallGraces < this.#stallGraceLimit)
+    ) {
       if (graceRemainingMs > 0) {
         this.#scheduleGraceCheck(turn, graceRemainingMs, epoch);
         return;
       }
       turn.stallGraces += 1;
-      this.#log(`stall:db-generating:${turn.stallGraces}`);
+      this.#log(
+        likelyCompacting
+          ? `stall:compacting:${turn.stallGraces}`
+          : `stall:db-generating:${turn.stallGraces}`,
+      );
       this.#scheduleGraceCheck(turn, this.#stallBudgetMs(turn), epoch);
       return;
     }
@@ -1120,6 +1138,15 @@ export class AgyDriverSession implements AgyTurnExecutor {
     // so thinking always appears before the text or tool calls of that step.
     this.#pollThoughts(turn);
     for (const activity of applyEvent(turn.outcome, parsed)) {
+      if (
+        !turn.thoughtTracker.prepareStreamActivity(
+          activity,
+          turn.outcome.conversationId ?? this.#boundConversationId,
+          (sideActivity) => this.#emitSideActivity(turn, sideActivity),
+        )
+      ) {
+        continue;
+      }
       // agy can repeat the same ACTIVE step line; only a genuinely new tool
       // start may have spawned a process group worth recording. Repeated
       // updates for a step already tracked skip the scan, but a NEW tool
@@ -1234,6 +1261,7 @@ export class AgyDriverSession implements AgyTurnExecutor {
 
   #settleTurn(turn: ActiveTurn, result: { outcome: AgyTurnOutcome } | { error: unknown }): void {
     if (this.#active !== turn) return;
+    turn.thoughtTracker.finishCompacting((activity) => this.#emitSideActivity(turn, activity));
     if (turn.overallTimer) clearTimeout(turn.overallTimer);
     if (turn.stallTimer) clearTimeout(turn.stallTimer);
     if (turn.thoughtPollTimer) clearInterval(turn.thoughtPollTimer);

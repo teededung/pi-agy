@@ -51,7 +51,13 @@ import {
   type AgySubagentEntry,
 } from "../lib/subagents.ts";
 import { readAgyToolMode, resolveAgyToolModeCommand } from "../lib/tool-mode.ts";
-import { AGY_COMPACTION_ENTRY } from "../lib/agy-compaction.ts";
+import { AGY_COMPACTION_ENTRY, cleanAgyCheckpointSummary } from "../lib/agy-compaction.ts";
+import {
+  AgyThoughtTracker,
+  extractCheckpointSummaryFromStepPayload,
+  extractContextTokensFromStepPayload,
+} from "../lib/agy-thoughts.ts";
+import { AgyDriverSession } from "../lib/agy-driver.ts";
 import {
   ALL_FALLBACK_MODELS,
   getAgyConsultCompletions,
@@ -2269,6 +2275,499 @@ test("renderFooterLines clips long gitBranch/sessionName and keeps model + think
   const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
   assert.match(stripAnsi(narrow[0]!), /…\s+gemini-4-argon • medium$/);
 });
+
+function encodeVarint(value: number): Buffer {
+  const bytes: number[] = [];
+  let v = value;
+  while (v >= 0x80) {
+    bytes.push((v & 0x7f) | 0x80);
+    v = Math.floor(v / 128);
+  }
+  bytes.push(v);
+  return Buffer.from(bytes);
+}
+
+function encodeVarintField(fieldNumber: number, value: number): Buffer {
+  return Buffer.concat([encodeVarint(fieldNumber * 8), encodeVarint(value)]);
+}
+
+function encodeBytesField(fieldNumber: number, payload: Buffer | string): Buffer {
+  const buf = typeof payload === "string" ? Buffer.from(payload, "utf8") : payload;
+  return Buffer.concat([encodeVarint(fieldNumber * 8 + 2), encodeVarint(buf.length), buf]);
+}
+
+function buildStepPayloadWithUsageAndSummary(opts: {
+  inputTokens?: number;
+  cacheReadTokens?: number;
+  thinking?: string;
+  checkpointSummary?: string;
+}): Buffer {
+  const parts: Buffer[] = [];
+  if (opts.inputTokens !== undefined || opts.cacheReadTokens !== undefined) {
+    const genMeta = Buffer.concat([
+      opts.inputTokens !== undefined ? encodeVarintField(2, opts.inputTokens) : Buffer.alloc(0),
+      opts.cacheReadTokens !== undefined
+        ? encodeVarintField(5, opts.cacheReadTokens)
+        : Buffer.alloc(0),
+    ]);
+    const stepMeta = encodeBytesField(9, genMeta);
+    parts.push(encodeBytesField(5, stepMeta));
+  }
+  if (opts.thinking !== undefined) {
+    const planner = encodeBytesField(3, opts.thinking);
+    parts.push(encodeBytesField(20, planner));
+  }
+  if (opts.checkpointSummary !== undefined) {
+    const cp = encodeBytesField(5, opts.checkpointSummary);
+    parts.push(encodeBytesField(30, cp));
+  }
+  return Buffer.concat(parts);
+}
+
+test("AgyThoughtTracker detects live compaction from SQLite + CLI logs and extracts checkpoint summaries", async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), "pi-agy-compaction-tracker-"));
+  try {
+    const conversationsDir = path.join(tmp, "conversations");
+    const logDir = path.join(tmp, "log");
+    await mkdir(conversationsDir, { recursive: true });
+    await mkdir(logDir, { recursive: true });
+
+    const cid = "28c3b74b-e5fd-46d2-abfc-c7d0b70ef674";
+    const dbPath = path.join(conversationsDir, `${cid}.db`);
+    const logPath = path.join(logDir, "cli-20261105_072754.log");
+
+    const db = new DatabaseSync(dbPath);
+    db.exec(
+      "CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, step_payload BLOB)",
+    );
+    // Seed turn history: user_input(87), planner(90) with 245,349 context tokens, tool(92) DONE
+    db.prepare("INSERT INTO steps (idx, step_type, status, step_payload) VALUES (?, ?, ?, ?)").run(
+      87,
+      14,
+      3,
+      Buffer.from([0x08, 14]),
+    );
+    db.prepare("INSERT INTO steps (idx, step_type, status, step_payload) VALUES (?, ?, ?, ?)").run(
+      90,
+      15,
+      3,
+      buildStepPayloadWithUsageAndSummary({ inputTokens: 6_439, cacheReadTokens: 238_910 }),
+    );
+    db.prepare("INSERT INTO steps (idx, step_type, status, step_payload) VALUES (?, ?, ?, ?)").run(
+      92,
+      132,
+      3,
+      Buffer.from("bash tool output"),
+    );
+
+    await writeFile(
+      logPath,
+      `I1105 07:36:32.000000 1 conversation_manager.go:874] Forwarding user message to conversation ${cid} (items=1, media=0)\n`,
+      "utf8",
+    );
+
+    let nowMs = 1_700_000_000_000;
+    const tracker = new AgyThoughtTracker(cid, conversationsDir, {
+      logDir,
+      now: () => nowMs,
+    });
+
+    // Initial poll: baseline captured, not compacting, lastContextTokens = 245,349
+    const p0 = tracker.poll();
+    assert.equal(p0.isCompacting, false);
+    assert.equal(p0.lastContextTokens, 245_349);
+    assert.equal(p0.awaitingPlannerAfterStep, true);
+
+    // Safety monitor LLM call (sir_flash_lite) must NOT trigger isCompacting
+    await writeFile(
+      logPath,
+      [
+        `I1105 07:36:32.000000 1 conversation_manager.go:874] Forwarding user message to conversation ${cid} (items=1, media=0)`,
+        `I1105 07:37:55.513869 4794 llm_monitor.go:712] LLM Monitor sir_flash_lite: Calling LLM (model: MODEL_TIER_FLASH_LITE)`,
+        `I1105 07:37:56.265503 4796 http_helpers.go:365] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse Trace: 0x1`,
+        `I1105 07:37:57.545955 4793 runner.go:839] Monitor sir_flash_lite FINISHED: triggered=false`,
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    nowMs += 3_000;
+    assert.equal(tracker.poll().isCompacting, false);
+
+    // Compaction streamGenerateContent starts without a new SQLite step
+    await writeFile(
+      logPath,
+      [
+        `I1105 07:36:32.000000 1 conversation_manager.go:874] Forwarding user message to conversation ${cid} (items=1, media=0)`,
+        `I1105 07:37:55.513869 4794 llm_monitor.go:712] LLM Monitor sir_flash_lite: Calling LLM (model: MODEL_TIER_FLASH_LITE)`,
+        `I1105 07:37:56.265503 4796 http_helpers.go:365] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse Trace: 0x1`,
+        `I1105 07:37:57.545955 4793 runner.go:839] Monitor sir_flash_lite FINISHED: triggered=false`,
+        `I1105 07:38:08.577324 4828 http_helpers.go:365] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse Trace: 0x8fc6`,
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    // Before 1.5s grace: still false
+    nowMs += 500;
+    assert.equal(tracker.poll().isCompacting, false);
+
+    // After 1.5s with no new SQLite step: isCompacting turns true!
+    nowMs += 1_500;
+    const pCompacting = tracker.poll();
+    assert.equal(pCompacting.isCompacting, true);
+
+    // Canceled checkpoint (status = 5) does not emit a completed checkpoint summary
+    db.prepare("INSERT INTO steps (idx, step_type, status, step_payload) VALUES (?, ?, ?, ?)").run(
+      93,
+      23,
+      5,
+      Buffer.from([0x08, 23]),
+    );
+    nowMs += 500;
+    const pCanceled = tracker.poll();
+    assert.equal(pCanceled.checkpoints.length, 0);
+
+    // Completed checkpoint (step_type = 23, status = 3) lands with usage + <summary> markdown
+    const rawSummary = "<summary>\n1. **Task Overview**\n   - Compacted 92 steps.\n</summary>";
+    const cpPayload = buildStepPayloadWithUsageAndSummary({
+      inputTokens: 9_543,
+      cacheReadTokens: 250_195,
+      checkpointSummary: rawSummary,
+    });
+    assert.equal(extractContextTokensFromStepPayload(cpPayload), 259_738);
+    assert.equal(
+      extractCheckpointSummaryFromStepPayload(cpPayload),
+      "1. **Task Overview**\n   - Compacted 92 steps.",
+    );
+    assert.equal(cleanAgyCheckpointSummary(rawSummary), "1. **Task Overview**\n   - Compacted 92 steps.");
+
+    db.prepare("INSERT INTO steps (idx, step_type, status, step_payload) VALUES (?, ?, ?, ?)").run(
+      94,
+      23,
+      3,
+      cpPayload,
+    );
+    nowMs += 500;
+    const pDone = tracker.poll();
+    assert.equal(pDone.isCompacting, false);
+    assert.equal(pDone.checkpoints.length, 1);
+    assert.deepEqual(pDone.checkpoints[0], {
+      stepId: 94,
+      beforeTokens: 259_738,
+      summary: "1. **Task Overview**\n   - Compacted 92 steps.",
+    });
+
+    // Subsequent poll does not duplicate the checkpoint
+    assert.equal(tracker.poll().checkpoints.length, 0);
+
+    tracker.close();
+    db.close();
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("AgyDriverSession survives >90s compaction silence via compaction grace and enriches checkpoint activity", async (t) => {
+  const { spawn } = await import("node:child_process");
+  const tmp = await mkdtemp(path.join(tmpdir(), "pi-agy-driver-compaction-"));
+  const conversationsDir = path.join(tmp, "conversations");
+  const logDir = path.join(tmp, "log");
+  await mkdir(conversationsDir, { recursive: true });
+  await mkdir(logDir, { recursive: true });
+
+  const cid = "d794b713-e10c-48dc-aa1d-1917b0c887a2";
+  const dbPath = path.join(conversationsDir, `${cid}.db`);
+  const logPath = path.join(logDir, "cli-20261105_080000.log");
+
+  const db = new DatabaseSync(dbPath);
+  db.exec(
+    "CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, step_payload BLOB)",
+  );
+  db.prepare("INSERT INTO steps (idx, step_type, status, step_payload) VALUES (?, ?, ?, ?)").run(
+    710,
+    14,
+    3,
+    Buffer.from([0x08, 14]),
+  );
+  db.prepare("INSERT INTO steps (idx, step_type, status, step_payload) VALUES (?, ?, ?, ?)").run(
+    711,
+    15,
+    3,
+    buildStepPayloadWithUsageAndSummary({ inputTokens: 9_000, cacheReadTokens: 241_000 }),
+  );
+  db.prepare("INSERT INTO steps (idx, step_type, status, step_payload) VALUES (?, ?, ?, ?)").run(
+    712,
+    132,
+    3,
+    Buffer.from("large tool output"),
+  );
+  await writeFile(
+    logPath,
+    `I1105 08:00:00.000000 1 conversation_manager.go:874] Forwarding user message to conversation ${cid} (items=1, media=0)\n`,
+    "utf8",
+  );
+
+  let fakeNowMs = Date.now();
+  const driver = new AgyDriverSession();
+  driver.setThoughtTrackerFactory(
+    (convId) =>
+      new AgyThoughtTracker(convId ?? cid, conversationsDir, {
+        logDir,
+        now: () => fakeNowMs,
+      }),
+  );
+  t.after(async () => {
+    await driver.close("shutdown");
+    db.close();
+    await rm(tmp, { recursive: true, force: true });
+  });
+
+  // Insert completed checkpoint into SQLite after 220ms (past two 80ms stall budgets!)
+  const cpPayload = buildStepPayloadWithUsageAndSummary({
+    inputTokens: 9_543,
+    cacheReadTokens: 250_195,
+    checkpointSummary: "<summary>\nCompacted summary body\n</summary>",
+  });
+
+  const activities: Array<{ type: string; [k: string]: unknown }> = [];
+  const childScript = `
+    const fs = require("node:fs");
+    process.stdin.on("data", () => {
+      process.stdout.write(JSON.stringify({ event: "init", conversation_id: "${cid}" }) + "\\n");
+      fs.appendFileSync(${JSON.stringify(logPath)}, "I1105 08:00:01.000000 2 http_helpers.go:365] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse Trace: 0xabc\\n");
+      setTimeout(() => {
+        process.stdout.write(JSON.stringify({
+          event: "step_update",
+          step_update: {
+            conversation_id: "${cid}",
+            step_index: 715,
+            state: "DONE",
+            step_type: "checkpoint",
+            duration_seconds: 77.6
+          }
+        }) + "\\n");
+        process.stdout.write(JSON.stringify({
+          event: "step_update",
+          step_update: {
+            conversation_id: "${cid}",
+            step_index: 716,
+            state: "DONE",
+            step_type: "agent_response",
+            text_delta: "Post-compaction answer.",
+            usage: { input_tokens: 1418, cache_read_tokens: 10646, output_tokens: 622 }
+          }
+        }) + "\\n");
+        process.stdout.write(JSON.stringify({
+          event: "result",
+          result: {
+            conversation_id: "${cid}",
+            status: "SUCCESS",
+            response: "Post-compaction answer.",
+            usage: { input_tokens: 1418, cache_read_tokens: 10646, output_tokens: 622 }
+          }
+        }) + "\\n");
+      }, 280);
+    });
+  `;
+
+  const outcome = await driver.run({
+    prompt: "continue after tool",
+    conversationId: cid,
+    binary: process.execPath,
+    inactivityTimeoutMs: 70,
+    onActivity: (act) => activities.push(act as unknown as { type: string; [k: string]: unknown }),
+    spawnOverride: () => {
+      const clockTimer = setInterval(() => {
+        fakeNowMs += 1_000;
+      }, 45);
+      clockTimer.unref?.();
+      setTimeout(() => {
+        clearInterval(clockTimer);
+        db.prepare(
+          "INSERT INTO steps (idx, step_type, status, step_payload) VALUES (?, ?, ?, ?)",
+        ).run(715, 23, 3, cpPayload);
+      }, 220);
+      return spawn(process.execPath, ["-e", childScript], {
+        stdio: ["pipe", "pipe", "pipe"],
+        detached: true,
+      });
+    },
+  });
+
+  assert.equal(outcome.status, "OK");
+  assert.equal(outcome.response, "Post-compaction answer.");
+  assert.ok(driver.snapshot().lifecycle.some((entry) => entry.includes("stall:compacting:")));
+
+  const compactingStart = activities.find((a) => a.type === "compacting" && a.active === true);
+  assert.ok(compactingStart);
+  assert.equal(compactingStart.beforeTokens, 250_000);
+
+  const compactingEnd = activities.find((a) => a.type === "compacting" && a.active === false);
+  assert.ok(compactingEnd);
+
+  const checkpointAct = activities.find((a) => a.type === "checkpoint");
+  assert.ok(checkpointAct);
+  assert.equal(checkpointAct.stepId, 715);
+  assert.equal(checkpointAct.durationSeconds, 77.6);
+  assert.equal(checkpointAct.beforeTokens, 259_738);
+  assert.equal(checkpointAct.summary, "Compacted summary body");
+});
+
+test("reduceAgyStream parses checkpoint steps and resolveBranchContextFootprint clears pre-compaction tokens until post-compaction usage", () => {
+  const outcome = reduceAgyStream(
+    [
+      JSON.stringify({
+        event: "step_update",
+        step_update: {
+          conversation_id: "conv-cp",
+          step_index: 10,
+          state: "ACTIVE",
+          step_type: "checkpoint",
+        },
+      }),
+      JSON.stringify({
+        event: "step_update",
+        step_update: {
+          conversation_id: "conv-cp",
+          step_index: 10,
+          state: "DONE",
+          step_type: "checkpoint",
+          duration_seconds: 42.5,
+          usage: { input_tokens: 10_000, cache_read_tokens: 240_000 },
+        },
+      }),
+      JSON.stringify({
+        event: "result",
+        result: { conversation_id: "conv-cp", status: "SUCCESS", response: "ok" },
+      }),
+    ].join("\n"),
+  );
+
+  assert.deepEqual(outcome.activities[0], { type: "compacting", active: true });
+  assert.deepEqual(outcome.activities[1], {
+    type: "checkpoint",
+    stepId: 10,
+    conversationId: "conv-cp",
+    durationSeconds: 42.5,
+    beforeTokens: 250_000,
+  });
+
+  // Immediately after checkpoint lands (before post-compaction usage), stale 245k is cleared
+  const midTurnBranch = [
+    {
+      type: "message",
+      message: {
+        role: "assistant",
+        provider: "antigravity",
+        usage: { input: 6_439, cacheRead: 238_910, output: 100 },
+      },
+    },
+    {
+      type: "custom",
+      customType: AGY_COMPACTION_ENTRY,
+      data: {
+        version: 1,
+        beforeTokens: 259_738,
+        summary: "Compacted summary",
+        detectedAt: "2026-11-05T08:00:00.000Z",
+      },
+    },
+  ];
+  const midFootprint = resolveBranchContextFootprint(midTurnBranch);
+  assert.equal(midFootprint.agyTokens, undefined);
+
+  // Once the post-compaction assistant message lands, new compacted token count is used
+  const settledBranch = [
+    ...midTurnBranch,
+    {
+      type: "message",
+      message: {
+        role: "assistant",
+        provider: "antigravity",
+        usage: { input: 1_418, cacheRead: 10_646, output: 622 },
+      },
+    },
+  ];
+  const settledFootprint = resolveBranchContextFootprint(settledBranch);
+  assert.equal(settledFootprint.agyTokens, 12_064);
+
+  // piHistoryBootstrap preserves AGY_COMPACTION_ENTRY summary on fork/tree/fallback
+  const oldUserMsg = { role: "user", content: "Old message before compaction" };
+  const oldAssistantMsg = {
+    role: "assistant",
+    content: [{ type: "text", text: "Old assistant response before compaction" }],
+  };
+  const newTurnUserMsg = { role: "user", content: "New turn after compaction" };
+  const bootstrapWithoutPostMessages = piHistoryBootstrap(
+    {
+      messages: [oldUserMsg, oldAssistantMsg, newTurnUserMsg],
+    } as unknown as Parameters<typeof piHistoryBootstrap>[0],
+    0,
+    [
+      { type: "message", message: oldUserMsg },
+      { type: "message", message: oldAssistantMsg },
+      {
+        type: "custom",
+        customType: AGY_COMPACTION_ENTRY,
+        data: {
+          version: 1,
+          beforeTokens: 259_738,
+          summary: "1. **Task Overview**\n   - Compacted task details",
+        },
+      },
+      { type: "message", message: newTurnUserMsg },
+    ],
+  );
+  assert.ok(
+    bootstrapWithoutPostMessages?.includes(
+      "[Earlier history compacted]\n<summary>\n1. **Task Overview**\n   - Compacted task details\n</summary>",
+    ),
+  );
+  assert.ok(!bootstrapWithoutPostMessages?.includes("Old message before compaction"));
+  assert.ok(!bootstrapWithoutPostMessages?.includes("Old assistant response before compaction"));
+
+  const postUserMsg = { role: "user", content: "Post-compaction question" };
+  const postAssistantMsg = {
+    role: "assistant",
+    content: [{ type: "text", text: "Post-compaction answer" }],
+  };
+  const followUpUserMsg = { role: "user", content: "Follow-up prompt" };
+  const bootstrapWithPostMessages = piHistoryBootstrap(
+    {
+      messages: [oldUserMsg, oldAssistantMsg, postUserMsg, postAssistantMsg, followUpUserMsg],
+    } as unknown as Parameters<typeof piHistoryBootstrap>[0],
+    0,
+    [
+      { type: "message", message: oldUserMsg },
+      { type: "message", message: oldAssistantMsg },
+      {
+        type: "custom",
+        customType: AGY_COMPACTION_ENTRY,
+        data: {
+          version: 1,
+          beforeTokens: 259_738,
+          summary: "1. **Task Overview**\n   - Compacted task details",
+        },
+      },
+      { type: "message", message: postUserMsg },
+      { type: "message", message: postAssistantMsg },
+      { type: "message", message: followUpUserMsg },
+    ],
+  );
+  assert.ok(
+    bootstrapWithPostMessages?.includes(
+      [
+        "[Earlier history compacted]",
+        "<summary>",
+        "1. **Task Overview**",
+        "   - Compacted task details",
+        "</summary>",
+        "user:\nPost-compaction question\n\nassistant:\nPost-compaction answer",
+      ].join("\n"),
+    ),
+  );
+  assert.ok(!bootstrapWithPostMessages?.includes("Old message before compaction"));
+});
+
 
 
 
