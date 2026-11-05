@@ -39,7 +39,15 @@ import {
 } from "./tasks.ts";
 import { agyToolStepKey, trackActiveToolStep } from "./tool-steps.ts";
 import { isAgySubagentTool } from "./subagents.ts";
-import { applyEvent, newTurnOutcome, type AgyActivity, type AgyTurnOutcome } from "./reducer.ts";
+import {
+  applyEvent,
+  createSlidingDeadline,
+  isAgyProgressActivity,
+  newTurnOutcome,
+  type AgyActivity,
+  type AgyTurnOutcome,
+  type SlidingDeadline,
+} from "./reducer.ts";
 import { AgyThoughtTracker } from "./agy-thoughts.ts";
 
 export type AgyDriverState = "idle" | "starting" | "ready" | "running" | "stopping" | "dead";
@@ -108,8 +116,7 @@ interface ActiveTurn {
   conversationReported: boolean;
   thoughtTracker: AgyThoughtTracker;
   thoughtPollTimer?: NodeJS.Timeout;
-  overallTimer?: NodeJS.Timeout;
-  deadlineAt: number;
+  deadline?: SlidingDeadline;
   stallTimer?: NodeJS.Timeout;
   /** Stall budgets already forgiven because a tool process was verifiably alive. */
   stallGraces: number;
@@ -561,7 +568,6 @@ export class AgyDriverSession implements AgyTurnExecutor {
       thoughtTracker: this.#createThoughtTracker(
         request.conversationId ?? this.#boundConversationId,
       ),
-      deadlineAt: performance.now() + (request.timeoutMs ?? 1_800_000),
       stallGraces: 0,
       parkedChecks: 0,
       parkedOnBackgroundWork: false,
@@ -578,12 +584,20 @@ export class AgyDriverSession implements AgyTurnExecutor {
     turn.request.onActivity?.(activity);
   }
 
+  #recordTurnProgress(turn: ActiveTurn): void {
+    turn.deadline?.touch();
+    turn.request.onProgress?.();
+  }
+
   #pollThoughts(turn: ActiveTurn): boolean {
     if (this.#active !== turn || turn.outcome.finished) return false;
     const cid = turn.outcome.conversationId ?? this.#boundConversationId;
     const progressed = turn.thoughtTracker.sync(cid, (activity) =>
       this.#emitSideActivity(turn, activity),
     );
+    if (turn.thoughtTracker.agentProgressed) {
+      this.#recordTurnProgress(turn);
+    }
     if (progressed) {
       turn.silenceMs = 0;
       turn.stallGraces = 0;
@@ -648,18 +662,22 @@ export class AgyDriverSession implements AgyTurnExecutor {
   }
 
   #armOverallTimer(turn: ActiveTurn): void {
-    const overallMs = turn.request.timeoutMs ?? 1_800_000;
-    turn.deadlineAt = performance.now() + overallMs;
-    if (turn.overallTimer) clearTimeout(turn.overallTimer);
-    turn.overallTimer = setTimeout(() => {
-      if (this.#active !== turn || !this.#child) return;
-      void this.#terminateTurn(turn, {
-        error: new AgySpawnError(
-          `agy turn timed out after ${Math.round(overallMs / 1000)}s`,
-          this.#stderrTail,
-        ),
-      });
-    }, overallMs);
+    const initialMs = turn.request.timeoutMs ?? 1_800_000;
+    const renewMs = turn.request.progressTimeoutMs ?? initialMs;
+    turn.deadline?.clear();
+    turn.deadline = createSlidingDeadline(
+      initialMs,
+      () => {
+        if (this.#active !== turn || !this.#child) return;
+        void this.#terminateTurn(turn, {
+          error: new AgySpawnError(
+            `agy turn timed out after ${Math.round(renewMs / 1000)}s`,
+            this.#stderrTail,
+          ),
+        });
+      },
+      renewMs,
+    );
   }
 
   #armTurnTimers(turn: ActiveTurn): void {
@@ -828,7 +846,8 @@ export class AgyDriverSession implements AgyTurnExecutor {
     turn.stallTimer = undefined;
     if (
       turn.parkedChecks < this.#parkedLimit &&
-      performance.now() + this.#parkedPollMs < turn.deadlineAt
+      turn.deadline !== undefined &&
+      performance.now() + this.#parkedPollMs < turn.deadline.deadlineAt
     ) {
       turn.parkedChecks += 1;
       this.#log(`stall:task-parked:${turn.parkedChecks}`);
@@ -1152,9 +1171,13 @@ export class AgyDriverSession implements AgyTurnExecutor {
       // updates for a step already tracked skip the scan, but a NEW tool
       // start never does — a missed snapshot means an agy crash later leaves
       // the worker orphaned and unrecorded.
-      const newToolStart =
-        activity.type === "tool_start" && !turn.activeTools.has(agyToolStepKey(activity));
+      const repeatedToolStart =
+        activity.type === "tool_start" && turn.activeTools.has(agyToolStepKey(activity));
+      const newToolStart = activity.type === "tool_start" && !repeatedToolStart;
       trackActiveToolStep(turn.activeTools, activity);
+      if (isAgyProgressActivity(activity, repeatedToolStart)) {
+        this.#recordTurnProgress(turn);
+      }
       if (activity.type === "tool_start" && isAgySubagentTool(activity.name)) {
         turn.subagentSpawned = true;
       }
@@ -1262,7 +1285,7 @@ export class AgyDriverSession implements AgyTurnExecutor {
   #settleTurn(turn: ActiveTurn, result: { outcome: AgyTurnOutcome } | { error: unknown }): void {
     if (this.#active !== turn) return;
     turn.thoughtTracker.finishCompacting((activity) => this.#emitSideActivity(turn, activity));
-    if (turn.overallTimer) clearTimeout(turn.overallTimer);
+    turn.deadline?.clear();
     if (turn.stallTimer) clearTimeout(turn.stallTimer);
     if (turn.thoughtPollTimer) clearInterval(turn.thoughtPollTimer);
     turn.thoughtPollTimer = undefined;

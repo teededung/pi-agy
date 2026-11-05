@@ -25,7 +25,13 @@ import {
   detachAgyConversationBridgeMetadata,
   prepareAgyConversationBridgeMetadata,
 } from "../lib/conversation-metadata.ts";
-import type { AgyTurnOutcome, AgyUsage } from "../lib/reducer.ts";
+import {
+  createSlidingDeadline,
+  isAgyProgressActivity,
+  type AgyTurnOutcome,
+  type AgyUsage,
+} from "../lib/reducer.ts";
+import { agyToolStepKey, trackActiveToolStep } from "../lib/tool-steps.ts";
 import { piSystemInstructionsPrompt, stallContinuationPrompt } from "../lib/prompt.ts";
 import { AgyTurnController } from "../lib/turn.ts";
 
@@ -430,7 +436,6 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                 "AGY_STALL_RETRY_BACKOFF_MS",
                 runtimeSettings.stallRetryBackoffMs ?? DEFAULT_STALL_RETRY_BACKOFF_MS,
               );
-              const deadline = Date.now() + timeoutMs;
               const timeoutError = new AgySpawnError(
                 `agy logical turn timed out after ${Math.round(timeoutMs / 1000)}s`,
                 "",
@@ -439,7 +444,17 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                 turnAbort.signal.reason === timeoutError
                   ? timeoutError
                   : new Error("agy turn was aborted.");
-              const deadlineTimer = setTimeout(() => turnAbort.abort(timeoutError), timeoutMs);
+              // In tools:pi mode one logical turn spans an entire multi-step
+              // agent loop (potentially hundreds of read/edit/bash calls over
+              // hours). Renew the deadline whenever genuine step/stream/SQLite
+              // progress occurs; only an unprogressing turn hits timeoutError.
+              const turnDeadline = createSlidingDeadline(timeoutMs, () =>
+                turnAbort.abort(timeoutError),
+              );
+              const recordProgress = () => {
+                if (turnGeneration !== generation || turnAbort.signal.aborted) return;
+                turnDeadline.touch();
+              };
               let onTurnAbort!: () => void;
               const cancelled = new Promise<never>((_resolve, reject) => {
                 onTurnAbort = () => reject(abortFailure());
@@ -552,7 +567,7 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                 };
                 for (;;) {
                   if (turnAbort.signal.aborted) throw abortFailure();
-                  const remainingMs = deadline - Date.now();
+                  const remainingMs = Math.ceil(turnDeadline.remainingMs());
                   if (remainingMs <= 0) throw timeoutError;
                   // After a stale-resume fallback, never resurrect the missing
                   // original ID if the fresh attempt stalls before init.
@@ -590,6 +605,7 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                       pendingBootstrapSuffix = undefined;
                     }
                   };
+                  const attemptActiveTools = new Set<string>();
                   const attempt: AgyTurnRequest = {
                     ...spawnRequest,
                     prompt: resumingRetry
@@ -600,13 +616,22 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                         ? freshRestorePrompt
                         : spawnRequest.prompt,
                     conversationId: resumableConversationId,
-                    timeoutMs: remainingMs,
+                    timeoutMs: retry === 0 && !freshFallback ? timeoutMs : remainingMs,
+                    progressTimeoutMs: timeoutMs,
+                    onProgress: recordProgress,
                     onConversation: (id) => {
                       spawnRequest.onConversation?.(id);
                       commitAttemptSync();
                     },
                     onActivity: (activity) => {
                       commitAttemptSync();
+                      const repeatedToolStart =
+                        activity.type === "tool_start" &&
+                        attemptActiveTools.has(agyToolStepKey(activity));
+                      trackActiveToolStep(attemptActiveTools, activity);
+                      if (isAgyProgressActivity(activity, repeatedToolStart)) {
+                        recordProgress();
+                      }
                       spawnRequest.onActivity?.(activity);
                     },
                   };
@@ -699,7 +724,7 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                   controller.fail(cause instanceof Error ? cause : new Error(String(cause)));
                 })
                 .finally(() => {
-                  clearTimeout(deadlineTimer);
+                  turnDeadline.clear();
                   turnAbort.signal.removeEventListener("abort", onTurnAbort);
                   if (requestAbortHandler) {
                     request.signal?.removeEventListener("abort", requestAbortHandler);

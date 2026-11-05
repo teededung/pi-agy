@@ -2768,6 +2768,126 @@ test("reduceAgyStream parses checkpoint steps and resolveBranchContextFootprint 
   assert.ok(!bootstrapWithPostMessages?.includes("Old message before compaction"));
 });
 
+test("AntigravityRuntime slides turnTimeoutMs on forward step/SQLite progress and still times out hung steps", async (t) => {
+  const sleep = (ms: number, signal?: AbortSignal) =>
+    new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, ms);
+      signal?.addEventListener(
+        "abort",
+        () => {
+          clearTimeout(timer);
+          resolve();
+        },
+        { once: true },
+      );
+    });
+
+  let callCount = 0;
+  const runtime = createAntigravityRuntime(async (request) => {
+    callCount += 1;
+    request.onConversation?.("conv-sliding-timeout");
+    if (callCount === 1) {
+      // Total duration ~195ms > timeoutMs (90ms), but forward progress arrives every ~45ms.
+      await sleep(45, request.signal);
+      request.onActivity?.({
+        type: "tool_start",
+        stepId: 1,
+        name: "mcp_pi_test_pi__read",
+        args: { path: "a.cpp" },
+      });
+      await sleep(50, request.signal);
+      request.onActivity?.({
+        type: "tool_done",
+        stepId: 1,
+        name: "mcp_pi_test_pi__read",
+        args: { path: "a.cpp" },
+        output: "ok",
+      });
+      // Simulate silent SQLite step_payload byte growth (e.g. 80KB edit generation).
+      await sleep(50, request.signal);
+      request.onProgress?.();
+      await sleep(50, request.signal);
+      assert.equal(request.signal?.aborted, false);
+      const result = {
+        type: "result" as const,
+        status: "OK" as const,
+        response: "Ported hooks successfully.",
+      };
+      request.onActivity?.(result);
+      return {
+        conversationId: "conv-sliding-timeout",
+        status: "OK",
+        response: result.response,
+        activities: [result],
+        finished: true,
+      };
+    }
+
+    // Second turn: starts one tool and then only repeats ACTIVE echoes for the same stepId.
+    request.onActivity?.({
+      type: "tool_start",
+      stepId: 2,
+      name: "mcp_pi_test_pi__bash",
+      args: { command: "sleep 999" },
+    });
+    await sleep(45, request.signal);
+    request.onActivity?.({
+      type: "tool_start",
+      stepId: 2,
+      name: "mcp_pi_test_pi__bash",
+      args: { command: "sleep 999" },
+    });
+    await sleep(90, request.signal);
+    assert.equal(request.signal?.aborted, true);
+    return {
+      conversationId: "conv-sliding-timeout",
+      status: "ERROR",
+      response: "",
+      error: "agy turn was aborted.",
+      activities: [],
+      finished: true,
+    };
+  });
+  t.after(() => runtime.dispose());
+
+  const service = runtime.runSync(AntigravityRuntime);
+
+  // 1. Active multi-step turn outlives initial 90ms timeoutMs cleanly.
+  const okController = await runtime.runPromise(
+    service.beginStreamTurn({
+      prompt: "Port hooks",
+      modelId: "gemini-4-argon",
+      timeoutMs: 90,
+    }),
+  );
+  const okActivities = [];
+  for (;;) {
+    const item = await okController.next();
+    if (item === null) break;
+    okActivities.push(item);
+  }
+  await runtime.runPromise(service.finishTurn);
+  assert.ok(okActivities.some((a) => a.type === "result" && a.status === "OK"));
+
+  // 2. Hung step (even with repeated ACTIVE echoes for the same tool step) still times out.
+  const hungController = await runtime.runPromise(
+    service.beginStreamTurn({
+      prompt: "Run deadlocked command",
+      modelId: "gemini-4-argon",
+      timeoutMs: 90,
+    }),
+  );
+  await assert.rejects(
+    async () => {
+      while ((await hungController.next()) !== null) {
+        // drain until timeout failure
+      }
+    },
+    /agy logical turn timed out after/,
+  );
+  await runtime.runPromise(service.finishTurn);
+});
+
 
 
 

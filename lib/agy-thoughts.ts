@@ -28,6 +28,7 @@ import type { AgyActivity } from "./reducer.ts";
 const STEP_TYPE_USER_INPUT = 14;
 const STEP_TYPE_PLANNER_RESPONSE = 15;
 const STEP_TYPE_CHECKPOINT = 23;
+const STEP_TYPE_SYSTEM_MESSAGE = 101;
 
 const STEP_STATUS_PENDING = 1;
 const STEP_STATUS_RUNNING = 2;
@@ -58,6 +59,8 @@ export interface AgyThoughtPollResult {
   checkpoints: AgyCheckpointSummaryInfo[];
   /** True when new rows, status transitions, or growing step_payload bytes were observed. */
   dbProgressed: boolean;
+  /** True when non-input/system agent steps (planner, tool, checkpoint) progressed in SQLite. */
+  agentProgressed: boolean;
   /** True when the turn has a step actively generating (status 8) or pending (status 1). */
   isGenerating: boolean;
   /** True when agy is actively generating a context compaction summary. */
@@ -396,6 +399,7 @@ export class AgyThoughtTracker {
   #lastMaxIdx = -1;
   #lastTotalBytes = 0;
   #lastStatusSignature = "";
+  #lastAgentStatusSignature = "";
 
   /** Cached context footprint across completed planner/checkpoint steps. */
   #lastUsageIdx = -1;
@@ -413,6 +417,7 @@ export class AgyThoughtTracker {
 
   /** Turn-level stream synchronization state shared by AgyDriver and runAgyTurn. */
   #lastIsGenerating = false;
+  #lastAgentProgressed = false;
   #lastAwaitingPlannerAfterStep = false;
   #emittedCompacting = false;
   #checkpointDetailsByStepId = new Map<number, AgyCheckpointSummaryInfo>();
@@ -465,6 +470,7 @@ export class AgyThoughtTracker {
       deltas: [],
       checkpoints: [],
       dbProgressed: false,
+      agentProgressed: false,
       isGenerating: false,
       isCompacting: false,
       lastContextTokens: this.#lastContextTokens,
@@ -517,6 +523,7 @@ export class AgyThoughtTracker {
     let maxIdx = this.#lastMaxIdx;
     let totalBytes = 0;
     const statusParts: string[] = [];
+    const agentStatusParts: string[] = [];
     let isGenerating = false;
     let hasRunningStep =
       overallMaxRow !== undefined &&
@@ -531,7 +538,11 @@ export class AgyThoughtTracker {
       if (row.idx < this.#minStepIndex) continue;
       if (row.idx > maxIdx) maxIdx = row.idx;
       totalBytes += row.payload_len ?? 0;
-      statusParts.push(`${row.idx}:${row.status}:${row.payload_len}`);
+      const part = `${row.idx}:${row.status}:${row.payload_len}`;
+      statusParts.push(part);
+      if (row.step_type !== STEP_TYPE_USER_INPUT && row.step_type !== STEP_TYPE_SYSTEM_MESSAGE) {
+        agentStatusParts.push(part);
+      }
       if (
         row.status === STEP_STATUS_GENERATING ||
         row.status === STEP_STATUS_PENDING ||
@@ -599,22 +610,27 @@ export class AgyThoughtTracker {
     const isCompacting = sqlCheckpointActive || cliCompacting;
 
     const statusSignature = statusParts.join(",");
+    const agentStatusSignature = agentStatusParts.join(",");
     const dbProgressed =
       rows.length > 0 &&
       (maxIdx > this.#lastMaxIdx ||
         totalBytes > this.#lastTotalBytes ||
         statusSignature !== this.#lastStatusSignature);
+    const agentProgressed =
+      agentStatusParts.length > 0 && agentStatusSignature !== this.#lastAgentStatusSignature;
 
     if (rows.length > 0) {
       this.#lastMaxIdx = maxIdx;
       this.#lastTotalBytes = totalBytes;
       this.#lastStatusSignature = statusSignature;
+      this.#lastAgentStatusSignature = agentStatusSignature;
     }
 
     return {
       deltas,
       checkpoints,
       dbProgressed,
+      agentProgressed,
       isGenerating,
       isCompacting,
       lastContextTokens: this.#lastContextTokens,
@@ -625,6 +641,11 @@ export class AgyThoughtTracker {
   /** Latest SQLite step-generating state observed by sync(). */
   get isGenerating(): boolean {
     return this.#lastIsGenerating;
+  }
+
+  /** True when the most recent sync() observed genuine agent/model/compaction progress. */
+  get agentProgressed(): boolean {
+    return this.#lastAgentProgressed;
   }
 
   /** True when compaction is actively in flight or likely starting on a large trajectory. */
@@ -683,6 +704,11 @@ export class AgyThoughtTracker {
       this.#checkpointDetailsByStepId.set(cp.stepId, cp);
     }
     const compactingFlipped = res.isCompacting !== this.#emittedCompacting;
+    this.#lastAgentProgressed =
+      res.agentProgressed ||
+      res.deltas.length > 0 ||
+      res.checkpoints.length > 0 ||
+      (compactingFlipped && res.isCompacting);
     if (compactingFlipped) {
       this.#emittedCompacting = res.isCompacting;
       emitSideActivity({

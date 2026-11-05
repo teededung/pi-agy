@@ -377,3 +377,90 @@ export function reduceAgyStream(text: string): AgyTurnOutcome {
   }
   return outcome;
 }
+
+/**
+ * True when `activity` represents genuine forward progress in an agy turn
+ * (model reasoning/output, new tool start, tool completion, or compaction),
+ * excluding synthetic retry/fallback notifications and repeated ACTIVE echoes.
+ */
+export function isAgyProgressActivity(
+  activity: AgyActivity,
+  repeatedToolStart = false,
+): boolean {
+  switch (activity.type) {
+    case "tool_start":
+      return !repeatedToolStart;
+    case "tool_done":
+    case "tool_error":
+    case "bridge_call":
+    case "text":
+    case "thinking_delta":
+    case "thought":
+    case "checkpoint":
+    case "usage":
+      return true;
+    case "compacting":
+      return activity.active;
+    default:
+      return false;
+  }
+}
+
+export interface SlidingDeadline {
+  readonly deadlineAt: number;
+  remainingMs(): number;
+  touch(): void;
+  clear(): void;
+}
+
+/**
+ * Monotonic deadline timer that slides forward by `renewMs` on `touch()`
+ * without reallocating `setTimeout` on every streaming delta.
+ */
+export function createSlidingDeadline(
+  initialMs: number,
+  onExpire: () => void,
+  renewMs = initialMs,
+): SlidingDeadline {
+  let deadlineAt = performance.now() + initialMs;
+  let timer: NodeJS.Timeout | undefined;
+  let cleared = false;
+
+  const schedule = (delayMs: number) => {
+    if (cleared) return;
+    if (timer !== undefined) clearTimeout(timer);
+    timer = setTimeout(() => {
+      if (cleared) return;
+      const remaining = deadlineAt - performance.now();
+      if (remaining > 10) {
+        schedule(remaining);
+        return;
+      }
+      timer = undefined;
+      onExpire();
+    }, Math.max(0, delayMs));
+  };
+
+  schedule(initialMs);
+
+  return {
+    get deadlineAt() {
+      return deadlineAt;
+    },
+    remainingMs() {
+      return Math.max(0, deadlineAt - performance.now());
+    },
+    touch() {
+      if (cleared) return;
+      deadlineAt = Math.max(deadlineAt, performance.now() + renewMs);
+    },
+    clear() {
+      cleared = true;
+      if (timer !== undefined) {
+        clearTimeout(timer);
+        timer = undefined;
+      }
+    },
+  };
+}
+

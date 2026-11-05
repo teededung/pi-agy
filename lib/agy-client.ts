@@ -17,8 +17,15 @@ import {
   prepareAgyConversationBridgeMetadata,
 } from "./conversation-metadata.ts";
 import { parseAgyLine } from "./events.ts";
-import { trackActiveToolStep } from "./tool-steps.ts";
-import { applyEvent, newTurnOutcome, type AgyActivity, type AgyTurnOutcome } from "./reducer.ts";
+import { agyToolStepKey, trackActiveToolStep } from "./tool-steps.ts";
+import {
+  applyEvent,
+  createSlidingDeadline,
+  isAgyProgressActivity,
+  newTurnOutcome,
+  type AgyActivity,
+  type AgyTurnOutcome,
+} from "./reducer.ts";
 import { AgyThoughtTracker } from "./agy-thoughts.ts";
 
 /** agy reasoning effort, as accepted by `agy --effort`. */
@@ -41,8 +48,16 @@ export interface AgyTurnRequest {
   cwd?: string;
   /** Session-owned MCP discovery directory, added without changing cwd. */
   mcpDirectory?: string;
-  /** Overall turn timeout owned by Pi. One-shot mode also passes --print-timeout. */
+  /**
+   * Maximum time without forward step/stream progress before Pi terminates the
+   * turn. Renewed on genuine agent progress (steps, tool transitions, deltas).
+   */
   timeoutMs?: number;
+  /**
+   * Renewal window applied on forward progress when `timeoutMs` was clamped to
+   * a shorter remaining retry budget before progress resumed.
+   */
+  progressTimeoutMs?: number;
   /**
    * Kill the turn when the stream produces no bytes for this long (stall
    * watchdog). 0 disables it; the overall timeoutMs still applies.
@@ -71,6 +86,8 @@ export interface AgyTurnRequest {
   binary?: string;
   /** Called with each structured activity event as tool steps stream in. */
   onActivity?: (activity: AgyActivity) => void;
+  /** Called whenever forward agent progress is observed on stdout or SQLite. */
+  onProgress?: () => void;
   /**
    * Called once the stream reveals the agy conversation id — before the turn
    * resolves, so callers can track it even when a turn hangs on background
@@ -216,7 +233,8 @@ function appendProcessArgs(args: string[], request: AgyTurnRequest): string[] {
 }
 
 export function buildOneShotAgyArgs(request: AgyTurnRequest): string[] {
-  const timeout = Math.ceil((request.timeoutMs ?? 1_800_000) / 1000);
+  // Delegate termination to Pi's progress-sliding deadline rather than agy's
+  // static --print-timeout, which cuts active multi-step turns at a fixed wall clock.
   // --print consumes the next token, so the prompt must remain adjacent.
   return appendProcessArgs(
     [
@@ -227,7 +245,7 @@ export function buildOneShotAgyArgs(request: AgyTurnRequest): string[] {
       "--output-format",
       "stream-json",
       "--print-timeout",
-      `${timeout}s`,
+      "2147484s",
     ],
     request,
   );
@@ -330,11 +348,13 @@ async function runSingleAgyTurn(request: AgyTurnRequest): Promise<AgyTurnOutcome
     };
 
     let abortHandler: (() => void) | undefined;
+    const initialTimeoutMs = request.timeoutMs ?? 1_800_000;
+    const renewTimeoutMs = request.progressTimeoutMs ?? initialTimeoutMs;
     const finishLogical = (fn: () => void) => {
       if (settled) return;
       settled = true;
       thoughtTracker.finishCompacting(emitSideActivity);
-      clearTimeout(killTimer);
+      killDeadline.clear();
       if (stallTimer !== undefined) {
         clearTimeout(stallTimer);
         stallTimer = undefined;
@@ -350,24 +370,36 @@ async function runSingleAgyTurn(request: AgyTurnRequest): Promise<AgyTurnOutcome
       fn();
     };
 
-    const killTimer = setTimeout(() => {
-      killAgyTree(child);
-      untrack();
-      finishLogical(() => {
-        reject(
-          new AgySpawnError(
-            `agy turn timed out after ${Math.round((request.timeoutMs ?? 1_800_000) / 1000)}s`,
-            stderrBuf,
-          ),
-        );
-      });
-    }, request.timeoutMs ?? 1_800_000);
+    const killDeadline = createSlidingDeadline(
+      initialTimeoutMs,
+      () => {
+        killAgyTree(child);
+        untrack();
+        finishLogical(() => {
+          reject(
+            new AgySpawnError(
+              `agy turn timed out after ${Math.round(renewTimeoutMs / 1000)}s`,
+              stderrBuf,
+            ),
+          );
+        });
+      },
+      renewTimeoutMs,
+    );
 
-    const syncThoughtTracker = () =>
-      thoughtTracker.sync(
+    const recordProgress = () => {
+      killDeadline.touch();
+      request.onProgress?.();
+    };
+
+    const syncThoughtTracker = () => {
+      const progressed = thoughtTracker.sync(
         outcome.conversationId ?? request.conversationId,
         emitSideActivity,
       );
+      if (thoughtTracker.agentProgressed) recordProgress();
+      return progressed;
+    };
 
     // Stall watchdog: any stdout/stderr bytes count as liveness (chunk level,
     // not parsed events — unknown shapes must still reset the timer). A tool
@@ -474,7 +506,12 @@ async function runSingleAgyTurn(request: AgyTurnRequest): Promise<AgyTurnOutcome
         ) {
           continue;
         }
+        const repeatedToolStart =
+          activity.type === "tool_start" && activeTools.has(agyToolStepKey(activity));
         trackActiveToolStep(activeTools, activity);
+        if (isAgyProgressActivity(activity, repeatedToolStart)) {
+          recordProgress();
+        }
         request.onActivity?.(activity);
       }
       if (outcome.finished) {
