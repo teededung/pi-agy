@@ -140,6 +140,7 @@ import {
 } from "./lib/conversation-state.ts";
 import {
   deleteAgyConversationsForSessionFile,
+  deleteDisposableAgyConversation,
   detachAgyConversationBridgeMetadata,
   readAgyConversationMetadata,
   renameAgyConversationsForSessionFile,
@@ -2436,7 +2437,10 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", async () => {
-    await syncSessionNameToAgy().catch(() => {});
+    const initialConversationId = await captureActiveConversationId();
+    if (!initialConversationId || (await agyConversationExists(initialConversationId))) {
+      await syncSessionNameToAgy().catch(() => {});
+    }
     if (sessionNamePollTimer) clearInterval(sessionNamePollTimer);
     sessionNamePollTimer = undefined;
     activeSessionCtx = undefined;
@@ -2489,7 +2493,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     }
     // Close the runtime: aborts any in-flight agy child process, then tear
     // down the Effect runtime.
-    const shutdownConversationId = await captureActiveConversationId();
+    const shutdownConversationId = (await captureActiveConversationId()) ?? initialConversationId;
     try {
       await runAntigravity(runtime, service.close);
     } catch {
@@ -2546,6 +2550,13 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     // Sweep any remaining tracked agy process trees (including earlier turns
     // that finished logically while grandchildren held stdio open).
     killAllAgyTrees();
+    // When `/drop quit` runs in an extension loaded before `pi-agy`, `<cid>.db`
+    // is deleted while warm `agy acp` still holds the session in memory, and
+    // `agy acp` re-flushes a ghost row into `conversation_summaries.db` on SIGTERM.
+    // Re-sweep once `agy acp` has exited so `agy --resume` stays completely clean.
+    if (shutdownConversationId && !(await agyConversationExists(shutdownConversationId))) {
+      await deleteDisposableAgyConversation(shutdownConversationId).catch(() => {});
+    }
   });
 
   pi.registerCommand("agy", {
