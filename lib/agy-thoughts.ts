@@ -80,6 +80,12 @@ export interface AgyThoughtTrackerOptions {
   logDir?: string;
   /** Clock override for deterministic compaction-grace tests. */
   now?: () => number;
+  /**
+   * When false (e.g. ACP mode where `agent_thought_chunk` streams directly on
+   * JSON-RPC), suppress SQLite `thinking_delta` emissions while still tracking
+   * compaction, checkpoints, retries, and DB liveness. Defaults to true.
+   */
+  emitThinkingDeltas?: boolean;
 }
 
 function defaultConversationsDir(): string {
@@ -464,6 +470,7 @@ export class AgyThoughtTracker {
   #lastAgentProgressed = false;
   #lastAwaitingPlannerAfterStep = false;
   #emittedCompacting = false;
+  #emitThinkingDeltas = true;
   #checkpointDetailsByStepId = new Map<number, AgyCheckpointSummaryInfo>();
   #streamEmittedCheckpoints = new Set<number>();
 
@@ -475,6 +482,7 @@ export class AgyThoughtTracker {
     this.#conversationsDir = conversationsDir;
     this.#logDir = options?.logDir ?? defaultLogDirFromConversationsDir(conversationsDir);
     this.#now = options?.now ?? Date.now;
+    this.#emitThinkingDeltas = options?.emitThinkingDeltas ?? true;
     this.#createdAtMs = this.#now();
     if (conversationId) {
       this.#conversationId = conversationId;
@@ -801,7 +809,9 @@ export class AgyThoughtTracker {
     }
     for (const delta of res.deltas) {
       this.flushUnemittedCheckpoints(conversationId, emitSideActivity, delta.stepId);
-      emitSideActivity(delta);
+      if (this.#emitThinkingDeltas) {
+        emitSideActivity(delta);
+      }
     }
     return res.deltas.length > 0 || res.dbProgressed || res.retryAttempted || compactingFlipped;
   }

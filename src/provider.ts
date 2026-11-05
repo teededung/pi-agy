@@ -32,7 +32,7 @@ import {
   type ThinkingLevel,
   type TranscriptContext,
 } from "@earendil-works/pi-ai";
-import type { AgyEffort } from "../lib/agy-client.ts";
+import type { AgyEffort, AgyPromptImage } from "../lib/agy-client.ts";
 import {
   boundCompactionSummaryFileLists,
   extractAgyCompactionEntrySummary,
@@ -123,7 +123,24 @@ function inferImageExtension(mimeType: string | undefined, bytes: Buffer): strin
   return "png";
 }
 
-function persistUserImagePart(part: ImagePart): string | undefined {
+function inferMimeTypeFromExtension(ext: string): string {
+  switch (ext) {
+    case "jpg":
+      return "image/jpeg";
+    case "gif":
+      return "image/gif";
+    case "webp":
+      return "image/webp";
+    case "bmp":
+      return "image/bmp";
+    default:
+      return "image/png";
+  }
+}
+
+function persistUserImagePart(
+  part: ImagePart,
+): { filePath: string; image: AgyPromptImage } | undefined {
   const rawData =
     typeof part.data === "string"
       ? part.data
@@ -152,6 +169,7 @@ function persistUserImagePart(part: ImagePart): string | undefined {
     const bytes = Buffer.from(base64, "base64");
     if (bytes.length === 0) return undefined;
     const ext = inferImageExtension(mimeType, bytes);
+    const normalizedMime = mimeType?.trim() || inferMimeTypeFromExtension(ext);
     const hash = createHash("sha256").update(bytes).digest("hex").slice(0, 16);
     const dir = path.join(tmpdir(), "pi-agy-images");
     mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -159,7 +177,10 @@ function persistUserImagePart(part: ImagePart): string | undefined {
     if (!existsSync(filePath)) {
       writeFileSync(filePath, bytes, { mode: 0o600 });
     }
-    return filePath;
+    return {
+      filePath,
+      image: { data: base64.replace(/\s+/g, ""), mimeType: normalizedMime },
+    };
   } catch {
     return undefined;
   }
@@ -175,6 +196,7 @@ function latestUserBatch(context: TranscriptContext): {
   start: number;
   prompt: string;
   images: number;
+  imageParts: AgyPromptImage[];
 } {
   for (let i = context.messages.length - 1; i >= 0; i--) {
     if (context.messages[i].role !== "user") continue;
@@ -182,6 +204,7 @@ function latestUserBatch(context: TranscriptContext): {
     while (i > 0 && context.messages[i - 1].role === "user") i--;
     const texts: string[] = [];
     const savedImagePaths: string[] = [];
+    const imageParts: AgyPromptImage[] = [];
     let omittedImages = 0;
     let images = 0;
     for (const message of context.messages.slice(i, end)) {
@@ -195,9 +218,10 @@ function latestUserBatch(context: TranscriptContext): {
           texts.push(part.text);
         } else if (part?.type === "image") {
           images += 1;
-          const savedPath = persistUserImagePart(part as ImagePart);
-          if (savedPath) {
-            savedImagePaths.push(savedPath);
+          const persisted = persistUserImagePart(part as ImagePart);
+          if (persisted) {
+            savedImagePaths.push(persisted.filePath);
+            imageParts.push(persisted.image);
           } else {
             omittedImages += 1;
           }
@@ -216,9 +240,10 @@ function latestUserBatch(context: TranscriptContext): {
       start: i,
       prompt: promptSegments.join("\n"),
       images,
+      imageParts,
     };
   }
-  return { start: -1, prompt: "", images: 0 };
+  return { start: -1, prompt: "", images: 0, imageParts: [] };
 }
 
 /** Extract all text in the latest user batch (plus an image-omitted note). */
@@ -405,9 +430,9 @@ export function piHistoryBootstrap(
         const args = JSON.stringify(part.arguments ?? {});
         rendered.push(`[tool call: ${part.name}${args === "{}" ? "" : ` ${args}`}]`);
       } else if (part?.type === "image" && message.role === "user") {
-        const savedPath = persistUserImagePart(part as ImagePart);
-        if (savedPath) {
-          rendered.push(attachedImagesPrompt([savedPath]));
+        const persisted = persistUserImagePart(part as ImagePart);
+        if (persisted) {
+          rendered.push(attachedImagesPrompt([persisted.filePath]));
         }
       }
     }
@@ -507,6 +532,7 @@ export function piHistoryBootstrap(
  * closing tags, `<previous-summary>`, or summarization instructions.
  */
 const MAX_AGY_SUMMARIZATION_PROMPT_CHARS = 120_000;
+const MAX_ACP_SUMMARIZATION_PROMPT_CHARS = 512_000;
 
 export function boundSummarizationPrompt(
   prompt: string,
@@ -700,10 +726,17 @@ export function isBridgedMcpStep(
   },
   serverName: string,
 ): boolean {
+  if (!serverName) return false;
   if (activity.name === "call_mcp_tool" && activity.args?.ServerName === serverName) {
     return true;
   }
-  return Boolean(serverName && activity.name.startsWith(`mcp_${serverName}_pi__`));
+  return (
+    activity.name.startsWith(`mcp_${serverName}_pi__`) ||
+    activity.name.startsWith(`${serverName}/pi__`) ||
+    activity.name.startsWith(`${serverName}:pi__`) ||
+    activity.name.startsWith(`${serverName}: pi__`) ||
+    /^pi__[A-Za-z0-9_]+$/.test(activity.name)
+  );
 }
 
 export interface OneShotConsultOverride {
@@ -1104,6 +1137,7 @@ export function streamAntigravity(
             turnService.setSession(snapshot.cwd ?? process.cwd(), effectiveModelId, false),
           );
         }
+        const executorMode = (await turnRuntime.runPromise(turnService.snapshot)).executor.mode;
 
         let bridgeRevision: string | undefined;
         const processProfile: AgyProcessProfile = getProcessProfile(isolatedRequest);
@@ -1158,7 +1192,12 @@ export function streamAntigravity(
             : (getSystemPromptRelay?.() ?? systemPrompt);
 
         const effectiveTurnPrompt = summaryRequest
-          ? boundSummarizationPrompt(turnPrompt)
+          ? boundSummarizationPrompt(
+              turnPrompt,
+              executorMode === "acp"
+                ? MAX_ACP_SUMMARIZATION_PROMPT_CHARS
+                : MAX_AGY_SUMMARIZATION_PROMPT_CHARS,
+            )
           : turnPrompt;
         const readOnlyPermissions =
           summaryRequest ||
@@ -1172,6 +1211,10 @@ export function streamAntigravity(
             // combine the slimmed Pi instruction relay with the aside directive
             // (stripping conflicting <btw_capabilities> tool claims).
             systemPrompt: effectiveSystemPrompt,
+            images:
+              summaryRequest || sideSummaryRequest || userBatch.imageParts.length === 0
+                ? undefined
+                : userBatch.imageParts,
             historyBootstrap:
               summaryRequest || sideSummaryRequest
                 ? undefined
@@ -1245,11 +1288,14 @@ export function streamAntigravity(
           thoughtIndex = null;
         };
 
-        // Non-blocking typewriter pacing for thinking and answer text. Text is
-        // queued and dripped by a timer at one steady rate (chosen per enqueue);
-        // any other activity (or close) flushes the rest immediately, so pacing
-        // never delays real work.
-        const paceEnabled = process.env.PI_ANTIGRAVITY_THINKING_PACE !== "0";
+        // Non-blocking typewriter pacing for legacy stream-json / one-shot modes
+        // where thinking is polled from SQLite every 250ms. In native `acp` mode,
+        // `agy acp` streams `agent_thought_chunk` and `agent_message_chunk` live
+        // over JSON-RPC, so pacing is bypassed by default (zero added latency)
+        // unless explicitly forced with PI_ANTIGRAVITY_THINKING_PACE=1.
+        const paceEnv = process.env.PI_ANTIGRAVITY_THINKING_PACE?.trim();
+        const paceEnabled =
+          paceEnv === "1" ? true : paceEnv === "0" ? false : executorMode !== "acp";
         const makePacer = (emit: (piece: string) => void, isOpen: () => boolean) => {
           let pending: string[] = [];
           let timer: ReturnType<typeof setInterval> | undefined;

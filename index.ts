@@ -14,6 +14,7 @@
 //   /agy-footer     toggle 2-row custom footer on/off or show status
 //   /agy-reset      drop the current agy conversation (next turn starts fresh)
 //   /agy-models     re-discover models from `agy models` and re-register
+//   /agy-login      authenticate Antigravity via ACP (`oauth-personal`, `oauth-business`, `gemini-api-key`, `agent-platform`)
 //   /agy-agents     list configured custom agents
 //   /agy-doctor     diagnose binary, models, driver, bridge, and local state
 //   /agy-subagents  list subagent activity observed on the agy stream
@@ -285,7 +286,10 @@ function getInitialModelCache(): ModelCache {
   };
 }
 
-async function discoverModels(refresh = false): Promise<ModelCache> {
+async function discoverModels(
+  refresh = false,
+  acpFallbackModels?: AgyModelInfo[],
+): Promise<ModelCache> {
   if (!refresh) {
     const cached = readJson<ModelCache | null>(MODEL_CACHE_FILE, null);
     if (cached?.models?.length && modelCacheIsFresh(cached)) {
@@ -293,8 +297,14 @@ async function discoverModels(refresh = false): Promise<ModelCache> {
     }
   }
   const live = await listAgyModels();
-  const cache: ModelCache = live.length
-    ? { fetchedAt: Date.now(), source: "live", models: normalizeModels(live) }
+  const combinedLive =
+    live.length > 0 && acpFallbackModels?.length
+      ? mergeAgyModels([...live, ...acpFallbackModels])
+      : live.length > 0
+        ? live
+        : (acpFallbackModels ?? []);
+  const cache: ModelCache = combinedLive.length
+    ? { fetchedAt: Date.now(), source: "live", models: normalizeModels(combinedLive) }
     : { fetchedAt: Date.now(), source: "fallback", models: FALLBACK_MODELS };
   try {
     writeJson(MODEL_CACHE_FILE, cache);
@@ -1846,9 +1856,19 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
 
   registerAntigravityProvider(currentCache.models);
 
+  async function getWarmAcpDiscoveredModels(): Promise<AgyModelInfo[] | undefined> {
+    try {
+      const snap = await runAntigravity(runtime, service.snapshot);
+      return snap.executor.discoveredModels;
+    } catch {
+      return undefined;
+    }
+  }
+
   async function refreshStaleModelsWhenSelected(): Promise<void> {
     if (modelCacheIsFresh(currentCache)) return;
-    const fresh = await discoverModels(true);
+    const acpModels = await getWarmAcpDiscoveredModels();
+    const fresh = await discoverModels(true, acpModels);
     currentCache = fresh;
     registerAntigravityProvider(fresh.models);
   }
@@ -2036,6 +2056,20 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       updateAgyTasksWidget();
     }
     await persistConversationState(ctx);
+    if (currentCache.source === "fallback") {
+      const acpModels = await getWarmAcpDiscoveredModels();
+      if (acpModels?.length) {
+        currentCache = {
+          fetchedAt: Date.now(),
+          source: "live",
+          models: normalizeModels(acpModels),
+        };
+        registerAntigravityProvider(currentCache.models);
+        try {
+          writeJson(MODEL_CACHE_FILE, currentCache);
+        } catch {}
+      }
+    }
     if (activeGoal) {
       const uiProbe = probeCtx(() => ctx.ui);
       const ui = !uiProbe.stale && uiProbe.value ? uiProbe.value : tasksUi;
@@ -2816,13 +2850,75 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         ctx.ui.notify('agy-models: usage "/agy-models".', "error");
         return;
       }
-      const refreshed = await discoverModels(true);
+      const acpModels = await getWarmAcpDiscoveredModels();
+      const refreshed = await discoverModels(true, acpModels);
       currentCache = refreshed;
       registerAntigravityProvider(refreshed.models);
       ctx.ui.notify(
         `antigravity: ${refreshed.models.length} models registered (${refreshed.source}).`,
         "info",
       );
+    },
+  });
+
+  const DEFAULT_ACP_AUTH_METHODS = [
+    "oauth-personal",
+    "oauth-business",
+    "gemini-api-key",
+    "agent-platform",
+    "status",
+  ] as const;
+
+  pi.registerCommand("agy-login", {
+    description:
+      "Authenticate Antigravity via ACP (/agy-login [oauth-personal|oauth-business|gemini-api-key|agent-platform|status])",
+    getArgumentCompletions: (prefix) =>
+      DEFAULT_ACP_AUTH_METHODS.filter((m) => m.startsWith(prefix.trim().toLowerCase())).map(
+        (m) => ({ value: m, label: m }),
+      ),
+    handler: async (args, ctx) => {
+      const arg = args.trim();
+      if (/^status$/i.test(arg)) {
+        const snap = await runAntigravity(runtime, service.snapshot);
+        const methods = snap.executor.authMethods;
+        ctx.ui.notify(
+          methods?.length
+            ? `antigravity ACP auth methods:\n${methods
+                .map((m) => `• ${m.id}: ${m.name}${m.description ? ` — ${m.description}` : ""}`)
+                .join("\n")}`
+            : `antigravity: ACP auth methods (${DEFAULT_ACP_AUTH_METHODS.filter((m) => m !== "status").join(", ")}). Run "/agy-login [method]" to authenticate.`,
+          "info",
+        );
+        return;
+      }
+      const methodId = arg || undefined;
+      ctx.ui.notify(
+        `antigravity: starting ACP authentication (${methodId ?? "oauth-personal"})...`,
+        "info",
+      );
+      try {
+        const result = await runAntigravity(
+          runtime,
+          service.authenticate({ methodId, cwd: ctx.cwd }),
+        );
+        const acpModels = await getWarmAcpDiscoveredModels();
+        const refreshed = await discoverModels(true, acpModels);
+        currentCache = refreshed;
+        registerAntigravityProvider(refreshed.models);
+        ctx.ui.notify(
+          `antigravity: authenticated via ${result.methodId}${
+            result.methodName ? ` (${result.methodName})` : ""
+          }; ${refreshed.models.length} models registered.`,
+          "info",
+        );
+      } catch (error) {
+        ctx.ui.notify(
+          `antigravity: ACP authentication failed (${
+            error instanceof Error ? error.message : String(error)
+          }).`,
+          "error",
+        );
+      }
     },
   });
 
@@ -2924,11 +3020,30 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
             .map(([reason, count]) => `${reason}=${count}`)
             .join(", ");
           lines.push(
-            executor.mode === "persistent"
+            executor.mode === "persistent" || executor.mode === "acp"
               ? `driver stats: spawns=${stats.spawnCount} respawns=${Math.max(0, stats.spawnCount - 1)} turns=${stats.submittedTurns} reused=${stats.reusedTurns} recycles=${stats.recycleCount} current=${stats.currentProcessTurns}`
               : `driver stats: one-shot launches=${stats.spawnCount} turns=${stats.submittedTurns}`,
             `driver recycle reasons: ${reasons || "none"}`,
           );
+        }
+        if (executor.acpQuota) {
+          const q = executor.acpQuota;
+          const quotaParts = [
+            q.remaining !== undefined ? `remaining=${q.remaining}` : undefined,
+            q.limit !== undefined ? `limit=${q.limit}` : undefined,
+            q.resetTime ? `resets=${q.resetTime}` : undefined,
+          ].filter(Boolean);
+          if (quotaParts.length > 0) {
+            lines.push(`driver quota: ${quotaParts.join(" ")}`);
+          }
+        }
+        if (executor.discoveredModels?.length) {
+          lines.push(
+            `acp session models: ${executor.discoveredModels.length} (${executor.discoveredModels.map((m) => m.id).join(", ")})`,
+          );
+        }
+        if (executor.authMethods?.length) {
+          lines.push(`acp auth methods: ${executor.authMethods.map((m) => m.id).join(", ")}`);
         }
       } catch (error) {
         lines.push(`driver: ERROR ${error instanceof Error ? error.message : String(error)}`);

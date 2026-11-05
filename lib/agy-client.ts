@@ -31,8 +31,19 @@ import { AgyThoughtTracker } from "./agy-thoughts.ts";
 /** agy reasoning effort, as accepted by `agy --effort`. */
 export type AgyEffort = "low" | "medium" | "high";
 
+export interface AgyPromptImage {
+  data: string;
+  mimeType: string;
+}
+
 export interface AgyTurnRequest {
   prompt: string;
+  /** Raw system instructions for executors supporting native system-prompt delivery (ACP). */
+  systemPrompt?: string;
+  /** Formatted text relay fallback when native system-prompt delivery is unavailable. */
+  systemPromptRelay?: string;
+  /** Multimodal user image blocks for executors supporting native image blocks (ACP). */
+  images?: AgyPromptImage[];
   /** Resume a prior conversation; omit to start a new one. */
   conversationId?: string;
   /** agy model id, e.g. "gemini-3.8-flash". */

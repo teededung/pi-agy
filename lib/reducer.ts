@@ -187,7 +187,7 @@ export function stripHallucinatedTurnSuffix(text: string): string {
     .replace(HALLUCINATED_TURN_BOUNDARY_RE, "");
 }
 
-function sanitizeAgentResponseDelta(
+export function sanitizeAgentResponseDelta(
   outcome: AgyTurnOutcome,
   stepIndex: number | undefined,
   rawDelta: string,

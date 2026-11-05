@@ -1,4 +1,10 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import type { AcpAuthMethod, AcpQuotaSnapshot } from "./agy-acp-client.ts";
+import { AgyAcpDriverSession } from "./agy-acp-driver.ts";
+import type { AgyModelInfo } from "./models.ts";
 import {
   AgyModelEffortFallbackError,
   AgySpawnError,
@@ -95,19 +101,29 @@ export interface AgyExecutorStats {
 }
 
 export interface AgyExecutorSnapshot {
-  mode: "persistent" | "one-shot";
+  mode: "acp" | "persistent" | "one-shot";
   state: AgyDriverState;
   pid?: number;
   conversationId?: string;
   config?: AgyProcessConfigSnapshot;
   lifecycle: string[];
   stats?: AgyExecutorStats;
+  acpQuota?: AcpQuotaSnapshot;
+  discoveredModels?: AgyModelInfo[];
+  authMethods?: AcpAuthMethod[];
 }
 
 export interface AgyTurnExecutor {
+  readonly supportsNativeSystemPrompt?: boolean;
+  readonly supportsNativeImages?: boolean;
   run(request: AgyTurnRequest): Promise<AgyTurnOutcome>;
   snapshot(): AgyExecutorSnapshot;
   close(reason: AgyExecutorCloseReason, cause?: AgyRecycleCause): Promise<void>;
+  authenticate?(options?: {
+    methodId?: string;
+    cwd?: string;
+    signal?: AbortSignal;
+  }): Promise<{ methodId: string; methodName?: string; authMethods: AcpAuthMethod[] }>;
 }
 
 interface ActiveTurn {
@@ -1445,6 +1461,30 @@ export class AgyOneShotExecutor implements AgyTurnExecutor {
   }
 }
 
+function configuredDriverMode(env: NodeJS.ProcessEnv): string | undefined {
+  const rawEnv = env.PI_ANTIGRAVITY_DRIVER?.trim().toLowerCase();
+  if (rawEnv) return rawEnv;
+  try {
+    const configDir = env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+    const settingsPath = join(configDir, "settings.json");
+    if (existsSync(settingsPath)) {
+      const data = JSON.parse(readFileSync(settingsPath, "utf8"));
+      const cfg = data?.["pi-agy"] ?? data?.antigravity;
+      if (cfg && typeof cfg === "object" && typeof cfg.driver === "string" && cfg.driver.trim()) {
+        return cfg.driver.trim().toLowerCase();
+      }
+    }
+  } catch {}
+  return undefined;
+}
+
 export function createAgyTurnExecutor(env: NodeJS.ProcessEnv = process.env): AgyTurnExecutor {
-  return env.PI_ANTIGRAVITY_DRIVER === "0" ? new AgyOneShotExecutor() : new AgyDriverSession();
+  const mode = configuredDriverMode(env);
+  if (mode === "0" || mode === "one-shot" || mode === "oneshot") {
+    return new AgyOneShotExecutor();
+  }
+  if (mode === "stream-json" || mode === "persistent" || mode === "legacy") {
+    return new AgyDriverSession();
+  }
+  return new AgyAcpDriverSession();
 }

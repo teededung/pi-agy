@@ -13,7 +13,13 @@ import { Context, Data, Effect, Layer, ManagedRuntime, Exit, Cause, Result } fro
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { AgySpawnError, AgyStallError, type AgyTurnRequest } from "../lib/agy-client.ts";
+import type { AcpAuthMethod } from "../lib/agy-acp-client.ts";
+import {
+  AgySpawnError,
+  AgyStallError,
+  type AgyPromptImage,
+  type AgyTurnRequest,
+} from "../lib/agy-client.ts";
 import {
   createAgyTurnExecutor,
   type AgyExecutorSnapshot,
@@ -117,7 +123,7 @@ function isMissingConversationFailure(value: unknown): boolean {
       : value instanceof Error
         ? value.message
         : String(value);
-  return /conversation.{0,80}(?:not found|does not exist|missing|failed to (?:load|resume))|(?:not found|missing).{0,80}conversation/i.test(
+  return /(?:conversation|session).{0,80}(?:not found|does not exist|missing|failed to (?:read|load|resume))|(?:not found|missing|failed to (?:read|load|resume)).{0,80}(?:conversation|session)/i.test(
     text,
   );
 }
@@ -169,8 +175,10 @@ export interface AntigravityRuntimeShape {
    */
   readonly beginStreamTurn: (request: {
     readonly prompt: string;
-    /** Current Pi instructions, relayed through agy's text-only user input. */
+    /** Current Pi instructions, delivered natively (ACP) or relayed through user input. */
     readonly systemPrompt?: string;
+    /** Multimodal user image blocks for executors with native image support (ACP). */
+    readonly images?: readonly AgyPromptImage[];
     /** Active pi-branch history used only when a fresh agy conversation needs restoring. */
     readonly historyBootstrap?: string;
     /**
@@ -205,6 +213,14 @@ export interface AntigravityRuntimeShape {
   }) => boolean;
   readonly reset: Effect.Effect<void, AntigravityRuntimeClosedError>;
   readonly snapshot: Effect.Effect<AntigravityStateSnapshot, AntigravityRuntimeClosedError>;
+  readonly authenticate: (options?: {
+    readonly methodId?: string;
+    readonly cwd?: string;
+    readonly signal?: AbortSignal;
+  }) => Effect.Effect<
+    { methodId: string; methodName?: string; authMethods: AcpAuthMethod[] },
+    AntigravityRuntimeError
+  >;
   readonly close: Effect.Effect<void, AntigravityRuntimeClosedError>;
 }
 
@@ -477,10 +493,11 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
               const freshSystemPromptRelay = systemPrompt
                 ? piSystemInstructionsPrompt(systemPrompt)
                 : undefined;
+              const useNativeSystemPrompt = Boolean(executor.supportsNativeSystemPrompt);
               let restoredAttemptActive = resumingPersistedConversation;
               let restoredResultMissing = false;
               const freshRestorePrompt = [
-                freshSystemPromptRelay,
+                useNativeSystemPrompt ? undefined : freshSystemPromptRelay,
                 request.historyBootstrap,
                 request.prompt,
                 request.bootstrapSuffix,
@@ -488,9 +505,16 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                 .filter((part): part is string => Boolean(part))
                 .join("\n\n");
               const spawnRequest: AgyTurnRequest = {
-                prompt: [systemPromptRelay, historyBootstrap, request.prompt, bootstrapSuffix]
+                prompt: [
+                  useNativeSystemPrompt ? undefined : systemPromptRelay,
+                  historyBootstrap,
+                  request.prompt,
+                  bootstrapSuffix,
+                ]
                   .filter((part): part is string => Boolean(part))
                   .join("\n\n"),
+                ...(useNativeSystemPrompt && systemPrompt ? { systemPrompt } : {}),
+                ...(request.images?.length ? { images: [...request.images] } : {}),
                 conversationId,
                 model: request.modelId,
                 effort: request.effort,
@@ -611,12 +635,23 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                   const attempt: AgyTurnRequest = {
                     ...spawnRequest,
                     prompt: resumingRetry
-                      ? [carriedRelay, stallContinuationPrompt(), carriedSuffix]
+                      ? [
+                          useNativeSystemPrompt ? undefined : carriedRelay,
+                          stallContinuationPrompt(),
+                          carriedSuffix,
+                        ]
                           .filter((part): part is string => Boolean(part))
                           .join("\n\n")
                       : freshFallback
                         ? freshRestorePrompt
                         : spawnRequest.prompt,
+                    ...(useNativeSystemPrompt
+                      ? {
+                          systemPrompt: systemPrompt || undefined,
+                          systemPromptRelay: carriedRelay,
+                        }
+                      : {}),
+                    images: resumingRetry ? undefined : spawnRequest.images,
                     conversationId: resumableConversationId,
                     timeoutMs: retry === 0 && !freshFallback ? timeoutMs : remainingMs,
                     progressTimeoutMs: timeoutMs,
@@ -779,6 +814,34 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
           })),
         ),
       ),
+
+      authenticate: (options) =>
+        ensureOpen.pipe(
+          Effect.andThen(
+            Effect.tryPromise({
+              try: async () => {
+                if (!executor.authenticate) {
+                  throw new AgySpawnError(
+                    "Active Antigravity driver does not support ACP authenticate; run `agy login` in a terminal.",
+                    "",
+                  );
+                }
+                return await executor.authenticate({
+                  methodId: options?.methodId,
+                  cwd: options?.cwd ?? cwd,
+                  signal: options?.signal,
+                });
+              },
+              catch: (cause) =>
+                cause instanceof AgySpawnError
+                  ? new AntigravitySpawnError({ message: cause.message, stderr: cause.stderr })
+                  : new AntigravitySpawnError({
+                      message: cause instanceof Error ? cause.message : String(cause),
+                      stderr: "",
+                    }),
+            }),
+          ),
+        ),
 
       close: Effect.suspend(() =>
         ensureOpen.pipe(
