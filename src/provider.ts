@@ -89,6 +89,20 @@ function shortenIsolatedPath(rawPath: string, cwd?: string): string {
     if (rel === "") return ".";
     if (rel && !rel.startsWith("..") && !path.isAbsolute(rel)) return rel;
   }
+  const rawTmp = tmpdir().replace(/\/+$/, "");
+  if (rawTmp) {
+    const tmpCandidates = new Set([rawTmp]);
+    if (rawTmp.startsWith("/private/")) tmpCandidates.add(rawTmp.slice("/private".length));
+    else if (rawTmp.startsWith("/var/") || rawTmp === "/tmp") tmpCandidates.add(`/private${rawTmp}`);
+    for (const dir of tmpCandidates) {
+      if (cleaned === dir) return "$TMPDIR";
+      if (cleaned.startsWith(`${dir}/`)) return `$TMPDIR/${cleaned.slice(dir.length + 1)}`;
+    }
+  }
+  const macVarTmp = /^(?:\/private)?\/var\/folders\/[^/]+\/[^/]+\/T(?:\/(.*))?$/.exec(cleaned);
+  if (macVarTmp) {
+    return macVarTmp[1] ? `$TMPDIR/${macVarTmp[1]}` : "$TMPDIR";
+  }
   const home = homedir();
   if (home && cleaned === home) return "~";
   if (home && cleaned.startsWith(`${home}/`)) return `~/${cleaned.slice(home.length + 1)}`;

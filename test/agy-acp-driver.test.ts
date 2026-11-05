@@ -41,6 +41,12 @@ import {
 import { Text } from "@earendil-works/pi-tui";
 import type { Theme, ToolRenderers } from "@earendil-works/pi-coding-agent";
 import {
+  BtwOverlayComponent,
+  buildOverlayTranscript,
+  formatInlineBtwToolLine,
+  resolveBtwOverlayPalette,
+} from "../extensions/btw.ts";
+import {
   formatIsolatedToolLine,
   isBridgedMcpStep,
   streamAntigravity,
@@ -1313,6 +1319,198 @@ test("/btw isolated tool lines prioritize toolSummary and normalize agy 1.5.0 na
     }),
     "🔧 `fsearch/grep` · Search Moonlight_Dagger across scripts",
   );
+  assert.equal(
+    formatIsolatedToolLine({
+      name: "mcp_pi-3e5c4d388aa7_pi__read",
+      args: {
+        path: "/var/folders/kx/pt4lx4qd77qczv985n2_75c40000gn/T/orca-paste-1793888860381-c0ece01f-5baa-41c0-9830-15507a63a16b.png",
+      },
+    }),
+    "🔧 `read` · $TMPDIR/orca-paste-1793888860381-c0ece01f-5baa-41c0-9830-15507a63a16b.png",
+  );
+});
+
+test("/btw overlay palette and transcript render crisp thinking/tool colors and elevated card backgrounds without warning yellow", async () => {
+  const noop = (s: string) => s;
+  const mdTheme = {
+    heading: noop,
+    link: noop,
+    linkUrl: noop,
+    code: noop,
+    codeBlock: noop,
+    codeBlockBorder: noop,
+    quote: noop,
+    quoteBorder: noop,
+    hr: () => "",
+    listBullet: noop,
+    bold: noop,
+    italic: noop,
+    strikethrough: noop,
+    underline: noop,
+  };
+
+  const mockTheme = {
+    appearance: "dark",
+    colors: {
+      text: { kind: "rgb", r: 222, g: 224, b: 225 },
+      thinkingText: { kind: "rgb", r: 157, g: 165, b: 170 },
+    },
+    getColorMode: () => "truecolor",
+    getBgAnsi: (token: string) =>
+      token === "toolPendingBg"
+        ? "\x1b[48;2;63;69;71m"
+        : token === "customMessageBg"
+          ? "\x1b[48;2;71;58;106m"
+          : "\x1b[48;2;37;72;90m",
+    getFgAnsi: (token: string) =>
+      token === "thinkingText" ? "\x1b[38;2;157;165;170m" : "\x1b[39m",
+    fg: (token: string, text: string) => `<fg:${token}>${text}</fg:${token}>`,
+    bg: (token: string, text: string) => `\x1b[48;2;37;72;90m${text}\x1b[49m`,
+    bold: (text: string) => `<b>${text}</b>`,
+  } as unknown as Theme;
+
+  const palette = resolveBtwOverlayPalette(mockTheme as any);
+  // Distinct truecolor surfaces for header, transcript body, and input row
+  assert.match(palette.surfaceBg, /^\x1b\[48;2;\d+;\d+;\d+m$/);
+  assert.match(palette.headerBg, /^\x1b\[48;2;\d+;\d+;\d+m$/);
+  assert.match(palette.inputBg, /^\x1b\[48;2;\d+;\d+;\d+m$/);
+  assert.notEqual(palette.surfaceBg, palette.headerBg);
+  assert.notEqual(palette.surfaceBg, "\x1b[48;2;52;58;67m");
+
+  // Inline tool line splits path and :start-end range with mdLink + text + syntaxNumber
+  const formattedTool = formatInlineBtwToolLine(
+    "🔧 `read` · lani-shield/docs/client-2026-10-21-migration-plan.md:20-50",
+    mockTheme as any,
+  );
+  assert.equal(
+    formattedTool,
+    "<fg:accent>▸</fg:accent> <fg:mdLink><b>read</b></fg:mdLink><fg:borderMuted> · </fg:borderMuted><fg:text>lani-shield/docs/client-2026-10-21-migration-plan.md</fg:text><fg:syntaxNumber>:20-50</fg:syntaxNumber>",
+  );
+
+  // Narrow width middle-truncates single-token paths while preserving :start-end range
+  const compactedTool = formatInlineBtwToolLine(
+    "🔧 `read` · $TMPDIR/orca-paste-1793888860381-c0ece01f-5baa-41c0-9830-15507a63a16b.png:10-20",
+    mockTheme as any,
+    48,
+  );
+  assert.ok(compactedTool?.includes("…"), "middle-truncates long path to fit single line");
+  assert.ok(compactedTool?.includes("<fg:syntaxNumber>:10-20</fg:syntaxNumber>"), "preserves line range suffix");
+
+  // Thinking transcript uses cool blended thinkingText + `│` rail, zero `<fg:warning>`,
+  // and 1-row top/bottom padding around thinking prose blocks relative to tool calls
+  const transcript = buildOverlayTranscript(
+    [
+      { id: 1, turnId: 1, type: "user-message", text: "Check RVA shift" },
+      {
+        id: 2,
+        turnId: 1,
+        type: "thinking",
+        streaming: true,
+        text: "The core question is whether hex tracking is version-specific.\n🔧 `read` · lani-shield/docs/plan.md:20-50\n🔧 `bash` · Search RVA symbols\nInitial analysis reveals shifted RVAs.",
+      },
+      { id: 3, turnId: 1, type: "assistant-text", streaming: false, text: "Confirmed." },
+    ],
+    mockTheme as any,
+    mdTheme as any,
+    72,
+    palette,
+  );
+  const joined = transcript.join("\n");
+  assert.ok(!joined.includes("<fg:warning>"), "must not paint thinking or tools in warning yellow");
+  assert.ok(joined.includes("<fg:borderMuted>│ </fg:borderMuted>"), "thinking prose has left rail");
+  assert.ok(joined.includes("<fg:mdLink><b>read</b></fg:mdLink>"), "inline tool row is structured");
+  assert.ok(joined.includes("<fg:syntaxNumber>:20-50</fg:syntaxNumber>"), "line range is highlighted");
+  const readIdx = transcript.findIndex((row) => row.includes("<fg:mdLink><b>read</b></fg:mdLink>"));
+  const bashIdx = transcript.findIndex((row) => row.includes("<fg:mdLink><b>bash</b></fg:mdLink>"));
+  assert.equal(transcript[readIdx - 1], "", "blank row separates preceding thinking prose from first tool call");
+  assert.equal(bashIdx, readIdx + 1, "consecutive tool calls stay grouped together");
+  assert.equal(transcript[bashIdx + 1], "", "blank row separates last tool call from next thinking prose block");
+
+  // Full BtwOverlayComponent render: rounded borderAccent when focused, borderMuted when unfocused, surfaceBg intact
+  const ansiTheme = {
+    appearance: "dark",
+    colors: {
+      text: { kind: "rgb", r: 222, g: 224, b: 225 },
+      thinkingText: { kind: "rgb", r: 157, g: 165, b: 170 },
+    },
+    getColorMode: () => "truecolor",
+    getBgAnsi: (token: string) =>
+      token === "toolPendingBg"
+        ? "\x1b[48;2;63;69;71m"
+        : token === "customMessageBg"
+          ? "\x1b[48;2;71;58;106m"
+          : "\x1b[48;2;37;72;90m",
+    getFgAnsi: () => "\x1b[38;2;168;153;215m",
+    fg: (token: string, text: string) =>
+      token === "borderAccent"
+        ? `\x1b[38;2;168;153;215m${text}\x1b[39m`
+        : token === "borderMuted"
+          ? `\x1b[38;2;126;136;142m${text}\x1b[39m`
+          : `\x1b[38;2;200;205;210m${text}\x1b[39m`,
+    bg: (_token: string, text: string) => `\x1b[48;2;37;72;90m${text}\x1b[49m`,
+    bold: (text: string) => `\x1b[1m${text}\x1b[22m`,
+  } as unknown as Theme;
+
+  // Initialize global theme for getMarkdownTheme() inside BtwOverlayComponent constructor
+  const { initTheme } = await import("@earendil-works/pi-coding-agent");
+  initTheme("dark");
+
+  const overlay = new BtwOverlayComponent(
+    { mode: "fullscreen", requestRender() {} } as any,
+    ansiTheme as any,
+    { matches: () => false } as any,
+    () => [
+      {
+        id: 1,
+        turnId: 1,
+        type: "user-message",
+        text: "xem cái nào đúng /var/folders/kx/pt4lx4qd77qczv985n2_75c40000gn/T/orca-paste-1793888860381-c0ece01f-5baa-41c0-9830-15507a63a16b.png",
+      },
+      {
+        id: 2,
+        turnId: 1,
+        type: "thinking",
+        streaming: true,
+        text: "Analyzing RVA shift.\n🔧 `read` · lani-shield/docs/plan.md:20-50",
+      },
+    ],
+    () => "⏳ 🔧 `read` · lani-shield/docs/plan.md:20-50",
+    () => "readonly",
+    () => "window",
+    () => {},
+    () => {},
+    () => {},
+    () => {},
+  );
+  const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m|\x1b_pi:[^\x07]*\x07/g, "");
+  overlay.focused = true;
+  const focusedRows = overlay.render(80);
+  const plainFocused = focusedRows.map(stripAnsi);
+  assert.ok(focusedRows[0]!.includes("╭") && focusedRows[0]!.includes("╮"));
+  assert.ok(focusedRows[focusedRows.length - 1]!.includes("╰") && focusedRows[focusedRows.length - 1]!.includes("╯"));
+  assert.ok(focusedRows[0]!.includes("\x1b[38;2;168;153;215m"), "focused border uses borderAccent");
+
+  // Header summary puts `● streaming` first with zero `· ●` double-dot collision, plus 1-space inner padding
+  assert.match(plainFocused[1]!, /^│ BTW ask · read-only/);
+  assert.match(plainFocused[2]!, /^│ ● streaming · 0 exchanges/);
+  assert.ok(!plainFocused[2]!.includes("· ●"), "no double bullet in header summary");
+
+  // Wrapped user continuation line keeps hanging indent instead of slamming against `│`
+  const youContinuation = plainFocused.find((row) => row.includes("15507a63a16b.png"));
+  assert.ok(youContinuation, "renders wrapped tail of user message");
+  assert.match(youContinuation!, /^│     /, "wrapped user continuation preserves 1-space margin + 4-space hanging indent");
+
+  // Focused empty composer shows `❯` prompt + fake cursor + streaming placeholder
+  const focusedInputRow = focusedRows[focusedRows.length - 3]!;
+  assert.ok(focusedInputRow.includes("\x1b_pi:fc\x07"), "focused composer emits fake cursor");
+  assert.match(stripAnsi(focusedInputRow), /^│ ❯ Ask a follow-up to queue/);
+
+  overlay.focused = false;
+  const unfocusedRows = overlay.render(80);
+  assert.ok(unfocusedRows[0]!.includes("\x1b[38;2;126;136;142m"), "unfocused border dims to borderMuted");
+  const unfocusedInputRow = unfocusedRows[unfocusedRows.length - 3]!;
+  assert.ok(!unfocusedInputRow.includes("\x1b_pi:fc\x07"), "unfocused composer hides fake cursor");
+  assert.match(stripAnsi(unfocusedInputRow), /^│ ❯ Press .* to focus BTW input/);
 });
 
 

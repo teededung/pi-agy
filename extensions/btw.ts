@@ -1389,24 +1389,304 @@ function getCompletedExchangeCount(entries: BtwTranscript): number {
   ).length;
 }
 
-function buildOverlayTranscript(
+interface RgbTuple {
+  r: number;
+  g: number;
+  b: number;
+}
+
+const BTW_XTERM_BASE: RgbTuple[] = [
+  { r: 0, g: 0, b: 0 },
+  { r: 128, g: 0, b: 0 },
+  { r: 0, g: 128, b: 0 },
+  { r: 128, g: 128, b: 0 },
+  { r: 0, g: 0, b: 128 },
+  { r: 128, g: 0, b: 128 },
+  { r: 0, g: 128, b: 128 },
+  { r: 192, g: 192, b: 192 },
+  { r: 128, g: 128, b: 128 },
+  { r: 255, g: 0, b: 0 },
+  { r: 0, g: 255, b: 0 },
+  { r: 255, g: 255, b: 0 },
+  { r: 0, g: 0, b: 255 },
+  { r: 255, g: 0, b: 255 },
+  { r: 0, g: 255, b: 255 },
+  { r: 255, g: 255, b: 255 },
+];
+
+function ansi256ToRgb(index: number): RgbTuple {
+  if (index < 16) return BTW_XTERM_BASE[Math.max(0, index)]!;
+  if (index >= 232) {
+    const v = 8 + (index - 232) * 10;
+    return { r: v, g: v, b: v };
+  }
+  const n = index - 16;
+  const steps = [0, 95, 135, 175, 215, 255];
+  return {
+    r: steps[Math.floor(n / 36)]!,
+    g: steps[Math.floor(n / 6) % 6]!,
+    b: steps[n % 6]!,
+  };
+}
+
+function parseSgrRgb(sgr: string): RgbTuple | undefined {
+  const tc = /\x1b\[(?:38|48);2;(\d+);(\d+);(\d+)m/.exec(sgr);
+  if (tc) {
+    return { r: Number(tc[1]), g: Number(tc[2]), b: Number(tc[3]) };
+  }
+  const idx = /\x1b\[(?:38|48);5;(\d+)m/.exec(sgr);
+  if (idx) {
+    return ansi256ToRgb(Number(idx[1]));
+  }
+  return undefined;
+}
+
+function clampByte(v: number): number {
+  return Math.max(0, Math.min(255, Math.round(v)));
+}
+
+function mixRgb(a: RgbTuple, b: RgbTuple, weightB: number, scale = 1): RgbTuple {
+  const wa = 1 - weightB;
+  return {
+    r: clampByte((a.r * wa + b.r * weightB) * scale),
+    g: clampByte((a.g * wa + b.g * weightB) * scale),
+    b: clampByte((a.b * wa + b.b * weightB) * scale),
+  };
+}
+
+function resolveThemeRgb(
+  theme: ExtensionContext["ui"]["theme"],
+  token: string,
+  slot: "fg" | "bg",
+): RgbTuple | undefined {
+  try {
+    const sgr =
+      slot === "bg"
+        ? theme.getBgAnsi(token as Parameters<typeof theme.getBgAnsi>[0])
+        : theme.getFgAnsi(token as Parameters<typeof theme.getFgAnsi>[0]);
+    const fromSgr = parseSgrRgb(sgr);
+    if (fromSgr) return fromSgr;
+  } catch {
+    // Ignore missing method on lightweight test mocks.
+  }
+  const raw = (theme as unknown as { colors?: Record<string, { kind?: string; r?: number; g?: number; b?: number }> })
+    .colors?.[token];
+  if (raw?.kind === "rgb" && typeof raw.r === "number" && typeof raw.g === "number" && typeof raw.b === "number") {
+    return { r: raw.r, g: raw.g, b: raw.b };
+  }
+  return undefined;
+}
+
+export interface BtwOverlayPalette {
+  surfaceBg: string;
+  headerBg: string;
+  inputBg: string;
+  thinkingText: (text: string) => string;
+}
+
+export function resolveBtwOverlayPalette(theme: ExtensionContext["ui"]["theme"]): BtwOverlayPalette {
+  const isLight = (theme as { appearance?: string }).appearance === "light";
+  const colorMode = (() => {
+    try {
+      return theme.getColorMode?.() ?? "truecolor";
+    } catch {
+      return "truecolor";
+    }
+  })();
+
+  const pendingBg = resolveThemeRgb(theme, "toolPendingBg", "bg");
+  const customBg = resolveThemeRgb(theme, "customMessageBg", "bg");
+  const textRgb = resolveThemeRgb(theme, "text", "fg");
+  const thinkingRgb = resolveThemeRgb(theme, "thinkingText", "fg");
+
+  let surfaceBg = "";
+  let headerBg = "";
+  let inputBg = "";
+
+  if (colorMode === "truecolor" && pendingBg && customBg) {
+    if (isLight) {
+      const white: RgbTuple = { r: 255, g: 255, b: 255 };
+      const surf = mixRgb(customBg, white, 0.45);
+      const head = mixRgb(customBg, white, 0.15);
+      const inp = mixRgb(customBg, white, 0.78);
+      surfaceBg = `\x1b[48;2;${surf.r};${surf.g};${surf.b}m`;
+      headerBg = `\x1b[48;2;${head.r};${head.g};${head.b}m`;
+      inputBg = `\x1b[48;2;${inp.r};${inp.g};${inp.b}m`;
+    } else {
+      const surf = mixRgb(pendingBg, customBg, 0.35, 0.64);
+      const head = mixRgb(pendingBg, customBg, 0.55, 0.78);
+      const inp = mixRgb(pendingBg, customBg, 0.25, 0.5);
+      surfaceBg = `\x1b[48;2;${surf.r};${surf.g};${surf.b}m`;
+      headerBg = `\x1b[48;2;${head.r};${head.g};${head.b}m`;
+      inputBg = `\x1b[48;2;${inp.r};${inp.g};${inp.b}m`;
+    }
+  } else {
+    try {
+      surfaceBg = theme.getBgAnsi("toolPendingBg");
+      headerBg = theme.getBgAnsi("customMessageBg");
+      inputBg = surfaceBg;
+    } catch {
+      surfaceBg = "";
+      headerBg = "";
+      inputBg = "";
+    }
+  }
+
+  const thinkingFgAnsi =
+    colorMode === "truecolor" && textRgb && thinkingRgb
+      ? (() => {
+          const blended = mixRgb(textRgb, thinkingRgb, isLight ? 0.35 : 0.4);
+          return `\x1b[38;2;${blended.r};${blended.g};${blended.b}m`;
+        })()
+      : "";
+
+  return {
+    surfaceBg,
+    headerBg,
+    inputBg,
+    thinkingText: thinkingFgAnsi
+      ? (text: string) => `${thinkingFgAnsi}${text}\x1b[39m`
+      : (text: string) => theme.fg("thinkingText", text),
+  };
+}
+
+/** Re-assert the overlay panel background across nested `\x1b[0m` / `\x1b[49m` resets. */
+function withSurfaceBg(content: string, bgAnsi: string): string {
+  if (!bgAnsi) return content;
+  return `${bgAnsi}${content.replace(/\x1b\[0?m/g, (m) => `${m}${bgAnsi}`).replace(/\x1b\[49m/g, bgAnsi)}\x1b[49m`;
+}
+
+function compactBtwDetail(detail: string, maxWidth?: number): string {
+  if (maxWidth === undefined || visibleWidth(detail) <= maxWidth) return detail;
+  if (maxWidth <= 6) return truncateToWidth(detail, Math.max(1, maxWidth), "…");
+  const rangeMatch = /^(.*?)(:\d+(?:-\d+)?)$/.exec(detail);
+  const body = rangeMatch && rangeMatch[1] ? rangeMatch[1] : detail;
+  const suffix = rangeMatch && rangeMatch[1] ? rangeMatch[2]! : "";
+  if (!/\s/.test(body) && suffix.length + 5 <= maxWidth) {
+    const budget = maxWidth - suffix.length;
+    if (body.length > budget) {
+      const head = Math.max(2, Math.ceil((budget - 1) * 0.55));
+      const tail = Math.max(1, budget - 1 - head);
+      return `${body.slice(0, head)}…${body.slice(body.length - tail)}${suffix}`;
+    }
+  }
+  return truncateToWidth(detail, maxWidth, "…");
+}
+
+function formatBtwToolDetail(
+  detail: string,
+  theme: ExtensionContext["ui"]["theme"],
+  maxWidth?: number,
+): string {
+  const compacted = compactBtwDetail(detail, maxWidth);
+  const rangeMatch = /^(.*?)(:\d+(?:-\d+)?)$/.exec(compacted);
+  if (rangeMatch && rangeMatch[1]) {
+    return `${theme.fg("text", rangeMatch[1])}${theme.fg("syntaxNumber", rangeMatch[2]!)}`;
+  }
+  return theme.fg("text", compacted);
+}
+
+export function formatInlineBtwToolLine(
+  rawLine: string,
+  theme: ExtensionContext["ui"]["theme"],
+  maxWidth?: number,
+): string | null {
+  const trimmed = rawLine.trim();
+  const match = /^🔧\s+(?:`([^`]+)`|([^\s·]+))(?:\s*·\s*(.+))?$/.exec(trimmed);
+  if (!match) return null;
+  const toolName = (match[1] ?? match[2] ?? "tool").trim();
+  const detail = match[3]?.trim();
+  const bullet = theme.fg("accent", "▸");
+  const label = theme.fg("mdLink", theme.bold(toolName));
+  if (!detail) {
+    return `${bullet} ${label}`;
+  }
+  const detailBudget =
+    maxWidth !== undefined ? Math.max(12, maxWidth - visibleWidth(toolName) - 5) : undefined;
+  return `${bullet} ${label}${theme.fg("borderMuted", " · ")}${formatBtwToolDetail(detail, theme, detailBudget)}`;
+}
+
+function formatOverlayStatusLine(
+  rawStatus: string,
+  theme: ExtensionContext["ui"]["theme"],
+  maxWidth?: number,
+): string {
+  const trimmed = rawStatus.trim();
+  if (!trimmed) return "";
+  const queueMatch = /^(.*?)( · 📥 \d+ queued)$/.exec(trimmed);
+  const core = queueMatch ? queueMatch[1]!.trim() : trimmed;
+  const queueSuffix = queueMatch
+    ? `${theme.fg("borderMuted", " · ")}${theme.fg("accent", queueMatch[2]!.slice(3))}`
+    : "";
+  const coreBudget =
+    maxWidth !== undefined
+      ? Math.max(16, maxWidth - (queueMatch ? visibleWidth(queueMatch[2]!) : 0))
+      : undefined;
+
+  if (core.startsWith("❌") || /^Unknown model\b/i.test(core)) {
+    return `${theme.fg("error", core)}${queueSuffix}`;
+  }
+  if (core.startsWith("⏹")) {
+    return `${theme.fg("warning", core)}${queueSuffix}`;
+  }
+  if (core.startsWith("⏳")) {
+    const rest = core.slice("⏳".length).trim();
+    const toolBudget = coreBudget !== undefined ? Math.max(14, coreBudget - 2) : undefined;
+    const inlineTool = formatInlineBtwToolLine(rest, theme, toolBudget);
+    if (inlineTool) {
+      return `${theme.fg("mdLink", "⏳")} ${inlineTool}${queueSuffix}`;
+    }
+    const textBody = coreBudget !== undefined ? truncateToWidth(rest, Math.max(8, coreBudget - 2), "…") : rest;
+    return `${theme.fg("mdLink", "⏳")} ${theme.fg("text", textBody)}${queueSuffix}`;
+  }
+  const staleIdx = core.indexOf("⚠ ");
+  if (staleIdx > 0) {
+    return `${theme.fg("muted", core.slice(0, staleIdx))}${theme.fg("warning", core.slice(staleIdx))}${queueSuffix}`;
+  }
+  if (core.startsWith("⚠")) {
+    return `${theme.fg("warning", core)}${queueSuffix}`;
+  }
+  return `${theme.fg("muted", core)}${queueSuffix}`;
+}
+
+function formatOverlayHintsLine(
+  rawHints: string,
+  theme: ExtensionContext["ui"]["theme"],
+): string {
+  const trimmed = rawHints.trim();
+  if (!trimmed) return "";
+  return trimmed
+    .split(" · ")
+    .map((segment) => {
+      const m = /^((?:↑↓|Alt\+\S+|Super\+\S+|Ctrl\+\S+|Esc)(?:\s*\/\s*(?:Alt\+\S+|Super\+\S+|Ctrl\+\S+|Esc))*)\s+(.+)$/.exec(
+        segment.trim(),
+      );
+      if (!m) return theme.fg("dim", segment);
+      return `${theme.fg("muted", m[1]!)} ${theme.fg("dim", m[2]!)}`;
+    })
+    .join(theme.fg("borderMuted", " · "));
+}
+
+export function buildOverlayTranscript(
   entries: BtwTranscript,
   theme: ExtensionContext["ui"]["theme"],
   markdownTheme: MarkdownTheme,
   contentWidth: number,
+  palette: BtwOverlayPalette = resolveBtwOverlayPalette(theme),
 ): string[] {
   if (entries.length === 0) {
-    return [theme.fg("dim", "No BTW thread yet. Ask a side question to start one.")];
+    return [theme.fg("muted", "No BTW thread yet. Ask a side question to start one.")];
   }
 
   const lines: string[] = [];
-  const userBadge = buildTranscriptBadge(theme, "You", "userMessageBg", "accent");
-  const thinkingBadge = buildTranscriptBadge(theme, "Thinking", "toolPendingBg", "warning");
-  const toolBadge = buildTranscriptBadge(theme, "Tool", "toolPendingBg", "warning");
-  const assistantBadge = buildTranscriptBadge(theme, "Assistant", "customMessageBg", "success");
+  const userBadge = buildTranscriptBadge(theme, "You", "userMessageBg", "mdLink");
+  const thinkingBadge = buildTranscriptBadge(theme, "Thinking", "selectedBg", "mdLink");
+  const toolBadge = buildTranscriptBadge(theme, "Tool", "selectedBg", "mdLink");
+  const assistantBadge = buildTranscriptBadge(theme, "Assistant", "toolSuccessBg", "success");
   const separator = theme.fg("borderMuted", "────────────────────────────────────────");
   const blockIndent = BTW_BLOCK_INDENT;
   const resultIndent = blockIndent;
+  const thinkingRail = theme.fg("borderMuted", "│ ");
 
   const pushBlankLine = () => {
     if (lines.length > 0 && lines[lines.length - 1] !== "") {
@@ -1450,6 +1730,22 @@ function buildOverlayTranscript(
     }
   };
 
+  const flushThinkingProse = (proseLines: string[]): boolean => {
+    const joined = proseLines.join("\n").trim();
+    proseLines.length = 0;
+    if (!joined) return false;
+    const proseWidth = Math.max(1, contentWidth - 2);
+    const markdownLines = new Markdown(joined, 0, 0, markdownTheme, {
+      color: palette.thinkingText,
+    })
+      .render(proseWidth)
+      .map((line) => line.replace(/\s+$/u, ""));
+    for (const line of markdownLines) {
+      lines.push(line ? `${blockIndent}${thinkingRail}${line}` : `${blockIndent}${theme.fg("borderMuted", "│")}`);
+    }
+    return markdownLines.length > 0;
+  };
+
   for (const entry of entries) {
     if (entry.type === "turn-boundary") {
       if (entry.phase === "start" && lines.length > 0) {
@@ -1460,7 +1756,10 @@ function buildOverlayTranscript(
     }
 
     if (entry.type === "user-message") {
-      pushInlineBlock(userBadge, entry.text, { blankBefore: false });
+      pushInlineBlock(userBadge, entry.text, {
+        blankBefore: false,
+        style: (line) => theme.fg("userMessageText", line),
+      });
       continue;
     }
 
@@ -1470,34 +1769,54 @@ function buildOverlayTranscript(
         lines.push(separator);
       }
       const queuedLabel = entry.queueTotal > 1 ? `Queued #${entry.queuePosition}` : "Queued";
-      const queuedBadge = buildTranscriptBadge(theme, queuedLabel, "toolPendingBg", "warning");
-      const waitingHint = theme.fg("dim", "(⏳ waiting for current turn...)");
+      const queuedBadge = buildTranscriptBadge(theme, queuedLabel, "toolPendingBg", "accent");
+      const waitingHint = theme.fg("muted", "(⏳ waiting for current turn...)");
       pushStackedBlock(`${queuedBadge} ${waitingHint}`, entry.text, {
         blankBefore: false,
-        style: (line) => theme.fg("dim", line),
+        style: (line) => theme.fg("muted", line),
       });
       continue;
     }
 
     if (entry.type === "thinking") {
-      const thinkingHeader = entry.streaming ? `${thinkingBadge} ${theme.fg("warning", "▍")}` : thinkingBadge;
-      const markdownLines = new Markdown(entry.text, 0, 0, markdownTheme, {
-        color: (text: string) => theme.fg("warning", text),
-        italic: true,
-      })
-        .render(Math.max(1, contentWidth))
-        .map((line) => line.replace(/\s+$/u, ""));
+      const thinkingHeader = entry.streaming ? `${thinkingBadge} ${theme.fg("mdLink", "▍")}` : thinkingBadge;
       pushBlankLine();
       lines.push(thinkingHeader);
-      for (const line of markdownLines) {
-        lines.push(line ? `${blockIndent}${line}` : "");
+      const proseBuffer: string[] = [];
+      let lastSection: "none" | "prose" | "tool" = "none";
+      const emitBufferedProse = (prev: "none" | "prose" | "tool"): "none" | "prose" | "tool" => {
+        if (!proseBuffer.join("\n").trim()) {
+          proseBuffer.length = 0;
+          return prev;
+        }
+        if (prev === "tool") {
+          pushBlankLine();
+        }
+        return flushThinkingProse(proseBuffer) ? "prose" : prev;
+      };
+      for (const rawLine of entry.text.split("\n")) {
+        const formattedTool = formatInlineBtwToolLine(rawLine, theme, contentWidth);
+        if (formattedTool) {
+          lastSection = emitBufferedProse(lastSection);
+          if (lastSection === "prose") {
+            pushBlankLine();
+          }
+          lines.push(`${blockIndent}${formattedTool}`);
+          lastSection = "tool";
+        } else {
+          proseBuffer.push(rawLine);
+        }
       }
+      emitBufferedProse(lastSection);
       continue;
     }
 
     if (entry.type === "tool-call") {
-      const toolLabel = theme.fg("warning", theme.bold(entry.toolName));
-      const argsLabel = entry.args ? theme.fg("dim", ` · ${entry.args}`) : "";
+      const toolLabel = theme.fg("mdLink", theme.bold(entry.toolName));
+      const detailBudget = Math.max(12, contentWidth - visibleWidth(entry.toolName) - 6);
+      const argsLabel = entry.args
+        ? `${theme.fg("borderMuted", " · ")}${formatBtwToolDetail(entry.args, theme, detailBudget)}`
+        : "";
       pushInlineBlock(toolBadge, `${toolLabel}${argsLabel}`);
       continue;
     }
@@ -1506,19 +1825,19 @@ function buildOverlayTranscript(
       const resultHeaderLabel = entry.isError
         ? theme.fg("error", "↳ error")
         : entry.streaming
-          ? theme.fg("warning", "↳ streaming result")
-          : theme.fg("dim", "↳ result");
+          ? theme.fg("mdLink", "↳ streaming result")
+          : theme.fg("muted", "↳ result");
       const truncationLabel = entry.truncated ? theme.fg("dim", " (truncated)") : "";
       pushStackedBlock(`${resultHeaderLabel}${truncationLabel}`, entry.content, {
         blankBefore: false,
         indent: resultIndent,
-        style: (line) => (entry.isError ? theme.fg("error", line) : theme.fg("dim", line)),
+        style: (line) => (entry.isError ? theme.fg("error", line) : theme.fg("muted", line)),
       });
       continue;
     }
 
     if (entry.type === "assistant-text") {
-      const assistantHeader = entry.streaming ? `${assistantBadge} ${theme.fg("warning", "▍")}` : assistantBadge;
+      const assistantHeader = entry.streaming ? `${assistantBadge} ${theme.fg("success", "▍")}` : assistantBadge;
       const markdownLines = new Markdown(entry.text, 0, 0, markdownTheme)
         .render(Math.max(1, contentWidth))
         .map((line) => line.replace(/\s+$/u, ""));
@@ -1679,8 +1998,8 @@ function getOverlayTitle(mode: BtwThreadMode): string {
 function buildTranscriptBadge(
   theme: ExtensionContext["ui"]["theme"],
   label: string,
-  background: "userMessageBg" | "toolPendingBg" | "customMessageBg",
-  foreground: "accent" | "warning" | "success",
+  background: "userMessageBg" | "toolPendingBg" | "customMessageBg" | "selectedBg" | "toolSuccessBg",
+  foreground: "accent" | "warning" | "success" | "mdLink",
 ): string {
   return theme.bg(background, theme.fg(foreground, theme.bold(` ${label} `)));
 }
@@ -1706,6 +2025,7 @@ export class BtwOverlayComponent extends Container implements Focusable {
   private readonly onAbortCallback: () => void;
   private readonly getModelLabel: () => string;
   private readonly getOverlayContext: () => ExtensionContext | ExtensionCommandContext | null;
+  private readonly getStaleNotice: () => string | null;
   private readonly tui: TUI;
   private readonly theme: ExtensionContext["ui"]["theme"];
   private readonly markdownTheme: MarkdownTheme;
@@ -1762,7 +2082,7 @@ export class BtwOverlayComponent extends Container implements Focusable {
     onAbort: () => void = onDismiss,
     getModelLabel: () => string = () => "",
     getOverlayContext: () => ExtensionContext | ExtensionCommandContext | null = () => null,
-    private readonly getStaleNotice: () => string | null = () => null,
+    getStaleNotice: () => string | null = () => null,
   ) {
     super();
     this.tui = tui;
@@ -1785,6 +2105,7 @@ export class BtwOverlayComponent extends Container implements Focusable {
     this.onAbortCallback = onAbort;
     this.getModelLabel = getModelLabel;
     this.getOverlayContext = getOverlayContext;
+    this.getStaleNotice = getStaleNotice;
 
     this.modeText = new Text("", 1, 0);
     this.summaryText = new Text("", 1, 0);
@@ -1912,8 +2233,10 @@ export class BtwOverlayComponent extends Container implements Focusable {
     const start = Math.max(0, this.completionIndex - 4);
     return this.completionItems.slice(start, start + 5).map((item, index) => {
       const selected = start + index === this.completionIndex;
-      return this.theme.fg(selected ? "accent" : "dim",
-        `${selected ? "→" : " "} ${item.label}  ${item.description}`);
+      if (selected) {
+        return `${this.theme.fg("accent", this.theme.bold(`→ ${item.label}`))}  ${this.theme.fg("text", item.description)}`;
+      }
+      return `  ${this.theme.fg("muted", item.label)}  ${this.theme.fg("dim", item.description)}`;
     });
   }
 
@@ -1924,39 +2247,122 @@ export class BtwOverlayComponent extends Container implements Focusable {
     return this.getWidthMode() === "full";
   }
 
-  private frameLine(content: string, innerWidth: number): string {
-    const truncated = truncateToWidth(content, innerWidth, "");
-    const padding = Math.max(0, innerWidth - visibleWidth(truncated));
-    if (this.borderless) {
-      return `${truncated}${" ".repeat(padding)}`;
-    }
-    return `${this.theme.fg("border", "│")}${truncated}${" ".repeat(padding)}${this.theme.fg("border", "│")}`;
+  private get borderToken(): "borderAccent" | "borderMuted" {
+    return this._focused ? "borderAccent" : "borderMuted";
   }
 
-  private ruleLine(innerWidth: number): string {
-    if (this.borderless) {
-      return this.theme.fg("border", "─".repeat(innerWidth));
-    }
-    return this.theme.fg("border", `├${"─".repeat(innerWidth)}┤`);
+  private get horizontalPad(): number {
+    return this.borderless ? 0 : 1;
   }
 
-  private borderLine(innerWidth: number, edge: "top" | "bottom"): string {
+  private frameLine(content: string, innerWidth: number, bgAnsi: string): string {
+    const pad = this.horizontalPad;
+    const textWidth = Math.max(1, innerWidth - pad * 2);
+    const truncated = truncateToWidth(content, textWidth, "");
+    const padding = Math.max(0, textWidth - visibleWidth(truncated));
+    const margin = " ".repeat(pad);
+    const inner = `${margin}${truncated}${" ".repeat(padding)}${margin}`;
     if (this.borderless) {
-      return this.theme.fg("border", "─".repeat(innerWidth));
+      return withSurfaceBg(inner, bgAnsi);
     }
-    const left = edge === "top" ? "┌" : "└";
-    const right = edge === "top" ? "┐" : "┘";
-    return this.theme.fg("border", `${left}${"─".repeat(innerWidth)}${right}`);
+    const bar = this.theme.fg(this.borderToken, "│");
+    return withSurfaceBg(`${bar}${inner}${bar}`, bgAnsi);
   }
 
-  private wrapTranscript(innerWidth: number): string[] {
+  private ruleLine(innerWidth: number, bgAnsi: string): string {
+    const horizontal = this.theme.fg("borderMuted", "─".repeat(innerWidth));
+    if (this.borderless) {
+      return withSurfaceBg(horizontal, bgAnsi);
+    }
+    const left = this.theme.fg(this.borderToken, "├");
+    const right = this.theme.fg(this.borderToken, "┤");
+    return withSurfaceBg(`${left}${horizontal}${right}`, bgAnsi);
+  }
+
+  private borderLine(innerWidth: number, edge: "top" | "bottom", bgAnsi: string): string {
+    if (this.borderless) {
+      return withSurfaceBg(this.theme.fg(this.borderToken, "─".repeat(innerWidth)), bgAnsi);
+    }
+    const left = edge === "top" ? "╭" : "╰";
+    const right = edge === "top" ? "╮" : "╯";
+    return withSurfaceBg(this.theme.fg(this.borderToken, `${left}${"─".repeat(innerWidth)}${right}`), bgAnsi);
+  }
+
+  private formatHeaderModeLine(): string {
+    const title = getOverlayTitle(this.getMode());
+    const modelLabel = this.getModelLabel();
+    const sep = this.theme.fg("borderMuted", " · ");
+    const parts = [this.theme.fg("accent", this.theme.bold(title))];
+    if (modelLabel) {
+      parts.push(this.theme.fg("mdLink", modelLabel));
+    }
+    parts.push(this.theme.fg("muted", this.getWorkspaceLabel()));
+    parts.push(this.theme.fg("dim", "hidden thread"));
+    return parts.join(sep);
+  }
+
+  private formatHeaderSummaryLine(hiddenAbove: number, hiddenBelow: number): string {
+    const sep = this.theme.fg("borderMuted", " · ");
+    const rawParts = this.summaryTextValue
+      .trim()
+      .split(" · ")
+      .filter(Boolean);
+    let stateBadge: string | null = null;
+    const restStyled: string[] = [];
+    for (const part of rawParts) {
+      if (part === "streaming") {
+        stateBadge = this.theme.fg("mdLink", "● streaming");
+      } else if (part === "idle") {
+        stateBadge = this.theme.fg("success", "● idle");
+      } else if (part.startsWith("📥")) {
+        restStyled.push(this.theme.fg("accent", part));
+      } else {
+        restStyled.push(this.theme.fg("muted", part));
+      }
+    }
+    const ordered = stateBadge ? [stateBadge, ...restStyled] : restStyled;
+    if (hiddenAbove || hiddenBelow) {
+      ordered.push(this.theme.fg("accent", `↑${hiddenAbove} ↓${hiddenBelow}`));
+    }
+    return ordered.join(sep);
+  }
+
+  private wrapTranscript(textWidth: number): string[] {
     const wrapped: string[] = [];
+    const safeWidth = Math.max(12, textWidth);
+    const thinkingPrefix = `${BTW_BLOCK_INDENT}${this.theme.fg("borderMuted", "│ ")}`;
+    const thinkingPrefixWidth = visibleWidth(thinkingPrefix);
+
     for (const line of this.transcriptLines) {
       if (!line) {
         wrapped.push("");
         continue;
       }
-      wrapped.push(...wrapTextWithAnsi(line, Math.max(1, innerWidth)));
+      if (visibleWidth(line) <= safeWidth) {
+        wrapped.push(line);
+        continue;
+      }
+      if (line.startsWith(thinkingPrefix)) {
+        const body = line.slice(thinkingPrefix.length);
+        const bodyWidth = Math.max(8, safeWidth - thinkingPrefixWidth);
+        for (const chunk of wrapTextWithAnsi(body, bodyWidth)) {
+          wrapped.push(`${thinkingPrefix}${chunk}`);
+        }
+        continue;
+      }
+      if (line.startsWith(BTW_BLOCK_INDENT)) {
+        const body = line.slice(BTW_BLOCK_INDENT.length);
+        const bodyWidth = Math.max(8, safeWidth - BTW_BLOCK_INDENT.length);
+        for (const chunk of wrapTextWithAnsi(body, bodyWidth)) {
+          wrapped.push(`${BTW_BLOCK_INDENT}${chunk}`);
+        }
+        continue;
+      }
+      const chunks = wrapTextWithAnsi(line, Math.max(8, safeWidth - BTW_BLOCK_INDENT.length));
+      wrapped.push(chunks[0] ?? "");
+      for (let i = 1; i < chunks.length; i++) {
+        wrapped.push(`${BTW_BLOCK_INDENT}${chunks[i]}`);
+      }
     }
     return wrapped;
   }
@@ -2052,26 +2458,58 @@ export class BtwOverlayComponent extends Container implements Focusable {
     this.input.handleInput(data);
   }
 
-  private inputFrameLine(dialogWidth: number): string {
+  private inputFrameLine(dialogWidth: number, bgAnsi: string): string {
     const borderColumns = this.borderless ? 0 : 2;
-    const targetWidth = Math.max(1, dialogWidth - borderColumns);
-    const previousFocused = this.input.focused;
-    // Input.render() emits CURSOR_MARKER when focused. In overlay mode that APC marker
-    // can skew width/composition on this one row before the TUI strips it, producing a
-    // right-edge notch and shifted border. Render the embedded input unfocused here so
-    // the row stays geometrically stable while the overlay still owns keyboard input.
-    this.input.focused = false;
-    try {
-      const renderedInputLine = this.input.render(targetWidth)[0] ?? "";
-      const inputLine = truncateToWidth(renderedInputLine, targetWidth, "");
-      const padding = Math.max(0, targetWidth - visibleWidth(inputLine));
-      if (this.borderless) {
-        return `${inputLine}${" ".repeat(padding)}`;
+    const pad = this.horizontalPad;
+    const innerWidth = Math.max(1, dialogWidth - borderColumns);
+    const textWidth = Math.max(1, innerWidth - pad * 2);
+    const draft = this.input.getValue();
+    const isStreaming = this.summaryTextValue.includes("streaming");
+    let inputLine: string;
+
+    if (draft.length === 0) {
+      if (this._focused) {
+        const placeholder = isStreaming
+          ? "Ask a follow-up to queue, or type /btw:…"
+          : "Ask a side question, or type /btw:…";
+        const firstChar = placeholder[0] ?? " ";
+        const restPlaceholder = placeholder.slice(1);
+        const raw = `${this.theme.fg("accent", this.theme.bold("❯ "))}\x1b_pi:fc\x07${firstChar}\x1b_pi:/fc\x07${this.theme.fg("dim", restPlaceholder)}`;
+        inputLine = truncateToWidth(raw, textWidth, "");
+      } else {
+        const raw = `${this.theme.fg("muted", "❯ ")}${this.theme.fg("dim", `Press ${BTW_FOCUS_SHORTCUTS_LABEL} to focus BTW input`)}`;
+        inputLine = truncateToWidth(raw, textWidth, "");
       }
-      return `${this.theme.fg("border", "│")}${inputLine}${" ".repeat(padding)}${this.theme.fg("border", "│")}`;
-    } finally {
-      this.input.focused = previousFocused;
+    } else {
+      const previousFocused = this.input.focused;
+      // Input.render() emits CURSOR_MARKER when focused. In overlay mode that APC marker
+      // can skew width/composition on this one row before the TUI strips it, producing a
+      // right-edge notch and shifted border. Render the embedded input unfocused here so
+      // the row stays geometrically stable while the overlay still owns keyboard input.
+      this.input.focused = false;
+      try {
+        let rendered = this.input.render(textWidth)[0] ?? "";
+        if (!this._focused) {
+          rendered = rendered.replace(/\x1b_pi:\/?fc\x07/g, "");
+        }
+        const promptGlyph = this._focused
+          ? this.theme.fg("accent", this.theme.bold("❯ "))
+          : this.theme.fg("muted", "❯ ");
+        rendered = rendered.replace(/^> /, promptGlyph);
+        inputLine = truncateToWidth(rendered, textWidth, "");
+      } finally {
+        this.input.focused = previousFocused;
+      }
     }
+
+    const padding = Math.max(0, textWidth - visibleWidth(inputLine));
+    const margin = " ".repeat(pad);
+    const inner = `${margin}${inputLine}${" ".repeat(padding)}${margin}`;
+    if (this.borderless) {
+      return withSurfaceBg(inner, bgAnsi);
+    }
+    const bar = this.theme.fg(this.borderToken, "│");
+    return withSurfaceBg(`${bar}${inner}${bar}`, bgAnsi);
   }
 
   private fitRenderedLine(line: string, width: number): string {
@@ -2079,15 +2517,17 @@ export class BtwOverlayComponent extends Container implements Focusable {
   }
 
   override render(width: number): string[] {
+    const palette = resolveBtwOverlayPalette(this.theme);
     const dialogWidth = Math.max(24, width);
     const borderColumns = this.borderless ? 0 : 2;
     const innerWidth = Math.max(22, dialogWidth - borderColumns);
-    const contentWidth = Math.max(1, innerWidth - BTW_BLOCK_INDENT.length);
+    const textWidth = Math.max(20, innerWidth - this.horizontalPad * 2);
+    const contentWidth = Math.max(1, textWidth - BTW_BLOCK_INDENT.length);
     if (contentWidth !== this.contentWidth) {
       this.contentWidth = contentWidth;
       this.rebuildTranscriptLines();
     }
-    const transcriptLines = this.wrapTranscript(innerWidth);
+    const transcriptLines = this.wrapTranscript(textWidth);
     const dialogHeight = this.getDialogHeight();
     const chromeHeight = BTW_OVERLAY_CHROME_LINES;
     const completionRows = this.completionRows();
@@ -2111,30 +2551,46 @@ export class BtwOverlayComponent extends Container implements Focusable {
     const transcriptPadCount = Math.max(0, transcriptHeight - visibleTranscript.length);
     const hiddenAbove = this.transcriptScrollOffset;
     const hiddenBelow = Math.max(0, maxScroll - this.transcriptScrollOffset);
-    const summary =
-      hiddenAbove || hiddenBelow
-        ? `${this.summaryTextValue.trim()} · ↑${hiddenAbove} ↓${hiddenBelow}`
-        : this.summaryTextValue.trim();
 
-    const lines = [this.borderLine(innerWidth, "top")];
+    const lines = [this.borderLine(innerWidth, "top", palette.headerBg)];
 
-    lines.push(this.frameLine(this.theme.fg("accent", this.theme.bold(this.modeTextValue.trim())), innerWidth));
-    lines.push(this.frameLine(this.theme.fg("dim", summary), innerWidth));
-    lines.push(this.ruleLine(innerWidth));
+    lines.push(this.frameLine(this.formatHeaderModeLine(), innerWidth, palette.headerBg));
+    lines.push(
+      this.frameLine(
+        this.formatHeaderSummaryLine(hiddenAbove, hiddenBelow),
+        innerWidth,
+        palette.headerBg,
+      ),
+    );
+    lines.push(this.ruleLine(innerWidth, palette.surfaceBg));
 
     for (const line of visibleTranscript) {
-      lines.push(this.frameLine(line, innerWidth));
+      lines.push(this.frameLine(line, innerWidth, palette.surfaceBg));
     }
     for (let i = 0; i < transcriptPadCount; i++) {
-      lines.push(this.frameLine("", innerWidth));
+      lines.push(this.frameLine("", innerWidth, palette.surfaceBg));
     }
 
-    lines.push(this.ruleLine(innerWidth));
-    lines.push(this.frameLine(this.theme.fg("warning", this.statusTextValue.trim()), innerWidth));
-    for (const row of completionRows) lines.push(this.frameLine(row, innerWidth));
-    lines.push(this.inputFrameLine(dialogWidth));
-    lines.push(this.frameLine(this.theme.fg("dim", this.hintsTextValue.trim()), innerWidth));
-    lines.push(this.borderLine(innerWidth, "bottom"));
+    lines.push(this.ruleLine(innerWidth, palette.surfaceBg));
+    lines.push(
+      this.frameLine(
+        formatOverlayStatusLine(this.statusTextValue, this.theme, textWidth),
+        innerWidth,
+        palette.surfaceBg,
+      ),
+    );
+    for (const row of completionRows) {
+      lines.push(this.frameLine(row, innerWidth, palette.surfaceBg));
+    }
+    lines.push(this.inputFrameLine(dialogWidth, palette.inputBg));
+    lines.push(
+      this.frameLine(
+        formatOverlayHintsLine(this.hintsTextValue, this.theme),
+        innerWidth,
+        palette.headerBg,
+      ),
+    );
+    lines.push(this.borderLine(innerWidth, "bottom", palette.headerBg));
 
     return lines.map((line) => this.fitRenderedLine(line, width));
   }
@@ -2289,7 +2745,7 @@ export default function (pi: ExtensionAPI) {
           }
         }
         if (entry.type === "tool-call") {
-          return withQueueSuffix(`⏳ tool: ${entry.toolName}${entry.args ? ` · ${entry.args}` : ""}`);
+          return withQueueSuffix(`⏳ 🔧 \`${entry.toolName}\`${entry.args ? ` · ${entry.args}` : ""}`);
         }
         if (entry.type === "thinking" && entry.streaming) {
           const lastToolLine = entry.text
@@ -2298,8 +2754,7 @@ export default function (pi: ExtensionAPI) {
             .filter((line) => line.startsWith("🔧 "))
             .pop();
           if (lastToolLine) {
-            const preview = lastToolLine.length > 56 ? `${lastToolLine.slice(0, 53)}...` : lastToolLine;
-            return withQueueSuffix(`⏳ ${preview}`);
+            return withQueueSuffix(`⏳ ${lastToolLine}`);
           }
           return withQueueSuffix("⏳ thinking...");
         }
@@ -2331,7 +2786,7 @@ export default function (pi: ExtensionAPI) {
           );
           const statusPreview = buildMinimizedStatusPreview();
           const statusColored = working
-            ? theme.fg("warning", ` ${statusPreview} `)
+            ? ` ${formatOverlayStatusLine(statusPreview, theme, 58)} `
             : theme.fg("success", ` ${statusPreview} `);
           const stale = getBtwStaleNotice();
           const staleText = stale ? theme.fg("warning", ` ${stale} `) : "";
