@@ -6,7 +6,9 @@ import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import {
   AGY_CONVERSATION_STATE_ENTRY,
+  AGY_GOAL_STATE_ENTRY,
   restorableAgyConversation,
+  restorableAgyGoalState,
 } from "../lib/conversation-state.ts";
 import {
   buildPiToolsTrajectoryMetadataFields,
@@ -51,7 +53,12 @@ import {
   type AgySubagentEntry,
 } from "../lib/subagents.ts";
 import { readAgyToolMode, resolveAgyToolModeCommand } from "../lib/tool-mode.ts";
-import { AGY_COMPACTION_ENTRY, cleanAgyCheckpointSummary } from "../lib/agy-compaction.ts";
+import {
+  AGY_COMPACTION_ENTRY,
+  boundCompactionSummaryFileLists,
+  cleanAgyCheckpointSummary,
+  scopeCompactionPreparationToAgyCheckpoint,
+} from "../lib/agy-compaction.ts";
 import {
   AgyThoughtTracker,
   extractCheckpointSummaryFromStepPayload,
@@ -64,6 +71,7 @@ import {
   resolveAgyConsultSpec,
 } from "../lib/models.ts";
 import {
+  boundSummarizationPrompt,
   contextHasPriorBoostActivity,
   contextHasPriorGrillActivity,
   contextHasPriorTeamworkActivity,
@@ -1638,7 +1646,28 @@ test("/goal prompt helpers format elapsed time, continuation checklist, and resp
       responseText: "Partial text",
       continuations: 0,
     }),
-    "aborted",
+    "error",
+  );
+  assert.equal(
+    decideGoalSettlement({
+      aborted: true,
+      settled: false,
+      stopReason: "error",
+      responseText: "",
+      continuations: 1,
+    }),
+    "error",
+  );
+  assert.equal(
+    decideGoalSettlement({
+      aborted: true,
+      settled: false,
+      stopReason: "aborted",
+      errorMessage: "Aborted after 1 retry attempt",
+      responseText: "",
+      continuations: 3,
+    }),
+    "error",
   );
   assert.equal(
     decideGoalSettlement({
@@ -2886,6 +2915,252 @@ test("AntigravityRuntime slides turnTimeoutMs on forward step/SQLite progress an
     /agy logical turn timed out after/,
   );
   await runtime.runPromise(service.finishTurn);
+});
+
+test("restorableAgyGoalState persists active/paused goal on branch, clears on inactive, and isolates forks", () => {
+  const sessionId = "01a19fd8-a700-7719-966c-3900203d9f6a";
+  const activeBranch = [
+    {
+      type: "custom",
+      customType: AGY_GOAL_STATE_ENTRY,
+      data: {
+        version: 1,
+        kind: "active",
+        sessionId,
+        request: "Hoàn thiện đợt 1 tương thích client 2026-10-21",
+        startedAt: 1700000000000,
+        continuations: 4,
+        boost: true,
+        paused: true,
+      },
+    },
+  ];
+  const restored = restorableAgyGoalState(activeBranch, sessionId);
+  assert.equal(restored?.request, "Hoàn thiện đợt 1 tương thích client 2026-10-21");
+  assert.equal(restored?.continuations, 4);
+  assert.equal(restored?.boost, true);
+  assert.equal(restored?.paused, true);
+
+  // Fork with different sessionId does not auto-resume continuation loop,
+  // while sessionId-agnostic history bootstrap still sees the branch goal.
+  assert.equal(restorableAgyGoalState(activeBranch, "forked-session-id"), undefined);
+  assert.equal(
+    restorableAgyGoalState(activeBranch)?.request,
+    "Hoàn thiện đợt 1 tương thích client 2026-10-21",
+  );
+
+  const clearedBranch = [
+    ...activeBranch,
+    {
+      type: "custom",
+      customType: AGY_GOAL_STATE_ENTRY,
+      data: { version: 1, kind: "inactive", sessionId },
+    },
+  ];
+  assert.equal(restorableAgyGoalState(clearedBranch, sessionId), undefined);
+});
+
+test("scopeCompactionPreparationToAgyCheckpoint trims pre-checkpoint history/fileOps and leaves non-agy sessions untouched", () => {
+  // 1. Pure non-agy session without pi-agy-compaction: completely untouched.
+  const nonAgyMsg = {
+    role: "assistant",
+    content: [{ type: "toolCall", id: "t1", name: "read", arguments: { path: "/repo/a.ts" } }],
+  };
+  const nonAgyPrep = {
+    firstKeptEntryId: "keep-1",
+    messagesToSummarize: [nonAgyMsg],
+    turnPrefixMessages: [],
+    isSplitTurn: false,
+    tokensBefore: 185_000,
+    previousSummary: undefined as string | undefined,
+    fileOps: {
+      read: new Set(["/repo/a.ts"]),
+      written: new Set<string>(),
+      edited: new Set<string>(),
+    },
+  };
+  const untouched = scopeCompactionPreparationToAgyCheckpoint(
+    nonAgyPrep,
+    [{ type: "message", message: nonAgyMsg }],
+    { isAntigravityProvider: false },
+  );
+  assert.equal(untouched.scoped, false);
+  assert.equal(nonAgyPrep.tokensBefore, 185_000);
+  assert.equal(nonAgyPrep.messagesToSummarize.length, 1);
+  assert.deepEqual([...nonAgyPrep.fileOps.read], ["/repo/a.ts"]);
+
+  // 2. Session with multi-day pre-checkpoint history + post-checkpoint delta:
+  // drops pre-checkpoint messages and stale 3-day fileOps, seeds previousSummary from agy checkpoint.
+  const day1User = { role: "user", content: "Day 1 old lani-server task", timestamp: 1000 };
+  const day1Asst = {
+    role: "assistant",
+    timestamp: 1010,
+    content: [{ type: "toolCall", id: "old1", name: "read", arguments: { path: "/old/day1.cpp" } }],
+  };
+  const goalUser = { role: "user", content: "/goal Port client 2026-10-21 hooks", timestamp: 2000 };
+  const postCheckpointUser = { role: "user", content: "continue", timestamp: 3000 };
+  const postCheckpointAsst = {
+    role: "assistant",
+    timestamp: 3010,
+    content: [
+      {
+        type: "toolCall",
+        id: "new1",
+        name: "edit",
+        arguments: { path: "/new/compat_itemdesc_hooks.cpp" },
+      },
+    ],
+  };
+
+  const mixedBranch = [
+    { type: "message", message: day1User },
+    { type: "message", message: day1Asst },
+    { type: "message", message: goalUser },
+    {
+      type: "custom",
+      customType: AGY_COMPACTION_ENTRY,
+      timestamp: "1970-01-01T00:00:02.500Z",
+      data: {
+        version: 1,
+        beforeTokens: 298_000,
+        afterTokens: 24_000,
+        summary: "1. **Task Overview**\n   - Active goal: Port client 2026-10-21 hooks.",
+        detectedAt: "1970-01-01T00:00:02.500Z",
+      },
+    },
+    { type: "message", message: postCheckpointUser },
+    { type: "message", message: postCheckpointAsst },
+  ];
+
+  const agyPrep = {
+    firstKeptEntryId: "keep-tail",
+    messagesToSummarize: [day1User, day1Asst, goalUser, postCheckpointUser],
+    turnPrefixMessages: [postCheckpointAsst],
+    isSplitTurn: true,
+    tokensBefore: 6_264_872,
+    previousSummary: undefined as string | undefined,
+    fileOps: {
+      read: new Set(["/old/day1.cpp"]),
+      written: new Set<string>(),
+      edited: new Set(["/new/compat_itemdesc_hooks.cpp"]),
+    },
+  };
+
+  const scoped = scopeCompactionPreparationToAgyCheckpoint(agyPrep, mixedBranch, {
+    isAntigravityProvider: true,
+    agyContextTokens: 254_598,
+  });
+  assert.equal(scoped.scoped, true);
+  assert.equal(scoped.immediateCompaction, undefined);
+  assert.equal(agyPrep.tokensBefore, 254_598);
+  assert.match(agyPrep.previousSummary ?? "", /Port client 2026-10-21 hooks/);
+  assert.deepEqual(agyPrep.messagesToSummarize, [postCheckpointUser]);
+  assert.deepEqual(agyPrep.turnPrefixMessages, [postCheckpointAsst]);
+  assert.deepEqual([...agyPrep.fileOps.read], []);
+  assert.deepEqual([...agyPrep.fileOps.edited], ["/new/compat_itemdesc_hooks.cpp"]);
+});
+
+test("piHistoryBootstrap pins summary and active /goal at head without file-list tail eviction", () => {
+  const hugeReadFiles = Array.from(
+    { length: 900 },
+    (_, i) => `/Users/dev/repo/module_${i}/very_long_source_filename_${i}.cpp`,
+  ).join("\n");
+  const piCompactionUserMsg = {
+    role: "user",
+    content: [
+      {
+        type: "text",
+        text:
+          "The conversation history before this point was compacted into the following summary:\n\n" +
+          "<summary>\n## Goal\nPreserve dual-client 0219 + 1021 compatibility.\n\n" +
+          `<read-files>\n${hugeReadFiles}\n</read-files>\n</summary>`,
+      },
+    ],
+  };
+  const recentTurn = {
+    role: "assistant",
+    content: [{ type: "text", text: `Recent progress: ${"x".repeat(55_000)}` }],
+  };
+  const latestContinue = { role: "user", content: "continue" };
+
+  const branch = [
+    {
+      type: "custom",
+      customType: AGY_GOAL_STATE_ENTRY,
+      data: {
+        version: 1,
+        kind: "active",
+        sessionId: "sess-1",
+        request: "Hoàn thiện đợt 1 tương thích in-game cho client 2026-10-21",
+        startedAt: 1000,
+        continuations: 2,
+        paused: true,
+      },
+    },
+    { type: "compaction", summary: "...", tokensBefore: 250_000 },
+    { type: "message", message: recentTurn },
+    { type: "message", message: latestContinue },
+  ];
+
+  const context = {
+    messages: [piCompactionUserMsg, recentTurn, latestContinue],
+  } as unknown as Parameters<typeof piHistoryBootstrap>[0];
+
+  const restored = piHistoryBootstrap(context, 0, branch);
+  assert.ok(restored);
+  // Active /goal reminder AND the prose ## Goal inside <summary> remain intact at the top!
+  assert.ok(restored.includes("[Active /goal objective]"));
+  assert.ok(restored.includes("Hoàn thiện đợt 1 tương thích in-game cho client 2026-10-21"));
+  assert.ok(restored.includes("## Goal\nPreserve dual-client 0219 + 1021 compatibility."));
+  assert.ok(restored.includes("earlier paths omitted"));
+
+  // Direct test of boundCompactionSummaryFileLists (including $ paths) and boundSummarizationPrompt
+  const dollarPaths = Array.from({ length: 100 }, (_, i) => `/repo/routes/$id/$&_${i}.tsx`).join("\n");
+  const boundedSummary = boundCompactionSummaryFileLists(
+    `Prose head\n<read-files>\n${dollarPaths}\n</read-files>`,
+    500,
+  );
+  assert.ok(boundedSummary.startsWith("Prose head\n<read-files>"));
+  assert.ok(boundedSummary.includes("$id/$&_99.tsx"));
+  assert.ok(!boundedSummary.includes("<read-files>\n/repo/routes/$id/$&_0.tsx"));
+
+  // Even when the original /goal user turn is still in context.messages[0] and gets tail-sliced off by maxHistoryChars,
+  // piHistoryBootstrap pins [Active /goal objective] at the head of the final transcript.
+  const goalTurnMsg = { role: "user" as const, content: "Hoàn thiện đợt 1 tương thích in-game cho client 2026-10-21" };
+  const fillerTurnMsg = { role: "assistant" as const, content: [{ type: "text" as const, text: "x".repeat(70_000) }] };
+  const uncompactedBranch = [
+    {
+      type: "custom" as const,
+      customType: AGY_GOAL_STATE_ENTRY,
+      data: {
+        version: 1,
+        kind: "active" as const,
+        sessionId: "sess-1",
+        request: "Hoàn thiện đợt 1 tương thích in-game cho client 2026-10-21",
+        startedAt: 1_000,
+        continuations: 3,
+        boost: true,
+        paused: true,
+      },
+    },
+  ];
+  const uncompactedRestored = piHistoryBootstrap(
+    {
+      messages: [goalTurnMsg, fillerTurnMsg, latestContinue],
+    } as unknown as Parameters<typeof piHistoryBootstrap>[0],
+    0,
+    uncompactedBranch,
+  );
+  assert.ok(uncompactedRestored);
+  assert.ok(uncompactedRestored.includes("[Active /goal objective]"));
+  assert.ok(uncompactedRestored.includes("Hoàn thiện đợt 1 tương thích in-game cho client 2026-10-21"));
+
+  const hugePrompt = `<conversation>\nEARLY_CONTEXT_${"a".repeat(90_000)}\nLATE_GOAL_SPEC_${"b".repeat(90_000)}\n</conversation>\n\n<previous-summary>\nKeep me\n</previous-summary>\n\nSummarize.`;
+  const boundedPrompt = boundSummarizationPrompt(hugePrompt, 50_000);
+  assert.ok(boundedPrompt.length <= 50_000);
+  assert.ok(boundedPrompt.startsWith("<conversation>\nEARLY_CONTEXT_"));
+  assert.ok(boundedPrompt.includes("</conversation>\n\n<previous-summary>\nKeep me\n</previous-summary>\n\nSummarize."));
+  assert.ok(boundedPrompt.includes("middle conversation omitted"));
 });
 
 

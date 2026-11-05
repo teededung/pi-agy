@@ -33,8 +33,13 @@ import {
   type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import type { AgyEffort } from "../lib/agy-client.ts";
-import { AGY_COMPACTION_ENTRY } from "../lib/agy-compaction.ts";
+import {
+  boundCompactionSummaryFileLists,
+  extractAgyCompactionEntrySummary,
+  isAgyCompactionBranchEntry,
+} from "../lib/agy-compaction.ts";
 import { type AgyPiBridge, resolveBridgeResultsFromContext } from "../lib/bridge.ts";
+import { restorableAgyGoalState } from "../lib/conversation-state.ts";
 import {
   ALL_FALLBACK_MODELS,
   extractAgyConsultFooter,
@@ -55,6 +60,7 @@ import {
   BOOST_DEACTIVATED_PROMPT,
   BOOST_ORCHESTRATOR_PROMPT,
   BRIDGE_PENDING_TOOL_MESSAGE,
+  buildActiveGoalContextReminder,
   buildGrillMeContinuationPrompt,
   buildGrillMePrompt,
   GOAL_INITIAL_PROMPT,
@@ -228,20 +234,6 @@ export function latestUserPrompt(context: TranscriptContext): { prompt: string; 
 const MAX_RESTORED_HISTORY_CHARS = 60_000;
 const MAX_TOOL_RESULT_RESTORE_CHARS = 1_500;
 
-function isAgyCompactionEntry(entry: unknown): boolean {
-  if (!entry || typeof entry !== "object") return false;
-  const record = entry as { type?: unknown; customType?: unknown };
-  return record.type === "custom" && record.customType === AGY_COMPACTION_ENTRY;
-}
-
-function extractAgyCompactionSummary(entry: unknown): string | undefined {
-  if (!isAgyCompactionEntry(entry)) return undefined;
-  const data = (entry as { data?: { summary?: unknown } }).data;
-  return typeof data?.summary === "string" && data.summary.trim().length > 0
-    ? data.summary.trim()
-    : undefined;
-}
-
 function isBranchMessageEntry(entry: unknown): entry is { type: "message"; message: unknown } {
   if (!entry || typeof entry !== "object") return false;
   return (entry as { type?: unknown }).type === "message" && "message" in entry;
@@ -268,11 +260,15 @@ function sliceMessagesAfterCompaction(
     return { messages: priorMessages, compacted: false };
   }
   let lastAgyCompactionIdx = -1;
+  let lastAgyCompactionWithSummaryIdx = -1;
   let lastNativeCompactionIdx = -1;
   for (let i = 0; i < branch.length; i++) {
     const entry = branch[i];
-    if (isAgyCompactionEntry(entry)) {
+    if (isAgyCompactionBranchEntry(entry)) {
       lastAgyCompactionIdx = i;
+      if (extractAgyCompactionEntrySummary(entry)) {
+        lastAgyCompactionWithSummaryIdx = i;
+      }
     } else if (
       entry &&
       typeof entry === "object" &&
@@ -281,10 +277,14 @@ function sliceMessagesAfterCompaction(
       lastNativeCompactionIdx = i;
     }
   }
-  if (lastAgyCompactionIdx < 0 || lastAgyCompactionIdx < lastNativeCompactionIdx) {
+  const effectiveAgyCompactionIdx =
+    lastAgyCompactionWithSummaryIdx > lastNativeCompactionIdx
+      ? lastAgyCompactionWithSummaryIdx
+      : lastAgyCompactionIdx;
+  if (effectiveAgyCompactionIdx < 0 || effectiveAgyCompactionIdx < lastNativeCompactionIdx) {
     return { messages: priorMessages, compacted: false };
   }
-  const summary = extractAgyCompactionSummary(branch[lastAgyCompactionIdx]);
+  const summary = extractAgyCompactionEntrySummary(branch[effectiveAgyCompactionIdx]);
   if (priorMessages.length === 0) {
     return {
       messages: priorMessages,
@@ -295,7 +295,7 @@ function sliceMessagesAfterCompaction(
 
   let firstPostCompactionIdx = -1;
   let matchedByRef = false;
-  for (let i = lastAgyCompactionIdx + 1; i < branch.length; i++) {
+  for (let i = effectiveAgyCompactionIdx + 1; i < branch.length; i++) {
     const entry = branch[i];
     if (!isBranchMessageEntry(entry)) continue;
     const idx = priorMessages.indexOf(entry.message as TranscriptContext["messages"][number]);
@@ -306,7 +306,7 @@ function sliceMessagesAfterCompaction(
     }
   }
   if (!matchedByRef) {
-    for (let i = lastAgyCompactionIdx - 1; i >= 0; i--) {
+    for (let i = effectiveAgyCompactionIdx - 1; i >= 0; i--) {
       const entry = branch[i];
       if (!isBranchMessageEntry(entry)) continue;
       const idx = priorMessages.indexOf(entry.message as TranscriptContext["messages"][number]);
@@ -320,7 +320,7 @@ function sliceMessagesAfterCompaction(
   if (!matchedByRef) {
     const startBranchIdx = lastNativeCompactionIdx >= 0 ? lastNativeCompactionIdx : 0;
     let preCompactionCount = 0;
-    for (let i = startBranchIdx; i < lastAgyCompactionIdx; i++) {
+    for (let i = startBranchIdx; i < effectiveAgyCompactionIdx; i++) {
       if (countsAsContextMessage(branch[i])) preCompactionCount += 1;
     }
     let nonSystemSeen = 0;
@@ -418,24 +418,134 @@ export function piHistoryBootstrap(
         : (message.role ?? "message");
     entries.push(`${role}:\n${rendered.join("\n")}`);
   }
-  if (entries.length === 0 && !compactionSummary) return undefined;
-  const transcript = entries.join("\n\n");
+  const activeGoalState = restorableAgyGoalState(branch);
+  const boundedAgySummary = compactionSummary
+    ? boundCompactionSummaryFileLists(compactionSummary)
+    : undefined;
+  if (
+    entries.length > 0 &&
+    entries[0]!.startsWith(
+      "user:\nThe conversation history before this point was compacted into the following summary:\n\n<summary>",
+    )
+  ) {
+    entries[0] = boundCompactionSummaryFileLists(entries[0]!);
+  }
+  if (entries.length === 0 && !boundedAgySummary && !activeGoalState) return undefined;
+
+  const hasLeadingPiCompactionEntry =
+    !compacted &&
+    entries.length > 0 &&
+    entries[0]!.startsWith(
+      "user:\nThe conversation history before this point was compacted into the following summary:\n\n<summary>",
+    );
+
+  const pinnedSections: string[] = [];
+  if (compacted) {
+    pinnedSections.push(
+      boundedAgySummary
+        ? `[Earlier history compacted]\n<summary>\n${boundedAgySummary}\n</summary>`
+        : "[Earlier history compacted]",
+    );
+  } else if (hasLeadingPiCompactionEntry) {
+    pinnedSections.push(entries[0]!);
+  }
+
+  const rollingEntries = hasLeadingPiCompactionEntry ? entries.slice(1) : entries;
+  const rollingTranscript = rollingEntries.join("\n\n");
   const maxHistoryChars = Math.max(10_000, MAX_RESTORED_HISTORY_CHARS - promptReserveChars);
-  const compactionPrefix = compactionSummary
-    ? `[Earlier history compacted]\n<summary>\n${compactionSummary}\n</summary>`
-    : "[Earlier history compacted]";
-  const fullTranscript = compacted
-    ? transcript
-      ? `${compactionPrefix}\n${transcript}`
-      : compactionPrefix
-    : transcript;
-  const bounded =
-    fullTranscript.length <= maxHistoryChars
-      ? fullTranscript
-      : compacted
-        ? `[Earlier history compacted]\n${fullTranscript.slice(-maxHistoryChars)}`
-        : `[Earlier history omitted]\n${transcript.slice(-maxHistoryChars)}`;
-  return restoredPiContextPrompt(bounded);
+  const goalReminder = activeGoalState
+    ? buildActiveGoalContextReminder(activeGoalState.request)
+    : undefined;
+  const ensureGoalPinned = (body: string): string => {
+    if (!activeGoalState || !goalReminder || body.includes(activeGoalState.request)) {
+      return body;
+    }
+    return body ? `${goalReminder}\n\n${body}` : goalReminder;
+  };
+
+  let pinnedText = pinnedSections.join("\n\n");
+  if (!pinnedText) {
+    const bounded =
+      rollingTranscript.length <= maxHistoryChars
+        ? rollingTranscript
+        : `[Earlier history omitted]\n${rollingTranscript.slice(-maxHistoryChars)}`;
+    return restoredPiContextPrompt(ensureGoalPinned(bounded));
+  }
+
+  const maxPinnedBudget = rollingTranscript
+    ? Math.floor(maxHistoryChars * 0.75)
+    : maxHistoryChars;
+  if (pinnedText.length > maxPinnedBudget) {
+    pinnedText = `${pinnedText.slice(0, Math.max(2_000, maxPinnedBudget - 40))}\n... [summary truncated]`;
+  }
+
+  if (!rollingTranscript) {
+    return restoredPiContextPrompt(ensureGoalPinned(pinnedText));
+  }
+  const transcriptJoinSep = compacted ? "\n" : "\n\n";
+  const combined = `${pinnedText}${transcriptJoinSep}${rollingTranscript}`;
+  if (combined.length <= maxHistoryChars) {
+    return restoredPiContextPrompt(ensureGoalPinned(combined));
+  }
+  const omissionBanner = "[Earlier post-compaction turns omitted]";
+  const goalReserve =
+    activeGoalState && goalReminder && !pinnedText.includes(activeGoalState.request)
+      ? goalReminder.length + 2
+      : 0;
+  const remainingForTail =
+    maxHistoryChars - pinnedText.length - goalReserve - omissionBanner.length - 4;
+  if (remainingForTail <= 500) {
+    return restoredPiContextPrompt(ensureGoalPinned(pinnedText));
+  }
+  const slicedCombined = `${pinnedText}${transcriptJoinSep}${omissionBanner}\n${rollingTranscript.slice(-remainingForTail)}`;
+  return restoredPiContextPrompt(ensureGoalPinned(slicedCombined));
+}
+
+/**
+ * Maximum prompt length sent to `agy` for standalone summarization requests so
+ * multi-day raw transcripts never hit `agy`'s ~160KB stdin line cap and lose
+ * closing tags, `<previous-summary>`, or summarization instructions.
+ */
+const MAX_AGY_SUMMARIZATION_PROMPT_CHARS = 120_000;
+
+export function boundSummarizationPrompt(
+  prompt: string,
+  maxChars = MAX_AGY_SUMMARIZATION_PROMPT_CHARS,
+): string {
+  if (prompt.length <= maxChars) return prompt;
+  const omissionMarker =
+    "\n\n[... middle conversation omitted to fit summarization limit ...]\n\n";
+
+  const xmlOpen = "<conversation>\n";
+  const xmlCloseIdx = prompt.lastIndexOf("\n</conversation>");
+  if (prompt.startsWith(xmlOpen) && xmlCloseIdx > xmlOpen.length) {
+    const body = prompt.slice(xmlOpen.length, xmlCloseIdx);
+    const suffix = prompt.slice(xmlCloseIdx);
+    const availableBody = maxChars - xmlOpen.length - suffix.length - omissionMarker.length;
+    if (availableBody > 1_000) {
+      const headChars = Math.floor(availableBody * 0.2);
+      const tailChars = availableBody - headChars;
+      return `${xmlOpen}${body.slice(0, headChars)}${omissionMarker}${body.slice(-tailChars)}${suffix}`;
+    }
+  }
+
+  const mdOpen = "# Conversation\n";
+  const mdInstructionsIdx = prompt.lastIndexOf("\n\n# Instructions\n");
+  if (prompt.startsWith(mdOpen) && mdInstructionsIdx > mdOpen.length) {
+    const body = prompt.slice(mdOpen.length, mdInstructionsIdx);
+    const suffix = prompt.slice(mdInstructionsIdx);
+    const availableBody = maxChars - mdOpen.length - suffix.length - omissionMarker.length;
+    if (availableBody > 1_000) {
+      const headChars = Math.floor(availableBody * 0.2);
+      const tailChars = availableBody - headChars;
+      return `${mdOpen}${body.slice(0, headChars)}${omissionMarker}${body.slice(-tailChars)}${suffix}`;
+    }
+  }
+
+  const available = Math.max(1_000, maxChars - omissionMarker.length);
+  const headChars = Math.floor(available * 0.2);
+  const tailChars = available - headChars;
+  return `${prompt.slice(0, headChars)}${omissionMarker}${prompt.slice(-tailChars)}`;
 }
 
 /** Map agy usage fields to pi usage fields. */
@@ -1042,9 +1152,13 @@ export function streamAntigravity(
             ? buildSideConversationSystemPrompt(systemPrompt, getSystemPromptRelay?.())
             : (getSystemPromptRelay?.() ?? systemPrompt);
 
+        const effectiveTurnPrompt = summaryRequest
+          ? boundSummarizationPrompt(turnPrompt)
+          : turnPrompt;
+
         const controller = await turnRuntime.runPromise(
           turnService.beginStreamTurn({
-            prompt: turnPrompt,
+            prompt: effectiveTurnPrompt,
             // Summary requests keep their summarization prompt; side conversations
             // combine the slimmed Pi instruction relay with the aside directive
             // (stripping conflicting <btw_capabilities> tool claims).
@@ -1052,7 +1166,7 @@ export function streamAntigravity(
             historyBootstrap:
               summaryRequest || sideSummaryRequest
                 ? undefined
-                : piHistoryBootstrap(context, turnPrompt.length, getBranch?.()),
+                : piHistoryBootstrap(context, effectiveTurnPrompt.length, getBranch?.()),
             bootstrapSuffix: isolatedRequest ? undefined : getBootstrapSuffix?.(),
             modelId: effectiveModelId,
             effort,

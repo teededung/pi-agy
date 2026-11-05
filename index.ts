@@ -114,6 +114,7 @@ import {
   agyContextTokens,
   detectAgyCompaction,
   formatAgyContextTokens,
+  scopeCompactionPreparationToAgyCheckpoint,
   type AgyCompactionMarker,
 } from "./lib/agy-compaction.ts";
 import {
@@ -128,9 +129,12 @@ import {
 } from "./lib/footer.ts";
 import {
   AGY_CONVERSATION_STATE_ENTRY,
+  AGY_GOAL_STATE_ENTRY,
   agyConversationExists,
   restorableAgyConversation,
+  restorableAgyGoalState,
   type PersistedAgyConversation,
+  type PersistedAgyGoalState,
   type PersistedAgyReset,
 } from "./lib/conversation-state.ts";
 import {
@@ -579,8 +583,42 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     startedAt: number;
     continuations: number;
     boost?: boolean;
+    paused?: boolean;
   }
   let activeGoal: ActiveGoalState | undefined;
+  let persistedGoalKey: string | undefined;
+
+  const persistGoalState = (ctx?: ExtensionContext): void => {
+    const targetCtx = ctx ?? activeSessionCtx;
+    if (!targetCtx) return;
+    const probe = probeCtx(() => targetCtx.sessionManager.getSessionId());
+    if (probe.stale || !probe.value) return;
+    const payload: PersistedAgyGoalState = activeGoal
+      ? {
+          version: 1,
+          kind: "active",
+          sessionId: probe.value,
+          request: activeGoal.request,
+          startedAt: activeGoal.startedAt,
+          continuations: activeGoal.continuations,
+          ...(activeGoal.boost ? { boost: true } : {}),
+          ...(activeGoal.paused ? { paused: true } : {}),
+        }
+      : {
+          version: 1,
+          kind: "inactive",
+          sessionId: probe.value,
+        };
+    const nextKey = JSON.stringify(payload);
+    if (nextKey === persistedGoalKey) return;
+    if (!activeGoal && persistedGoalKey === undefined) return;
+    try {
+      pi.appendEntry(AGY_GOAL_STATE_ENTRY, payload);
+      persistedGoalKey = nextKey;
+    } catch {
+      // Session may be stale or read-only.
+    }
+  };
 
   interface ActiveOneShotConsult extends OneShotConsultOverride {
     restoreModel?: NonNullable<ExtensionContext["model"]>;
@@ -608,6 +646,18 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   const updateOrchestrationStatus = (ui?: ExtensionContext["ui"]): void => {
     if (!ui) return;
     try {
+      const providerProbe = activeSessionCtx
+        ? probeCtx(() => activeSessionCtx?.model?.provider)
+        : undefined;
+      const showAgyBadges =
+        !providerProbe || (!providerProbe.stale && providerProbe.value === "antigravity");
+      if (!showAgyBadges) {
+        ui.setStatus("agy-boost", undefined);
+        ui.setStatus("agy-teamwork", undefined);
+        ui.setStatus("agy-grill", undefined);
+        ui.setStatus("agy-goal", undefined);
+        return;
+      }
       ui.setStatus(
         "agy-boost",
         isBoostActive() ? ui.theme.fg("accent", "[boost]\u00A0") : undefined,
@@ -620,16 +670,18 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         "agy-grill",
         isGrillActive() ? ui.theme.fg("accent", "[grill]\u00A0") : undefined,
       );
+      const goalBadge = activeGoal
+        ? activeGoal.paused
+          ? activeGoal.continuations > 0
+            ? `[goal #${activeGoal.continuations} · paused]\u00A0`
+            : "[goal · paused]\u00A0"
+          : activeGoal.continuations > 0
+            ? `[goal #${activeGoal.continuations}]\u00A0`
+            : "[goal]\u00A0"
+        : undefined;
       ui.setStatus(
         "agy-goal",
-        activeGoal
-          ? ui.theme.fg(
-              "accent",
-              activeGoal.continuations > 0
-                ? `[goal #${activeGoal.continuations}]\u00A0`
-                : "[goal]\u00A0",
-            )
-          : undefined,
+        goalBadge ? ui.theme.fg("accent", goalBadge) : undefined,
       );
     } catch {
       // UI may be unavailable (e.g. non-interactive modes).
@@ -1778,9 +1830,13 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
               continuations: 0,
               boost: options?.boost,
             };
-          } else if (options?.boost) {
-            activeGoal.boost = true;
+          } else {
+            activeGoal.paused = undefined;
+            if (options?.boost) {
+              activeGoal.boost = true;
+            }
           }
+          persistGoalState();
           updateOrchestrationStatus(tasksUi);
         },
         isGrillActive,
@@ -1861,6 +1917,11 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     subagentSpawnedThisTurn = false;
     const probe = probeCtx(() => ctx.model?.provider);
     if (probe.stale || probe.value !== "antigravity") return;
+    if (activeGoal?.paused) {
+      activeGoal.paused = undefined;
+      persistGoalState(ctx);
+      updateOrchestrationStatus(ctx.ui);
+    }
     agyAgentActive = true;
     void syncSessionNameToAgy(ctx).catch(() => {});
     updateAgyTasksWidget();
@@ -1869,16 +1930,18 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
 
   const collectLatestTurnAssistantInfo = (
     branch: readonly unknown[] | undefined,
-  ): { stopReason?: string; text: string } => {
+  ): { stopReason?: string; errorMessage?: string; text: string } => {
     if (!Array.isArray(branch)) return { text: "" };
     const texts: string[] = [];
     let latestStopReason: string | undefined;
+    let latestErrorMessage: string | undefined;
     for (let i = branch.length - 1; i >= 0; i--) {
       const entry = branch[i] as {
         type?: unknown;
         message?: {
           role?: unknown;
           stopReason?: unknown;
+          errorMessage?: unknown;
           content?: unknown;
         };
       };
@@ -1891,6 +1954,9 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       if (entry.message.role === "assistant") {
         if (!latestStopReason && typeof entry.message.stopReason === "string") {
           latestStopReason = entry.message.stopReason;
+        }
+        if (!latestErrorMessage && typeof entry.message.errorMessage === "string") {
+          latestErrorMessage = entry.message.errorMessage;
         }
         if (typeof entry.message.content === "string") {
           texts.push(entry.message.content);
@@ -1981,12 +2047,14 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         aborted: event.aborted,
         settled: Boolean(settledOutcome),
         stopReason: settledOutcome?.stopReason ?? branchInfo.stopReason,
+        errorMessage: branchInfo.errorMessage,
         responseText: branchInfo.text || settledOutcome?.responseText || "",
         hadSubagentActivity: hadSubagentThisTurn || hasRunningSubagent(),
         continuations: activeGoal.continuations,
       });
       if (decision === "complete" || decision === "cancelled") {
         activeGoal = undefined;
+        persistGoalState(ctx);
         updateOrchestrationStatus(ui);
         try {
           ui?.notify(
@@ -1998,9 +2066,23 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         }
       } else if (decision === "aborted") {
         activeGoal = undefined;
+        persistGoalState(ctx);
         updateOrchestrationStatus(ui);
+      } else if (decision === "error") {
+        activeGoal.paused = true;
+        persistGoalState(ctx);
+        updateOrchestrationStatus(ui);
+        try {
+          ui?.notify(
+            'Goal paused after turn error — send a message (e.g. "continue") to resume, or "/goal off" to cancel.',
+            "warning",
+          );
+        } catch {
+          // Best-effort UI notification
+        }
       } else if (decision === "max_continuations") {
         activeGoal = undefined;
+        persistGoalState(ctx);
         updateOrchestrationStatus(ui);
         try {
           ui?.notify(
@@ -2011,7 +2093,9 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
           // Best-effort UI notification
         }
       } else if (decision === "continue") {
+        activeGoal.paused = undefined;
         activeGoal.continuations += 1;
+        persistGoalState(ctx);
         updateOrchestrationStatus(ui);
         pi.sendUserMessage(
           buildGoalContinuationPrompt(
@@ -2055,7 +2139,26 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     oneShotTeamwork = false;
     oneShotGrill = false;
     teamworkLaunchedThisTurn = false;
-    activeGoal = undefined;
+    persistedGoalKey = undefined;
+    const restoredGoal =
+      event.reason !== "new" && event.reason !== "fork"
+        ? restorableAgyGoalState(
+            ctx.sessionManager.getBranch(),
+            ctx.sessionManager.getSessionId(),
+          )
+        : undefined;
+    activeGoal = restoredGoal
+      ? {
+          request: restoredGoal.request,
+          startedAt: restoredGoal.startedAt,
+          continuations: restoredGoal.continuations,
+          boost: restoredGoal.boost,
+          paused: restoredGoal.paused,
+        }
+      : undefined;
+    if (restoredGoal) {
+      persistedGoalKey = JSON.stringify(restoredGoal);
+    }
     lastSettledOutcome = undefined;
     lastSettledSpawnedSubagent = false;
     if (event.reason === "new") {
@@ -2204,7 +2307,26 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     await runAntigravity(runtime, service.setSession(cwd.value, undefined, true));
     detachConversationMetadata(previousConversationId);
     appendConversationReset(ctx);
-    activeGoal = undefined;
+    persistedGoalKey = undefined;
+    const treeProbe = probeCtx(() => ({
+      branch: ctx.sessionManager.getBranch(),
+      sessionId: ctx.sessionManager.getSessionId(),
+    }));
+    const restoredTreeGoal = !treeProbe.stale
+      ? restorableAgyGoalState(treeProbe.value.branch, treeProbe.value.sessionId)
+      : undefined;
+    activeGoal = restoredTreeGoal
+      ? {
+          request: restoredTreeGoal.request,
+          startedAt: restoredTreeGoal.startedAt,
+          continuations: restoredTreeGoal.continuations,
+          boost: restoredTreeGoal.boost,
+          paused: restoredTreeGoal.paused,
+        }
+      : undefined;
+    if (restoredTreeGoal) {
+      persistedGoalKey = JSON.stringify(restoredTreeGoal);
+    }
     const ui = probeCtx(() => ctx.ui);
     if (!ui.stale && ui.value) updateOrchestrationStatus(ui.value);
     subagentRoster.clear();
@@ -2215,18 +2337,62 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     requestFooterRender?.();
   });
 
+  pi.on("session_before_compact", async (event, ctx: ExtensionContext) => {
+    activeSessionCtx = ctx;
+    const providerProbe = probeCtx(() => ctx.model?.provider);
+    const isAgy = !providerProbe.stale && providerProbe.value === "antigravity";
+    // Antigravity manages threshold compaction natively inside `agy` (~300k for
+    // Gemini, 1M for Claude). Client-side threshold compaction in Pi only triggers
+    // when multi-day raw transcript chars/4 (e.g. after retry `context_edit`s)
+    // exceed the 1M scheduling window, which would needlessly destroy the live
+    // `agy` conversation. Non-antigravity providers remain completely untouched.
+    if (isAgy && event.reason === "threshold") {
+      return { cancel: true };
+    }
+    const footprint = resolveBranchContextFootprint(event.branchEntries);
+    const scoped = scopeCompactionPreparationToAgyCheckpoint(
+      event.preparation,
+      event.branchEntries,
+      {
+        isAntigravityProvider: isAgy,
+        agyContextTokens: footprint.agyTokens ?? observedContextTokens,
+      },
+    );
+    if (scoped.immediateCompaction) {
+      return { compaction: scoped.immediateCompaction };
+    }
+    return undefined;
+  });
+
   pi.on("session_compact", async (_event, ctx: ExtensionContext) => {
     // Pi manual/overflow compaction summarizes earlier history on the session
-    // branch. Reset the agy conversation so the next turn bootstraps from the
-    // compacted branch and the footer immediately clears pre-compaction tokens.
+    // branch. Reset the agy conversation when relevant so the next agy turn
+    // bootstraps from the compacted branch and clears pre-compaction tokens.
     activeSessionCtx = ctx;
     setAgyCompactingUi(false);
-    const cwd = probeCtx(() => ctx.cwd);
-    if (cwd.stale) return;
+    const sessionProbe = probeCtx(() => ({
+      cwd: ctx.cwd,
+      provider: ctx.model?.provider,
+      branch: ctx.sessionManager.getBranch(),
+    }));
+    if (sessionProbe.stale) return;
     const previousConversationId = await captureActiveConversationId();
-    await runAntigravity(runtime, service.setSession(cwd.value, undefined, true));
+    const hadAgyHistory =
+      sessionProbe.value.provider === "antigravity" ||
+      Boolean(previousConversationId) ||
+      Boolean(trackedConversationId) ||
+      sessionProbe.value.branch.some(
+        (entry) =>
+          entry.type === "custom" &&
+          (entry.customType === AGY_CONVERSATION_STATE_ENTRY ||
+            entry.customType === "pi-antigravity-conversation-state" ||
+            entry.customType === AGY_COMPACTION_ENTRY),
+      );
+    await runAntigravity(runtime, service.setSession(sessionProbe.value.cwd, undefined, true));
     detachConversationMetadata(previousConversationId);
-    appendConversationReset(ctx);
+    if (hadAgyHistory) {
+      appendConversationReset(ctx);
+    }
     subagentRoster.clear();
     setAgyTasksWidget(0);
     setAgyArtifactsWidget(0);
@@ -2576,6 +2742,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       sessionTeamworkMode = false;
       sessionGrillMode = false;
       activeGoal = undefined;
+      persistGoalState(ctx);
       updateOrchestrationStatus(ctx.ui);
       subagentRoster.clear();
       setAgyTasksWidget(0);
@@ -2599,6 +2766,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       sessionTeamworkMode = false;
       sessionGrillMode = false;
       activeGoal = undefined;
+      persistedGoalKey = undefined;
       updateOrchestrationStatus(ctx.ui);
       subagentRoster.clear();
       setAgyTasksWidget(0);
@@ -3233,11 +3401,19 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     if (/^(off|stop|cancel|disable|clear|false)$/i.test(trimmed)) {
       if (activeGoal) {
         activeGoal = undefined;
+        persistGoalState(ctx);
         updateOrchestrationStatus(ctx.ui);
         ctx.ui.notify("Goal mode cancelled.", "info");
       } else {
         ctx.ui.notify("Goal mode is already OFF.", "info");
       }
+      return;
+    }
+    if (ctx.model?.provider !== "antigravity") {
+      ctx.ui.notify(
+        'Goal mode requires an Antigravity (agy) model. Switch to an antigravity model first, or use "/goal off".',
+        "warning",
+      );
       return;
     }
     const wantsBoost = /^\/(?:agy-)?boost\b/i.test(trimmed);
@@ -3251,6 +3427,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         continuations: 0,
         boost: wantsBoost || undefined,
       };
+      persistGoalState(ctx);
       updateOrchestrationStatus(ctx.ui);
       pi.sendUserMessage(`/goal ${trimmed}`);
     } else {

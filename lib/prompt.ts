@@ -569,10 +569,23 @@ export function inspectGoalResponseMarkers(
 
 export const MAX_GOAL_CONTINUATIONS = 50;
 
+/**
+ * Reminder block preserved across conversation resets/compactions or post-error
+ * resumes while `/goal` mode remains active.
+ */
+export function buildActiveGoalContextReminder(originalRequest: string): string {
+  return [
+    "[Active /goal objective]",
+    GOAL_INITIAL_PROMPT,
+    `Original request: ${originalRequest.trim()}`,
+  ].join("\n");
+}
+
 export interface GoalSettlementCheck {
   aborted?: boolean;
   settled?: boolean;
   stopReason?: string;
+  errorMessage?: string;
   responseText: string;
   hadSubagentActivity?: boolean;
   continuations: number;
@@ -583,6 +596,7 @@ export type GoalSettlementDecision =
   | "complete"
   | "cancelled"
   | "aborted"
+  | "error"
   | "max_continuations"
   | "wait"
   | "continue";
@@ -593,11 +607,13 @@ export function decideGoalSettlement(
   const marker = inspectGoalResponseMarkers(check.responseText);
   if (marker === "complete") return "complete";
   if (marker === "cancelled") return "cancelled";
-  if (
-    check.aborted ||
-    check.stopReason === "aborted" ||
-    check.stopReason === "error"
-  ) {
+  const isRetryAbort =
+    typeof check.errorMessage === "string" &&
+    /^Aborted after \d+ retry attempt/i.test(check.errorMessage);
+  if (isRetryAbort || check.stopReason === "error") {
+    return "error";
+  }
+  if (check.aborted || check.stopReason === "aborted") {
     return "aborted";
   }
   if (

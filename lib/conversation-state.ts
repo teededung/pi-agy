@@ -6,6 +6,26 @@ import type { AgyUsage } from "./events.ts";
 import type { AgyToolMode } from "./tool-mode.ts";
 
 export const AGY_CONVERSATION_STATE_ENTRY = "pi-agy-conversation-state";
+export const AGY_GOAL_STATE_ENTRY = "pi-agy-goal-state";
+
+export interface PersistedAgyGoalActive {
+  version: 1;
+  kind: "active";
+  sessionId: string;
+  request: string;
+  startedAt: number;
+  continuations: number;
+  boost?: boolean;
+  paused?: boolean;
+}
+
+export interface PersistedAgyGoalInactive {
+  version: 1;
+  kind: "inactive";
+  sessionId: string;
+}
+
+export type PersistedAgyGoalState = PersistedAgyGoalActive | PersistedAgyGoalInactive;
 
 export interface PersistedAgyConversation {
   version: 1;
@@ -216,6 +236,67 @@ export function restorableAgyConversation(
         }
       }
     }
+    return state;
+  }
+  return undefined;
+}
+
+export function parsePersistedAgyGoalState(value: unknown): PersistedAgyGoalState | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (record.version !== 1 || !isBoundedString(record.sessionId, 256)) return undefined;
+  if (record.kind === "inactive") {
+    return {
+      version: 1,
+      kind: "inactive",
+      sessionId: record.sessionId,
+    };
+  }
+  if (record.kind !== "active") return undefined;
+  if (!isBoundedString(record.request, 65_536)) return undefined;
+  if (!isNonNegativeNumber(record.startedAt)) return undefined;
+  if (!Number.isSafeInteger(record.continuations) || (record.continuations as number) < 0) {
+    return undefined;
+  }
+  if (record.boost !== undefined && typeof record.boost !== "boolean") return undefined;
+  if (record.paused !== undefined && typeof record.paused !== "boolean") return undefined;
+  return {
+    version: 1,
+    kind: "active",
+    sessionId: record.sessionId,
+    request: record.request,
+    startedAt: record.startedAt,
+    continuations: record.continuations as number,
+    ...(record.boost ? { boost: true } : {}),
+    ...(record.paused ? { paused: true } : {}),
+  };
+}
+
+/**
+ * Restore the active `/goal` state from the current session branch.
+ *
+ * When `sessionId` is supplied, forked sessions with a different sessionId do
+ * not automatically resume an autonomous continuation loop unless re-started;
+ * when omitted (e.g. prompt history bootstrap), any active branch goal is returned.
+ */
+export function restorableAgyGoalState(
+  branch: readonly unknown[] | undefined,
+  sessionId?: string,
+): PersistedAgyGoalActive | undefined {
+  if (!Array.isArray(branch)) return undefined;
+  for (let index = branch.length - 1; index >= 0; index -= 1) {
+    const entry = branch[index] as { type?: unknown; customType?: unknown; data?: unknown };
+    if (
+      !entry ||
+      typeof entry !== "object" ||
+      entry.type !== "custom" ||
+      entry.customType !== AGY_GOAL_STATE_ENTRY
+    ) {
+      continue;
+    }
+    const state = parsePersistedAgyGoalState(entry.data);
+    if (!state || state.kind === "inactive") return undefined;
+    if (sessionId !== undefined && state.sessionId !== sessionId) return undefined;
     return state;
   }
   return undefined;
