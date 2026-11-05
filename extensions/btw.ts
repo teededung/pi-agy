@@ -913,9 +913,63 @@ function formatToolPreview(value: unknown): string {
   }
 
   if (value && typeof value === "object") {
-    const path = (value as { path?: unknown }).path;
-    if (typeof path === "string") {
-      return path;
+    const record = value as Record<string, unknown>;
+    const pickStr = (keys: string[]): string | undefined => {
+      for (const key of keys) {
+        const candidate = record[key];
+        if (typeof candidate === "string") {
+          const trimmed = candidate.replace(/\s+/g, " ").trim();
+          if (trimmed) return trimmed;
+        }
+      }
+      return undefined;
+    };
+
+    const summary = pickStr(["toolSummary", "toolAction", "description"]);
+    if (summary) {
+      return summary.length > 120 ? `${summary.slice(0, 117)}...` : summary;
+    }
+
+    const filePath = pickStr([
+      "path",
+      "file_path",
+      "Path",
+      "AbsolutePath",
+      "TargetFile",
+      "DirectoryPath",
+    ]);
+    if (filePath) {
+      const start =
+        typeof record.offset === "number"
+          ? record.offset
+          : typeof record.StartLine === "number"
+            ? record.StartLine
+            : undefined;
+      const end =
+        typeof record.EndLine === "number"
+          ? record.EndLine
+          : typeof start === "number" && typeof record.limit === "number"
+            ? start + record.limit - 1
+            : undefined;
+      return typeof start === "number" && start > 0
+        ? typeof end === "number" && end >= start
+          ? `${filePath}:${start}-${end}`
+          : `${filePath}:${start}`
+        : filePath;
+    }
+
+    const fallback = pickStr([
+      "query",
+      "Query",
+      "pattern",
+      "Pattern",
+      "url",
+      "Url",
+      "command",
+      "CommandLine",
+    ]);
+    if (fallback) {
+      return fallback.length > 120 ? `${fallback.slice(0, 117)}...` : fallback;
     }
   }
 
@@ -2440,7 +2494,11 @@ export default function (pi: ExtensionAPI) {
     applyTranscriptEvent(transcriptState, event);
 
     if (event.type === "tool_execution_start") {
-      setOverlayStatus(`⏳ running tool: ${event.toolName}`, ctx);
+      const preview = formatToolPreview(event.args);
+      setOverlayStatus(
+        preview ? `⏳ running tool: ${event.toolName} · ${preview}` : `⏳ running tool: ${event.toolName}`,
+        ctx,
+      );
       return;
     }
 

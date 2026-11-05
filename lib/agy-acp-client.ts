@@ -762,11 +762,15 @@ const KNOWN_AGY_TOOLS = new Set([
   "command_status",
   "send_command_input",
   "view_file",
+  "read_file",
   "view_file_outline",
   "view_code_item",
   "write_to_file",
+  "write_file",
   "replace_file_content",
   "multi_replace_file_content",
+  "edit_file",
+  "sed_file",
   "grep_search",
   "find_by_name",
   "list_dir",
@@ -830,18 +834,44 @@ function inferAcpToolName(
 
   const kind = typeof update.kind === "string" ? update.kind : "";
   if (kind === "execute" || typeof rawArgs.CommandLine === "string") return "run_command";
-  if (kind === "read" && typeof rawArgs.AbsolutePath === "string") return "view_file";
-  if (kind === "edit" && typeof rawArgs.TargetFile === "string") {
-    return Array.isArray(rawArgs.ReplacementChunks)
-      ? "multi_replace_file_content"
-      : typeof rawArgs.CodeContent === "string"
-        ? "write_to_file"
-        : "replace_file_content";
+  if (
+    kind === "read" ||
+    (/^File\s+\S/i.test(rawTitle) &&
+      (typeof rawArgs.Path === "string" || typeof rawArgs.AbsolutePath === "string"))
+  ) {
+    if (typeof rawArgs.DirectoryPath === "string") return "list_dir";
+    if (typeof rawArgs.AbsolutePath === "string" && typeof rawArgs.Path !== "string") {
+      return "view_file";
+    }
+    return "read_file";
   }
-  if (kind === "search" && typeof rawArgs.Query === "string") {
-    return typeof rawArgs.SearchPath === "string" ? "grep_search" : "search_web";
+  if (kind === "edit") {
+    if (typeof rawArgs.TargetFile === "string") {
+      return Array.isArray(rawArgs.ReplacementChunks)
+        ? "multi_replace_file_content"
+        : typeof rawArgs.CodeContent === "string"
+          ? "write_to_file"
+          : "replace_file_content";
+    }
+    if (typeof rawArgs.Path === "string") {
+      return typeof rawArgs.Content === "string" && rawArgs.Target === undefined
+        ? "write_file"
+        : "edit_file";
+    }
   }
-  if (kind === "fetch" && typeof rawArgs.Url === "string") return "read_url_content";
+  if (kind === "search") {
+    if (typeof rawArgs.Pattern === "string" || typeof rawArgs.SearchDirectory === "string") {
+      return "find_by_name";
+    }
+    if (typeof rawArgs.Query === "string") {
+      return typeof rawArgs.SearchPath === "string" || typeof rawArgs.Path === "string"
+        ? "grep_search"
+        : "search_web";
+    }
+  }
+  if (kind === "fetch" && (typeof rawArgs.Url === "string" || typeof rawArgs.url === "string")) {
+    return "read_url_content";
+  }
 
   return rawTitle ? rawTitle.slice(0, 120) : kind || "tool";
 }
@@ -853,6 +883,7 @@ function extractToolArgs(update: Record<string, unknown>): JsonObject {
   if (Object.keys(args).length === 0 && Array.isArray(update.locations)) {
     const firstLoc = asRecord(update.locations[0]);
     if (firstLoc && typeof firstLoc.path === "string") {
+      args.Path = firstLoc.path;
       args.AbsolutePath = firstLoc.path;
     }
   }
@@ -891,6 +922,8 @@ function extractToolOutputText(update: Record<string, unknown>): string | undefi
 interface TrackedAcpToolCall {
   stepId: number;
   name: string;
+  title?: string;
+  kind?: string;
   args: JsonObject;
   started: boolean;
   finished: boolean;
@@ -979,6 +1012,12 @@ export class AcpTurnNormalizer {
           tracked = {
             stepId,
             name: inferAcpToolName(update, incomingArgs),
+            ...(typeof update.title === "string" && update.title.trim()
+              ? { title: update.title.trim() }
+              : {}),
+            ...(typeof update.kind === "string" && update.kind.trim()
+              ? { kind: update.kind.trim() }
+              : {}),
             args: incomingArgs,
             started: false,
             finished: false,
@@ -986,11 +1025,28 @@ export class AcpTurnNormalizer {
           };
           this.#tools.set(toolCallId, tracked);
         } else {
+          if (typeof update.title === "string" && update.title.trim()) {
+            tracked.title = update.title.trim();
+          }
+          if (typeof update.kind === "string" && update.kind.trim()) {
+            tracked.kind = update.kind.trim();
+          }
           if (Object.keys(incomingArgs).length > 0) {
             tracked.args = { ...tracked.args, ...incomingArgs };
           }
-          if (tracked.name === "tool" && typeof update.title === "string" && update.title.trim()) {
-            tracked.name = inferAcpToolName(update, tracked.args);
+          if (
+            (!KNOWN_AGY_TOOLS.has(tracked.name) || tracked.name === "read_file") &&
+            !tracked.name.startsWith("mcp_") &&
+            !tracked.name.startsWith("pi__") &&
+            !tracked.name.includes("/pi__")
+          ) {
+            const mergedMeta: Record<string, unknown> = {
+              ...(tracked.title ? { title: tracked.title } : {}),
+              ...(tracked.kind ? { kind: tracked.kind } : {}),
+              ...update,
+            };
+            const refined = inferAcpToolName(mergedMeta, tracked.args);
+            if (refined && refined !== "tool") tracked.name = refined;
           }
         }
 
@@ -1002,9 +1058,26 @@ export class AcpTurnNormalizer {
 
         const status = typeof update.status === "string" ? update.status : "in_progress";
         const cid = notification.sessionId || this.#outcome.conversationId;
+        const emitStart = (): void => {
+          if (tracked!.started) return;
+          tracked!.started = true;
+          if (!this.#inToolBatch) {
+            this.#toolBatches += 1;
+            this.#inToolBatch = true;
+            this.#sawPostToolChunk = false;
+          }
+          activities.push({
+            type: "tool_start",
+            stepId: tracked!.stepId,
+            conversationId: cid,
+            name: tracked!.name,
+            args: tracked!.args,
+          });
+        };
 
         if (status === "completed") {
           if (!tracked.finished) {
+            emitStart();
             tracked.finished = true;
             const output = extractToolOutputText(update);
             const durationSeconds = Math.max(0, (Date.now() - tracked.startedAtMs) / 1000);
@@ -1020,6 +1093,7 @@ export class AcpTurnNormalizer {
           }
         } else if (status === "failed") {
           if (!tracked.finished) {
+            emitStart();
             tracked.finished = true;
             const message =
               extractToolOutputText(update) ??
@@ -1035,20 +1109,8 @@ export class AcpTurnNormalizer {
               message: message.replace(/\s+/g, " ").slice(0, 160),
             });
           }
-        } else if (!tracked.started) {
-          tracked.started = true;
-          if (!this.#inToolBatch) {
-            this.#toolBatches += 1;
-            this.#inToolBatch = true;
-            this.#sawPostToolChunk = false;
-          }
-          activities.push({
-            type: "tool_start",
-            stepId: tracked.stepId,
-            conversationId: cid,
-            name: tracked.name,
-            args: tracked.args,
-          });
+        } else if (status !== "pending" || Object.keys(tracked.args).length > 0) {
+          emitStart();
         }
         break;
       }

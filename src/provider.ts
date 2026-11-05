@@ -18,7 +18,7 @@
 
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import {
   calculateCost,
@@ -54,6 +54,7 @@ import type { AgyReplayStore } from "../lib/replay.ts";
 import { mapAgyToolToNative } from "../lib/native-tools.ts";
 import { inspectAgyCommandResult } from "../lib/command-result.ts";
 import { agyToolStepKey } from "../lib/tool-steps.ts";
+import { agyToolLabel } from "../lib/render.ts";
 import {
   agyIncompleteToolError,
   attachedImagesPrompt,
@@ -79,6 +80,130 @@ import {
   type AntigravityRuntimeInstance,
   type AntigravityRuntimeShape,
 } from "./runtime.ts";
+
+function shortenIsolatedPath(rawPath: string, cwd?: string): string {
+  const cleaned = rawPath.replace(/^['"]+|['"]+$/g, "").trim();
+  if (!cleaned) return "";
+  if (cwd && path.isAbsolute(cleaned)) {
+    const rel = path.relative(cwd, cleaned);
+    if (rel === "") return ".";
+    if (rel && !rel.startsWith("..") && !path.isAbsolute(rel)) return rel;
+  }
+  const home = homedir();
+  if (home && cleaned === home) return "~";
+  if (home && cleaned.startsWith(`${home}/`)) return `~/${cleaned.slice(home.length + 1)}`;
+  return cleaned;
+}
+
+/**
+ * Format a compact single-line `🔧 \`<label>\` · <detail>` marker for isolated
+ * `/btw` side conversations. Prioritizes `toolSummary` over raw `CommandLine`
+ * so long shell invocations show their human-readable intent instead of
+ * truncated command fragments, and normalizes native `agy` file/search tools.
+ */
+export function formatIsolatedToolLine(
+  activity: { name: string; args?: Record<string, unknown> },
+  cwd?: string,
+): string {
+  const args = activity.args ?? {};
+  const pickStr = (keys: string[]): string | undefined => {
+    for (const key of keys) {
+      const value = args[key];
+      if (typeof value === "string") {
+        const trimmed = value.replace(/\s+/g, " ").trim();
+        if (trimmed) return trimmed;
+      }
+    }
+    return undefined;
+  };
+  const pickPosInt = (keys: string[]): number | undefined => {
+    for (const key of keys) {
+      const value = args[key];
+      if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+        return Math.trunc(value);
+      }
+      if (typeof value === "string") {
+        const parsed = Number.parseInt(value.trim(), 10);
+        if (Number.isFinite(parsed) && parsed > 0) return parsed;
+      }
+    }
+    return undefined;
+  };
+
+  const strippedName = activity.name.replace(/^Run\s+/i, "").trim();
+  const nonBridgeMcp =
+    !strippedName.includes("pi__") ? strippedName.match(/^mcp_([^_]+)_(.+)$/) : null;
+  let label: string;
+  if (strippedName === "call_mcp_tool") {
+    const server = pickStr(["ServerName", "serverName"]);
+    const tool = pickStr(["ToolName", "toolName"]);
+    label = server && tool ? `${server}/${tool}` : "mcp";
+  } else if (nonBridgeMcp?.[1] && nonBridgeMcp[2]) {
+    label = `${nonBridgeMcp[1]}/${nonBridgeMcp[2]}`;
+  } else {
+    label = agyToolLabel(strippedName) || strippedName || "tool";
+  }
+
+  let detail = pickStr(["toolSummary", "toolAction", "description"]);
+  if (!detail) {
+    if (label === "grep") {
+      const query = pickStr(["Query", "query"]);
+      const searchPath = pickStr(["SearchPath", "Path", "DirectoryPath", "path"]);
+      if (query) {
+        const shortDir = searchPath ? shortenIsolatedPath(searchPath, cwd) : "";
+        detail = shortDir ? `"${query}" in ${shortDir}` : `"${query}"`;
+      }
+    } else if (label === "find") {
+      const pattern = pickStr(["Pattern", "pattern", "query"]);
+      const searchDir = pickStr(["SearchDirectory", "DirectoryPath", "Path", "path"]);
+      if (pattern) {
+        const shortDir = searchDir ? shortenIsolatedPath(searchDir, cwd) : "";
+        detail = shortDir ? `${pattern} in ${shortDir}` : pattern;
+      }
+    } else if (label === "search_web" || label === "web_search") {
+      const query = pickStr(["Query", "query"]);
+      if (query) detail = `"${query}"`;
+    } else if (label === "read_url_content" || label === "fetch_content") {
+      detail = pickStr(["Url", "url"]);
+    }
+
+    if (!detail) {
+      const rawPath = pickStr([
+        "Path",
+        "AbsolutePath",
+        "TargetFile",
+        "DirectoryPath",
+        "path",
+        "file_path",
+      ]);
+      if (rawPath) {
+        const shortPath = shortenIsolatedPath(rawPath, cwd);
+        if (label === "read") {
+          const start = pickPosInt(["StartLine", "start_line", "offset"]);
+          const explicitEnd = pickPosInt(["EndLine", "end_line"]);
+          const limit = pickPosInt(["limit"]);
+          const end = explicitEnd ?? (start && limit ? start + limit - 1 : undefined);
+          detail =
+            start && end && end >= start
+              ? `${shortPath}:${start}-${end}`
+              : start
+                ? `${shortPath}:${start}`
+                : shortPath;
+        } else {
+          detail = shortPath;
+        }
+      }
+    }
+
+    if (!detail) {
+      detail = pickStr(["CommandLine", "command", "Query", "query", "Url", "url"]);
+    }
+  }
+
+  const oneLine = (detail ?? "").replace(/\s+/g, " ").trim();
+  const clipped = oneLine.length > 120 ? `${oneLine.slice(0, 117)}...` : oneLine;
+  return clipped ? `🔧 \`${label}\` · ${clipped}` : `🔧 \`${label}\``;
+}
 
 interface TextPart {
   type: "text";
@@ -1138,7 +1263,9 @@ export function streamAntigravity(
             turnService.setSession(snapshot.cwd ?? process.cwd(), effectiveModelId, false),
           );
         }
-        const executorMode = (await turnRuntime.runPromise(turnService.snapshot)).executor.mode;
+        const turnSnapshot = await turnRuntime.runPromise(turnService.snapshot);
+        const executorMode = turnSnapshot.executor.mode;
+        const turnCwd = turnSnapshot.cwd ?? process.cwd();
 
         let bridgeRevision: string | undefined;
         const processProfile: AgyProcessProfile = getProcessProfile(isolatedRequest);
@@ -1853,19 +1980,7 @@ export function streamAntigravity(
                     });
                   }
                   hasRealThinking = true;
-                  const args = activity.args ?? {};
-                  const detail =
-                    (typeof args.CommandLine === "string" && args.CommandLine.trim()) ||
-                    (typeof args.AbsolutePath === "string" && args.AbsolutePath.trim()) ||
-                    (typeof args.TargetFile === "string" && args.TargetFile.trim()) ||
-                    (typeof args.toolAction === "string" && args.toolAction.trim()) ||
-                    (typeof args.toolSummary === "string" && args.toolSummary.trim()) ||
-                    "";
-                  const oneLine = detail.replace(/\s+/g, " ").trim();
-                  const clipped = oneLine.length > 96 ? `${oneLine.slice(0, 93)}...` : oneLine;
-                  const toolLine = clipped
-                    ? `🔧 \`${activity.name}\` · ${clipped}`
-                    : `🔧 \`${activity.name}\``;
+                  const toolLine = formatIsolatedToolLine(activity, turnCwd);
                   const prefix =
                     thinkingBuffer.length === 0 || thinkingBuffer.endsWith("\n") ? "" : "\n";
                   const delta = `${prefix}${toolLine}\n`;

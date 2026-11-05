@@ -40,7 +40,11 @@ import {
 } from "../lib/tool-summary.ts";
 import { Text } from "@earendil-works/pi-tui";
 import type { Theme, ToolRenderers } from "@earendil-works/pi-coding-agent";
-import { isBridgedMcpStep, streamAntigravity } from "../src/provider.ts";
+import {
+  formatIsolatedToolLine,
+  isBridgedMcpStep,
+  streamAntigravity,
+} from "../src/provider.ts";
 import { AntigravityRuntime, createAntigravityRuntime, runAntigravity } from "../src/runtime.ts";
 
 interface MockRpcCall {
@@ -1210,6 +1214,104 @@ test("ToolSummaryTracker + createSummaryToolRendererResolver render muted toolSu
       mockTheme,
     ),
     "[muted]Run full test suite[/muted]\n[toolTitle]<b>bash</b>[/toolTitle] [accent]npm test[/accent]",
+  );
+});
+
+test("/btw isolated tool lines prioritize toolSummary and normalize agy 1.5.0 native Path tools", () => {
+  // 1. Long multi-line bun/bash commands show toolSummary instead of truncated CommandLine
+  assert.equal(
+    formatIsolatedToolLine(
+      {
+        name: "run_command",
+        args: {
+          CommandLine:
+            "cd /Users/rongmauhong/Documents/Repo/ragnarok/lani-web && bun -e 'import { getDb } from \"#lib/db\"; console.log(await getDb());'",
+          WaitMsBeforeAsync: 5000,
+          toolSummary: "Query dagger job mask in lani-web DB",
+        },
+      },
+      "/Users/rongmauhong/Documents/Repo/ragnarok",
+    ),
+    "🔧 `bash` · Query dagger job mask in lani-web DB",
+  );
+
+  // 2. Native agy 1.5.0 `File <path>` (kind="read", Path/StartLine/EndLine) normalizes to `read_file` -> `read` with relative path:range
+  const normalizer = new AcpTurnNormalizer(newTurnOutcome());
+  const immediateActs = normalizer.consumeUpdate({
+    sessionId: "conv-1",
+    update: {
+      sessionUpdate: "tool_call",
+      toolCallId: "tc-read-1",
+      title: "File lani-web/scripts/item-import-verify.ts",
+      kind: "read",
+      status: "in_progress",
+      rawInput: {
+        Path: "/Users/rongmauhong/Documents/Repo/ragnarok/lani-web/scripts/item-import-verify.ts",
+        StartLine: 1,
+        EndLine: 80,
+      },
+    },
+  });
+  assert.equal(immediateActs.length, 1);
+  assert.equal(immediateActs[0]?.type, "tool_start");
+  if (immediateActs[0]?.type === "tool_start") {
+    assert.equal(immediateActs[0].name, "read_file");
+    assert.equal(
+      formatIsolatedToolLine(immediateActs[0], "/Users/rongmauhong/Documents/Repo/ragnarok"),
+      "🔧 `read` · lani-web/scripts/item-import-verify.ts:1-80",
+    );
+  }
+
+  // 3. Delayed rawInput on tool_call_update also refines `File <path>` to `read_file`
+  normalizer.consumeUpdate({
+    sessionId: "conv-1",
+    update: {
+      sessionUpdate: "tool_call",
+      toolCallId: "tc-read-2",
+      title: "File package.json",
+      kind: "read",
+      status: "pending",
+    },
+  });
+  const delayedActs = normalizer.consumeUpdate({
+    sessionId: "conv-1",
+    update: {
+      sessionUpdate: "tool_call_update",
+      toolCallId: "tc-read-2",
+      status: "in_progress",
+      rawInput: { Path: "/repo/package.json", StartLine: 1, EndLine: 25 },
+    },
+  });
+  assert.equal(delayedActs[0]?.type, "tool_start");
+  if (delayedActs[0]?.type === "tool_start") {
+    assert.equal(delayedActs[0].name, "read_file");
+    assert.equal(
+      formatIsolatedToolLine(delayedActs[0], "/repo"),
+      "🔧 `read` · package.json:1-25",
+    );
+  }
+
+  // 4. MCP calls format server/tool cleanly and prefer toolSummary
+  assert.equal(
+    formatIsolatedToolLine({
+      name: "call_mcp_tool",
+      args: {
+        ServerName: "lani-admin",
+        ToolName: "item_lookup",
+        toolSummary: "Look up Moonlight Dagger metadata",
+      },
+    }),
+    "🔧 `lani-admin/item_lookup` · Look up Moonlight Dagger metadata",
+  );
+  assert.equal(
+    formatIsolatedToolLine({
+      name: "Run mcp_fsearch_grep",
+      args: {
+        query: "Moonlight_Dagger",
+        toolSummary: "Search Moonlight_Dagger across scripts",
+      },
+    }),
+    "🔧 `fsearch/grep` · Search Moonlight_Dagger across scripts",
   );
 });
 
