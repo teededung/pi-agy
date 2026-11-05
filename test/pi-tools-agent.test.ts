@@ -63,6 +63,7 @@ import {
   AgyThoughtTracker,
   extractCheckpointSummaryFromStepPayload,
   extractContextTokensFromStepPayload,
+  parseGoDurationMs,
 } from "../lib/agy-thoughts.ts";
 import { AgyDriverSession } from "../lib/agy-driver.ts";
 import {
@@ -76,6 +77,7 @@ import {
   contextHasPriorGrillActivity,
   contextHasPriorTeamworkActivity,
   isBridgedMcpStep,
+  isReadOnlyAsideSystemPrompt,
   latestUserPrompt,
   mapUsage,
   piHistoryBootstrap,
@@ -100,7 +102,13 @@ import {
 } from "../lib/prompt.ts";
 import { AgyPiBridge } from "../lib/bridge.ts";
 import { AgyReplayStore } from "../lib/replay.ts";
-import { AgyStallError } from "../lib/agy-client.ts";
+import {
+  AgyStallError,
+  buildDriverAgyArgs,
+  buildOneShotAgyArgs,
+  extractAgyStderrSummary,
+  READ_ONLY_AGY_SETTINGS_JSON,
+} from "../lib/agy-client.ts";
 import { AntigravityRuntime, createAntigravityRuntime } from "../src/runtime.ts";
 
 test("tool mode defaults to pi and the startup flag overrides the environment", () => {
@@ -1415,8 +1423,8 @@ test("deleteDisposableAgyConversation recursively deletes subagent trees and cle
   }
 });
 
-test("reduceAgyStream strips invisible U+FFF9-U+FFFB chars without truncating subsequent deltas and RECOMMENDED_AGY_VERSION is 1.4.9", () => {
-  assert.equal(RECOMMENDED_AGY_VERSION, "1.4.9");
+test("reduceAgyStream strips invisible U+FFF9-U+FFFB chars without truncating subsequent deltas and RECOMMENDED_AGY_VERSION is 1.5.0", () => {
+  assert.equal(RECOMMENDED_AGY_VERSION, "1.5.0");
   assert.equal(stripHallucinatedTurnSuffix("hello \uFFF9code\uFFFA\uFFFB world"), "hello code world");
 
   const stream = [
@@ -3161,6 +3169,107 @@ test("piHistoryBootstrap pins summary and active /goal at head without file-list
   assert.ok(boundedPrompt.startsWith("<conversation>\nEARLY_CONTEXT_"));
   assert.ok(boundedPrompt.includes("</conversation>\n\n<previous-summary>\nKeep me\n</previous-summary>\n\nSummarize."));
   assert.ok(boundedPrompt.includes("middle conversation omitted"));
+});
+
+test("agy 1.5.0 alignment: Retry-After backoff tracking, readOnlyPermissions args, and AGY_ERROR stderr parsing", async (t) => {
+  // 1. Go duration parser + AgyThoughtTracker Retry-After backoff window
+  assert.equal(parseGoDurationMs("500ms"), 500);
+  assert.equal(parseGoDurationMs("12s"), 12_000);
+  assert.equal(parseGoDurationMs("1m0s"), 60_000);
+  assert.equal(parseGoDurationMs("1m30.5s"), 90_500);
+  assert.equal(parseGoDurationMs("invalid"), undefined);
+
+  const root = await mkdtemp(path.join(tmpdir(), "agy-150-retry-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const convsDir = path.join(root, "conversations");
+  const logDir = path.join(root, "log");
+  await mkdir(convsDir, { recursive: true });
+  await mkdir(logDir, { recursive: true });
+
+  const cid = "conv-retry-150";
+  const logFile = path.join(logDir, "cli-20261105_140000.log");
+  let fakeNow = new Date("2026-11-05T14:00:10.000+07:00").getTime();
+  await writeFile(
+    logFile,
+    `I1105 14:00:09.000000 1 server.go:100] Sending user message to conversation ${cid}\n`,
+    "utf8",
+  );
+
+  const tracker = new AgyThoughtTracker(cid, convsDir, {
+    logDir,
+    now: () => fakeNow,
+  });
+  assert.equal(tracker.sync(cid, () => {}), false);
+  assert.equal(tracker.isRetrying, false);
+
+  // Append an agy 1.5.0 60s Retry-After backoff line (> 45s stallBaseMs)
+  await writeFile(
+    logFile,
+    `I1105 14:00:09.000000 1 server.go:100] Sending user message to conversation ${cid}\n` +
+      `W1105 14:00:12.000000 1 http_helpers.go:410] Encountered retryable api error. retrying in 1m0s. Error (429): RESOURCE_EXHAUSTED\n`,
+    "utf8",
+  );
+  fakeNow = new Date("2026-11-05T14:00:12.500+07:00").getTime();
+  assert.equal(tracker.sync(cid, () => {}), true);
+  assert.equal(tracker.agentProgressed, true);
+  assert.equal(tracker.isRetrying, true);
+
+  // At +46s into the 60s Retry-After sleep (past 45s stallBaseMs), isRetrying stays true!
+  fakeNow = new Date("2026-11-05T14:00:58.500+07:00").getTime();
+  assert.equal(tracker.sync(cid, () => {}), false);
+  assert.equal(tracker.isRetrying, true);
+
+  // Once delay + 15s grace expires with no new retry or step, isRetrying clears so real hangs still fail.
+  fakeNow = new Date("2026-11-05T14:01:30.000+07:00").getTime();
+  tracker.sync(cid, () => {});
+  assert.equal(tracker.isRetrying, false);
+  tracker.close();
+
+  // 2. Read-only runtime permission lock on compaction & /btw:ask
+  assert.equal(
+    isReadOnlyAsideSystemPrompt("Available tools in this BTW session: read, grep, find, ls."),
+    true,
+  );
+  assert.equal(isReadOnlyAsideSystemPrompt("No tools are available in this BTW session."), true);
+  assert.equal(isReadOnlyAsideSystemPrompt("Normal system prompt"), false);
+
+  const defaultDriverArgs = buildDriverAgyArgs({ model: "gemini-4-argon" });
+  assert.ok(defaultDriverArgs.includes("--dangerously-skip-permissions"));
+  assert.ok(!defaultDriverArgs.includes("--settings"));
+
+  const readOnlyDriverArgs = buildDriverAgyArgs({
+    model: "gemini-4-argon",
+    readOnlyPermissions: true,
+  });
+  assert.ok(!readOnlyDriverArgs.includes("--dangerously-skip-permissions"));
+  const settingsIdx = readOnlyDriverArgs.indexOf("--settings");
+  assert.ok(settingsIdx >= 0);
+  assert.equal(readOnlyDriverArgs[settingsIdx + 1], READ_ONLY_AGY_SETTINGS_JSON);
+
+  const readOnlyOneShotArgs = buildOneShotAgyArgs({
+    prompt: "Summarize this conversation",
+    readOnlyPermissions: true,
+  });
+  assert.ok(!readOnlyOneShotArgs.includes("--dangerously-skip-permissions"));
+  assert.ok(readOnlyOneShotArgs.includes("--settings"));
+
+  // 3. Structured AGY_ERROR + print-timeout stderr extraction (exit code 3)
+  const structuredStderr = [
+    "some noisy startup warning",
+    "[agy] print timeout after 30m0s with 2 background task(s) still running; terminating them",
+    JSON.stringify({
+      short_error: "Agent execution timed out waiting on background work",
+      canonical_status: "DEADLINE_EXCEEDED",
+      error_code: 504,
+      retryable: false,
+      abandoned_tasks: [{ name: "task-12" }, "subagent-deepcoder"],
+    }).replace(/^/, "AGY_ERROR: "),
+  ].join("\n");
+  const parsedErr = extractAgyStderrSummary(structuredStderr);
+  assert.match(parsedErr, /\[DEADLINE_EXCEEDED 504\]/);
+  assert.match(parsedErr, /Agent execution timed out waiting on background work/);
+  assert.match(parsedErr, /terminated tasks: task-12, subagent-deepcoder/);
+  assert.match(parsedErr, /\[agy\] print timeout after 30m0s/);
 });
 
 

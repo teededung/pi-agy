@@ -65,6 +65,10 @@ export interface AgyThoughtPollResult {
   isGenerating: boolean;
   /** True when agy is actively generating a context compaction summary. */
   isCompacting: boolean;
+  /** True when agy logged an in-process API/model retry backoff (`Retry-After` / `retrying in ...`) still in progress. */
+  isRetrying: boolean;
+  /** True when a new in-process retry attempt was logged since the previous poll. */
+  retryAttempted: boolean;
   /** Latest known `input_tokens + cache_read_tokens` from SQLite step metadata. */
   lastContextTokens?: number;
   /** True when the newest step in SQLite is waiting on the next planner/checkpoint step. */
@@ -342,6 +346,43 @@ function parseGlogTimestampMs(line: string, refNowMs: number): number | undefine
   return Number.isFinite(ts) ? ts : undefined;
 }
 
+/** Parse Go `time.Duration` text (e.g. `500ms`, `12s`, `1m30s`) into milliseconds. */
+export function parseGoDurationMs(raw: string): number | undefined {
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  const tokenRe = /(\d+(?:\.\d+)?)(ns|us|µs|ms|s|m|h)/g;
+  let totalMs = 0;
+  let consumed = 0;
+  for (const m of trimmed.matchAll(tokenRe)) {
+    if (m.index !== consumed) return undefined;
+    consumed += m[0].length;
+    const val = Number(m[1]);
+    if (!Number.isFinite(val)) return undefined;
+    switch (m[2]) {
+      case "ns":
+        totalMs += val / 1_000_000;
+        break;
+      case "us":
+      case "µs":
+        totalMs += val / 1_000;
+        break;
+      case "ms":
+        totalMs += val;
+        break;
+      case "s":
+        totalMs += val * 1_000;
+        break;
+      case "m":
+        totalMs += val * 60_000;
+        break;
+      case "h":
+        totalMs += val * 3_600_000;
+        break;
+    }
+  }
+  return consumed === trimmed.length && totalMs > 0 ? Math.round(totalMs) : undefined;
+}
+
 function readFileSlice(filePath: string, offset: number, maxBytes: number): Buffer | undefined {
   let fd: number | undefined;
   try {
@@ -414,9 +455,12 @@ export class AgyThoughtTracker {
   #pendingMonitorCalls = 0;
   #activeStreamStartedAtMs: number | undefined;
   #streamStartMaxIdx = -1;
+  #retryUntilMs = 0;
+  #sawRetrySinceLastPoll = false;
 
   /** Turn-level stream synchronization state shared by AgyDriver and runAgyTurn. */
   #lastIsGenerating = false;
+  #lastIsRetrying = false;
   #lastAgentProgressed = false;
   #lastAwaitingPlannerAfterStep = false;
   #emittedCompacting = false;
@@ -452,6 +496,8 @@ export class AgyThoughtTracker {
     this.#pendingMonitorCalls = 0;
     this.#activeStreamStartedAtMs = undefined;
     this.#streamStartMaxIdx = -1;
+    this.#retryUntilMs = 0;
+    this.#sawRetrySinceLastPoll = false;
     if (!this.#baselineCaptured) {
       // If the conversation already existed before this turn, anchor at the
       // newest USER_INPUT step so earlier turns are never replayed.
@@ -466,20 +512,26 @@ export class AgyThoughtTracker {
    * Never throws; returns empty state if the DB is absent or locked.
    */
   poll(): AgyThoughtPollResult {
-    const empty: AgyThoughtPollResult = {
-      deltas: [],
-      checkpoints: [],
-      dbProgressed: false,
-      agentProgressed: false,
-      isGenerating: false,
-      isCompacting: false,
-      lastContextTokens: this.#lastContextTokens,
-      awaitingPlannerAfterStep: false,
-    };
-    const db = this.#ensureDb();
-    if (!db) return empty;
-
     const nowMs = this.#now();
+    const db = this.#ensureDb();
+    if (!db) {
+      this.#tailCliLog(-1, nowMs);
+      const retryAttempted = this.#sawRetrySinceLastPoll;
+      this.#sawRetrySinceLastPoll = false;
+      return {
+        deltas: [],
+        checkpoints: [],
+        dbProgressed: false,
+        agentProgressed: retryAttempted,
+        isGenerating: false,
+        isCompacting: false,
+        isRetrying: nowMs < this.#retryUntilMs,
+        retryAttempted,
+        lastContextTokens: this.#lastContextTokens,
+        awaitingPlannerAfterStep: false,
+      };
+    }
+
     this.#refreshContextTokensBaseline(db);
 
     let overallMaxRow: MaxStepSummaryRow | undefined;
@@ -501,7 +553,21 @@ export class AgyThoughtTracker {
       );
       rows = stmt.all(this.#minStepIndex) as unknown as StepRow[];
     } catch {
-      return empty;
+      this.#tailCliLog(-1, nowMs);
+      const retryAttempted = this.#sawRetrySinceLastPoll;
+      this.#sawRetrySinceLastPoll = false;
+      return {
+        deltas: [],
+        checkpoints: [],
+        dbProgressed: false,
+        agentProgressed: retryAttempted,
+        isGenerating: false,
+        isCompacting: false,
+        isRetrying: nowMs < this.#retryUntilMs,
+        retryAttempted,
+        lastContextTokens: this.#lastContextTokens,
+        awaitingPlannerAfterStep: false,
+      };
     }
 
     const overallMaxIdx = overallMaxRow?.idx ?? -1;
@@ -608,6 +674,12 @@ export class AgyThoughtTracker {
 
     const cliCompacting = this.#pollCliCompacting(overallMaxIdx, hasRunningStep, isGenerating, nowMs);
     const isCompacting = sqlCheckpointActive || cliCompacting;
+    if (hasRunningStep || isGenerating) {
+      this.#retryUntilMs = 0;
+    }
+    const retryAttempted = this.#sawRetrySinceLastPoll;
+    this.#sawRetrySinceLastPoll = false;
+    const isRetrying = nowMs < this.#retryUntilMs;
 
     const statusSignature = statusParts.join(",");
     const agentStatusSignature = agentStatusParts.join(",");
@@ -617,7 +689,8 @@ export class AgyThoughtTracker {
         totalBytes > this.#lastTotalBytes ||
         statusSignature !== this.#lastStatusSignature);
     const agentProgressed =
-      agentStatusParts.length > 0 && agentStatusSignature !== this.#lastAgentStatusSignature;
+      retryAttempted ||
+      (agentStatusParts.length > 0 && agentStatusSignature !== this.#lastAgentStatusSignature);
 
     if (rows.length > 0) {
       this.#lastMaxIdx = maxIdx;
@@ -633,6 +706,8 @@ export class AgyThoughtTracker {
       agentProgressed,
       isGenerating,
       isCompacting,
+      isRetrying,
+      retryAttempted,
       lastContextTokens: this.#lastContextTokens,
       awaitingPlannerAfterStep,
     };
@@ -641,6 +716,11 @@ export class AgyThoughtTracker {
   /** Latest SQLite step-generating state observed by sync(). */
   get isGenerating(): boolean {
     return this.#lastIsGenerating;
+  }
+
+  /** True when agy logged an active in-process API/model retry (`Retry-After` / backoff). */
+  get isRetrying(): boolean {
+    return this.#lastIsRetrying;
   }
 
   /** True when the most recent sync() observed genuine agent/model/compaction progress. */
@@ -699,6 +779,7 @@ export class AgyThoughtTracker {
     if (conversationId) this.setConversationId(conversationId);
     const res = this.poll();
     this.#lastIsGenerating = res.isGenerating;
+    this.#lastIsRetrying = res.isRetrying;
     this.#lastAwaitingPlannerAfterStep = res.awaitingPlannerAfterStep;
     for (const cp of res.checkpoints) {
       this.#checkpointDetailsByStepId.set(cp.stepId, cp);
@@ -706,6 +787,7 @@ export class AgyThoughtTracker {
     const compactingFlipped = res.isCompacting !== this.#emittedCompacting;
     this.#lastAgentProgressed =
       res.agentProgressed ||
+      res.retryAttempted ||
       res.deltas.length > 0 ||
       res.checkpoints.length > 0 ||
       (compactingFlipped && res.isCompacting);
@@ -721,7 +803,7 @@ export class AgyThoughtTracker {
       this.flushUnemittedCheckpoints(conversationId, emitSideActivity, delta.stepId);
       emitSideActivity(delta);
     }
-    return res.deltas.length > 0 || res.dbProgressed || compactingFlipped;
+    return res.deltas.length > 0 || res.dbProgressed || res.retryAttempted || compactingFlipped;
   }
 
   /**
@@ -868,32 +950,35 @@ export class AgyThoughtTracker {
     } catch {}
   }
 
+  #tailCliLog(overallMaxIdx: number, nowMs: number): void {
+    if (!this.#cliLogPath) {
+      this.#tryBindCliLog(nowMs, false);
+    }
+    if (!this.#cliLogPath) return;
+    try {
+      const st = statSync(this.#cliLogPath);
+      if (st.size < this.#cliLogOffset) {
+        this.#cliLogOffset = 0;
+        this.#cliLogRemainder = "";
+      }
+      if (st.size > this.#cliLogOffset) {
+        const toRead = Math.min(st.size - this.#cliLogOffset, 262_144);
+        const chunk = readFileSlice(this.#cliLogPath, this.#cliLogOffset, toRead);
+        if (chunk && chunk.length > 0) {
+          this.#cliLogOffset += chunk.length;
+          this.#consumeCliLogChunk(chunk.toString("utf8"), overallMaxIdx, nowMs, false);
+        }
+      }
+    } catch {}
+  }
+
   #pollCliCompacting(
     overallMaxIdx: number,
     hasRunningStep: boolean,
     isGenerating: boolean,
     nowMs: number,
   ): boolean {
-    if (!this.#cliLogPath) {
-      this.#tryBindCliLog(nowMs, false);
-    }
-    if (this.#cliLogPath) {
-      try {
-        const st = statSync(this.#cliLogPath);
-        if (st.size < this.#cliLogOffset) {
-          this.#cliLogOffset = 0;
-          this.#cliLogRemainder = "";
-        }
-        if (st.size > this.#cliLogOffset) {
-          const toRead = Math.min(st.size - this.#cliLogOffset, 262_144);
-          const chunk = readFileSlice(this.#cliLogPath, this.#cliLogOffset, toRead);
-          if (chunk && chunk.length > 0) {
-            this.#cliLogOffset += chunk.length;
-            this.#consumeCliLogChunk(chunk.toString("utf8"), overallMaxIdx, nowMs, false);
-          }
-        }
-      } catch {}
-    }
+    this.#tailCliLog(overallMaxIdx, nowMs);
 
     if (this.#activeStreamStartedAtMs === undefined) return false;
 
@@ -936,6 +1021,24 @@ export class AgyThoughtTracker {
         this.#pendingMonitorCalls = 0;
         this.#activeStreamStartedAtMs = undefined;
         this.#streamStartMaxIdx = -1;
+        this.#retryUntilMs = 0;
+        this.#sawRetrySinceLastPoll = false;
+        continue;
+      }
+      const retryMatch = /\bretrying in (\d+(?:\.\d+)?(?:ns|us|µs|ms|s|m|h)(?:\d+(?:\.\d+)?(?:ns|us|µs|ms|s|m|h))*)/i.exec(
+        line,
+      );
+      if (retryMatch) {
+        const parsedMs = parseGlogTimestampMs(line, nowMs);
+        if (isInitialReplay && parsedMs !== undefined && nowMs - parsedMs > 120_000) {
+          continue;
+        }
+        const delayMs = Math.min(parseGoDurationMs(retryMatch[1]!) ?? 30_000, 120_000);
+        const untilMs = (parsedMs ?? nowMs) + delayMs + 15_000;
+        if (untilMs > nowMs) {
+          this.#retryUntilMs = Math.max(this.#retryUntilMs, untilMs);
+          if (!isInitialReplay) this.#sawRetrySinceLastPoll = true;
+        }
         continue;
       }
       if (line.includes("llm_monitor.go:") && line.includes("Calling LLM")) {

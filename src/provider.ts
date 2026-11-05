@@ -628,6 +628,13 @@ export function isSideConversationRequest(prompt: string, systemPrompt?: string)
 const BTW_ASIDE_INSTRUCTION =
   "You are having an aside conversation with the user, separate from their main working session. Answer the side question directly and concisely, using the session context when helpful without derailing or continuing the main task unless asked.";
 
+export function isReadOnlyAsideSystemPrompt(rawSystemPrompt: string | undefined): boolean {
+  return Boolean(
+    rawSystemPrompt?.includes("Available tools in this BTW session: read, grep, find, ls.") ||
+      rawSystemPrompt?.includes("No tools are available in this BTW session."),
+  );
+}
+
 function buildSideConversationSystemPrompt(
   rawSystemPrompt: string | undefined,
   relayedSystemPrompt: string | undefined,
@@ -635,9 +642,7 @@ function buildSideConversationSystemPrompt(
   if (rawSystemPrompt?.includes("Summarize the side conversation concisely")) {
     return rawSystemPrompt;
   }
-  const isReadOnlyAside =
-    rawSystemPrompt?.includes("Available tools in this BTW session: read, grep, find, ls.") ||
-    rawSystemPrompt?.includes("No tools are available in this BTW session.");
+  const isReadOnlyAside = isReadOnlyAsideSystemPrompt(rawSystemPrompt);
   const asideInstruction = isReadOnlyAside
     ? `${BTW_ASIDE_INSTRUCTION}\nThis is a read-only aside turn: do not modify files or run mutating commands.`
     : BTW_ASIDE_INSTRUCTION;
@@ -1155,6 +1160,10 @@ export function streamAntigravity(
         const effectiveTurnPrompt = summaryRequest
           ? boundSummarizationPrompt(turnPrompt)
           : turnPrompt;
+        const readOnlyPermissions =
+          summaryRequest ||
+          sideSummaryRequest ||
+          (sideRequest && isReadOnlyAsideSystemPrompt(systemPrompt));
 
         const controller = await turnRuntime.runPromise(
           turnService.beginStreamTurn({
@@ -1176,6 +1185,7 @@ export function streamAntigravity(
             // alongside the Pi MCP bridge.
             agent: isBoost || isTeamwork ? undefined : processProfile.agent,
             mode: processProfile.mode,
+            readOnlyPermissions,
             mcpDirectory: processProfile.mcpDirectory,
             bridgeRevision,
             signal: options?.signal,

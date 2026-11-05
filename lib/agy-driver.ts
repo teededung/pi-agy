@@ -5,6 +5,7 @@ import {
   AgyStallError,
   buildDriverAgyArgs,
   canFallbackToLegacyEffortSuffix,
+  extractAgyStderrSummary,
   isAgyModelEffortFallbackError,
   rememberLegacyEffortSuffixModel,
   runAgyTurn,
@@ -79,6 +80,7 @@ export interface AgyProcessConfigSnapshot {
   effort?: string;
   agent?: string;
   mode?: string;
+  readOnlyPermissions?: boolean;
   bridgeRevision?: string;
 }
 
@@ -192,6 +194,7 @@ function processConfig(
     effort: useLegacySuffix ? undefined : effort,
     agent: request.agent,
     mode: request.mode,
+    ...(request.readOnlyPermissions ? { readOnlyPermissions: true } : {}),
     bridgeRevision: request.bridgeRevision,
   };
 }
@@ -215,6 +218,7 @@ function recycleCause(
   if (current.effort !== next.effort) return "effort";
   if (current.agent !== next.agent) return "agent";
   if (current.mode !== next.mode) return "mode";
+  if (Boolean(current.readOnlyPermissions) !== Boolean(next.readOnlyPermissions)) return "mode";
   if (current.bridgeRevision !== next.bridgeRevision) return "bridge-catalog";
   if (request.conversationId === undefined) {
     return boundConversationId === undefined ? undefined : "conversation-reset";
@@ -517,6 +521,7 @@ export class AgyDriverSession implements AgyTurnExecutor {
           signal: request.signal,
           agent: request.agent,
           mode: request.mode,
+          readOnlyPermissions: request.readOnlyPermissions,
           bridgeRevision: request.bridgeRevision,
           binary: config.binary,
           onActivity: request.onActivity,
@@ -903,8 +908,9 @@ export class AgyDriverSession implements AgyTurnExecutor {
     // or agy is actively compacting a large trajectory in memory before writing the
     // CHECKPOINT step, do not count this window as a dead stream while within the grace ceiling.
     const likelyCompacting = turn.thoughtTracker.isLikelyCompacting(toolActive);
+    const retrying = turn.thoughtTracker.isRetrying;
     if (
-      (turn.thoughtTracker.isGenerating || likelyCompacting) &&
+      (turn.thoughtTracker.isGenerating || likelyCompacting || retrying) &&
       (graceRemainingMs > 0 || turn.stallGraces < this.#stallGraceLimit)
     ) {
       if (graceRemainingMs > 0) {
@@ -913,9 +919,11 @@ export class AgyDriverSession implements AgyTurnExecutor {
       }
       turn.stallGraces += 1;
       this.#log(
-        likelyCompacting
-          ? `stall:compacting:${turn.stallGraces}`
-          : `stall:db-generating:${turn.stallGraces}`,
+        retrying
+          ? `stall:api-retry:${turn.stallGraces}`
+          : likelyCompacting
+            ? `stall:compacting:${turn.stallGraces}`
+            : `stall:db-generating:${turn.stallGraces}`,
       );
       this.#scheduleGraceCheck(turn, this.#stallBudgetMs(turn), epoch);
       return;
@@ -1257,7 +1265,7 @@ export class AgyDriverSession implements AgyTurnExecutor {
     this.#log(`close:${code ?? signal ?? "unknown"}`);
     const turn = this.#active;
     if (turn) {
-      const tail = this.#stderrTail.trim().split("\n").slice(-3).join("\n");
+      const tail = extractAgyStderrSummary(this.#stderrTail);
       // Only append canned recovery hints when agy left no diagnostics of
       // its own — a real stderr tail beats boilerplate.
       const hint = tail

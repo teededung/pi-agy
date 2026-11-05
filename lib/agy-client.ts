@@ -80,6 +80,13 @@ export interface AgyTurnRequest {
   agent?: string;
   /** Stable agy execution mode. */
   mode?: AgyExecutionMode;
+  /**
+   * Enforce strict read-only permissions at the agy runtime boundary (used for
+   * compaction summarization and read-only `/btw:ask` aside turns): omits
+   * `--dangerously-skip-permissions` and overrides session settings so edits,
+   * writes, and shell commands are automatically denied in headless mode.
+   */
+  readOnlyPermissions?: boolean;
   /** Non-argv bridge/catalog fingerprint used by persistent executors. */
   bridgeRevision?: string;
   /** Preflight-selected absolute binary. Normally resolved lazily. */
@@ -232,6 +239,94 @@ function appendProcessArgs(args: string[], request: AgyTurnRequest): string[] {
   return args;
 }
 
+export const READ_ONLY_AGY_SETTINGS_JSON = JSON.stringify({
+  agentMode: "default",
+  toolPermission: "strict",
+  permissions: { allow: [] },
+});
+
+/**
+ * Extract a concise, structured failure reason from agy stderr when the process
+ * exits early (e.g. exit code 3 with `AGY_ERROR: {...}` or `[agy] print timeout after ...`).
+ */
+export function extractAgyStderrSummary(stderr: string): string {
+  const trimmed = stderr.trim();
+  if (!trimmed) return "";
+  const lines = trimmed
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const timeoutLine = [...lines]
+    .reverse()
+    .find((line) => /^(?:\[agy\]|Print mode:)\s+print timeout after\b/i.test(line));
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!;
+    const agyErrMatch = /^AGY_ERROR:\s*(\{.+\})\s*$/.exec(line);
+    if (!agyErrMatch) continue;
+    try {
+      const parsed = JSON.parse(agyErrMatch[1]!) as Record<string, unknown>;
+      const primary =
+        (typeof parsed.short_error === "string" && parsed.short_error.trim()) ||
+        (typeof parsed.message === "string" && parsed.message.trim()) ||
+        (typeof parsed.error === "string" && parsed.error.trim()) ||
+        (typeof parsed.details === "string" && parsed.details.trim()) ||
+        "";
+      const status =
+        (typeof parsed.canonical_status === "string" && parsed.canonical_status.trim()) ||
+        (typeof parsed.status === "string" && parsed.status.trim()) ||
+        "";
+      const code =
+        typeof parsed.error_code === "number" || typeof parsed.error_code === "string"
+          ? String(parsed.error_code)
+          : typeof parsed.code === "number" || typeof parsed.code === "string"
+            ? String(parsed.code)
+            : "";
+      const tasksRaw = Array.isArray(parsed.abandoned_tasks)
+        ? parsed.abandoned_tasks
+        : Array.isArray(parsed.abandonedTasks)
+          ? parsed.abandonedTasks
+          : undefined;
+      const taskNames = tasksRaw
+        ?.map((t) => {
+          if (typeof t === "string") return t.trim();
+          if (t && typeof t === "object") {
+            const rec = t as Record<string, unknown>;
+            return String(rec.name ?? rec.id ?? rec.command ?? "").trim();
+          }
+          return "";
+        })
+        .filter(Boolean);
+      const headParts: string[] = [];
+      if (status || code) {
+        const badge = [status, code].filter(Boolean).join(" ");
+        if (!primary.includes(badge)) headParts.push(`[${badge}]`);
+      }
+      if (primary) headParts.push(primary);
+      const sections: string[] = [];
+      if (headParts.length > 0) sections.push(headParts.join(" "));
+      if (taskNames && taskNames.length > 0) {
+        sections.push(`terminated tasks: ${taskNames.join(", ")}`);
+      }
+      if (timeoutLine && !primary.toLowerCase().includes("print timeout")) {
+        sections.push(timeoutLine);
+      }
+      if (sections.length > 0) return sections.join(" · ");
+    } catch {
+      // Malformed JSON after AGY_ERROR: fall through to line tail.
+    }
+  }
+  if (timeoutLine) return timeoutLine;
+  return lines.slice(-3).join("\n");
+}
+
+function permissionArgsForRequest(
+  request: Pick<AgyTurnRequest, "readOnlyPermissions">,
+): string[] {
+  return request.readOnlyPermissions
+    ? ["--settings", READ_ONLY_AGY_SETTINGS_JSON]
+    : ["--dangerously-skip-permissions"];
+}
+
 export function buildOneShotAgyArgs(request: AgyTurnRequest): string[] {
   // Delegate termination to Pi's progress-sliding deadline rather than agy's
   // static --print-timeout, which cuts active multi-step turns at a fixed wall clock.
@@ -240,7 +335,7 @@ export function buildOneShotAgyArgs(request: AgyTurnRequest): string[] {
     [
       "--print",
       request.prompt,
-      "--dangerously-skip-permissions",
+      ...permissionArgsForRequest(request),
       "--disable-slash-commands",
       "--output-format",
       "stream-json",
@@ -252,11 +347,10 @@ export function buildOneShotAgyArgs(request: AgyTurnRequest): string[] {
 }
 
 export function buildDriverAgyArgs(request: Omit<AgyTurnRequest, "prompt">): string[] {
-  // stream-json input still uses agy's print wait (default: 5 minutes).
-  // Expiry can report SUCCESS with an empty/partial response while the agent
-  // keeps running. Zero expires immediately, so keep this wait above Node's
-  // maximum setTimeout budget; Pi's per-turn deadline/abort owns termination.
-  // A fixed process argument also avoids recycling when remaining budgets vary.
+  // agy < 1.5.0 defaulted stream-json print wait to 5m (plus a hidden 30m cap on
+  // background tasks) and treated 0s as immediate expiry; agy 1.5.0+ waits until
+  // completion on 0s and exits with code 3 + AGY_ERROR on --print-timeout expiry.
+  // Keep 2147484s for MIN_AGY_VERSION compatibility while Pi's sliding deadline owns termination.
   return appendProcessArgs(
     [
       "--input-format",
@@ -265,7 +359,7 @@ export function buildDriverAgyArgs(request: Omit<AgyTurnRequest, "prompt">): str
       "stream-json",
       "--print-timeout",
       "2147484s",
-      "--dangerously-skip-permissions",
+      ...permissionArgsForRequest(request),
       "--disable-slash-commands",
     ],
     { ...request, prompt: "" },
@@ -419,7 +513,10 @@ async function runSingleAgyTurn(request: AgyTurnRequest): Promise<AgyTurnOutcome
             return;
           }
           const likelyCompacting = thoughtTracker.isLikelyCompacting(activeTools.size > 0);
-          if ((thoughtTracker.isGenerating || likelyCompacting) && stallGraces < 6) {
+          if (
+            (thoughtTracker.isGenerating || likelyCompacting || thoughtTracker.isRetrying) &&
+            stallGraces < 6
+          ) {
             stallGraces += 1;
             armStall();
             return;
@@ -579,7 +676,7 @@ async function runSingleAgyTurn(request: AgyTurnRequest): Promise<AgyTurnOutcome
           resolve(outcome);
           return;
         }
-        const tail = stderrBuf.trim().split("\n").slice(-3).join("\n");
+        const tail = extractAgyStderrSummary(stderrBuf);
         reject(
           new AgySpawnError(
             `agy exited with code ${code ?? "signal"} before producing a result${
