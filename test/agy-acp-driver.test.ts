@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -26,7 +26,8 @@ import {
   selectAcpPermissionOutcome,
   type AcpChildProcess,
 } from "../lib/agy-acp-client.ts";
-import { extractUsageFromStepPayload } from "../lib/agy-thoughts.ts";
+import { AgyThoughtTracker, extractUsageFromStepPayload } from "../lib/agy-thoughts.ts";
+import { AgyStallError } from "../lib/agy-client.ts";
 import { newTurnOutcome } from "../lib/reducer.ts";
 import { AgyPiBridge } from "../lib/bridge.ts";
 import { createAgyTurnExecutor } from "../lib/agy-driver.ts";
@@ -1564,5 +1565,110 @@ test("/btw overlay palette and transcript render crisp thinking/tool colors and 
   assert.ok(!unfocusedInputRow.includes("\x1b_pi:fc\x07"), "unfocused composer hides fake cursor");
   assert.match(stripAnsi(unfocusedInputRow), /^│ ❯ Press .* to focus BTW input/);
 });
+
+test("AgyAcpDriverSession rejects stalls with AgyStallError and AgyThoughtTracker binds acp-server-*.log", async () => {
+  const fake = createFakeAcpSpawn({ hangPromptUntilCancel: true });
+  const driver = new AgyAcpDriverSession({
+    probeSubagents: async () => ({
+      hasAlive: false,
+      aliveCount: 0,
+      aliveConversationIds: [],
+      newestUpdateMs: 0,
+    }),
+    probeToolProcess: async () => false,
+  });
+  try {
+    await assert.rejects(
+      driver.run({
+        binary: "agy",
+        prompt: "HANG_ME stall check",
+        inactivityTimeoutMs: 40,
+        spawnOverride: fake.spawnOverride,
+      }),
+      (err: unknown) => {
+        assert.ok(
+          err instanceof AgyStallError,
+          `expected AgyStallError instead of ${err instanceof Error ? `${err.name}: ${err.message}` : String(err)}`,
+        );
+        return true;
+      },
+    );
+    assert.equal(driver.snapshot().state, "idle");
+  } finally {
+    await driver.close("shutdown");
+  }
+
+  // Verify AgyThoughtTracker binds `acp-server-*.log` and grants compaction/prefill grace at >=100k tokens
+  const tmpDir = mkdtempSync(path.join(tmpdir(), "agy-acp-thought-log-"));
+  try {
+    const cid = "249d10c0-4398-4fdb-8073-f2dad87d030b";
+    const dbPath = path.join(tmpDir, `${cid}.db`);
+    const db = new DatabaseSync(dbPath);
+    db.exec(
+      "CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, step_payload BLOB)",
+    );
+    const encodeVarint = (value: number): number[] => {
+      const out: number[] = [];
+      let v = value;
+      while (v >= 0x80) {
+        out.push((v & 0x7f) | 0x80);
+        v = Math.floor(v / 128);
+      }
+      out.push(v);
+      return out;
+    };
+    const genMeta = Buffer.from([
+      0x10,
+      ...encodeVarint(3_397),
+      0x18,
+      ...encodeVarint(3_156),
+      0x28,
+      ...encodeVarint(171_912),
+    ]);
+    const stepMeta = Buffer.from([0x4a, ...encodeVarint(genMeta.length), ...genMeta]);
+    const stepPayload = Buffer.from([0x2a, ...encodeVarint(stepMeta.length), ...stepMeta]);
+    db.prepare("INSERT INTO steps (idx, step_type, status, step_payload) VALUES (?, ?, ?, ?)").run(
+      544,
+      15,
+      3,
+      stepPayload,
+    );
+    db.prepare("INSERT INTO steps (idx, step_type, status, step_payload) VALUES (?, ?, ?, ?)").run(
+      545,
+      132,
+      3,
+      Buffer.from("edit output"),
+    );
+    db.close();
+
+    const acpLogPath = path.join(tmpDir, "acp-server-20261107_130400-77287.log");
+    writeFileSync(
+      acpLogPath,
+      [
+        `I1107 13:07:40.000000 1 server.go:1826] Sending user message to conversation ${cid} (items=1, media=0)`,
+        `I1107 13:07:45.000000 2 http_helpers.go:403] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse Trace: 0x1`,
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    let nowMs = new Date(2026, 10, 7, 13, 7, 47, 0).getTime();
+    const tracker = new AgyThoughtTracker(undefined, tmpDir, {
+      logDir: tmpDir,
+      now: () => nowMs,
+      emitThinkingDeltas: false,
+    });
+    tracker.sync(cid, () => {});
+    assert.equal(tracker.isLikelyCompacting(false), true);
+    nowMs += 2_000;
+    const pollRes = tracker.poll();
+    assert.equal(pollRes.lastContextTokens, 175_309);
+    assert.equal(pollRes.isCompacting, true);
+    tracker.close();
+  } finally {
+    rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 
 

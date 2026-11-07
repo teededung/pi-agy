@@ -809,7 +809,7 @@ export class AgyThoughtTracker {
       this.#emittedCompacting ||
       (!hasActiveTools &&
         this.#lastAwaitingPlannerAfterStep &&
-        (this.#lastContextTokens ?? 0) >= 180_000)
+        (this.#lastContextTokens ?? 0) >= MIN_COMPACTION_CONTEXT_TOKENS)
     );
   }
 
@@ -991,7 +991,9 @@ export class AgyThoughtTracker {
     try {
       if (!existsSync(this.#logDir)) return;
       const names = readdirSync(this.#logDir).filter(
-        (name) => name.startsWith("cli-") && name.endsWith(".log"),
+        (name) =>
+          (name.startsWith("cli-") || name.startsWith("acp-server-")) &&
+          name.endsWith(".log"),
       );
       if (names.length === 0) return;
       const candidates: Array<{ path: string; size: number; mtimeMs: number }> = [];
@@ -1074,14 +1076,14 @@ export class AgyThoughtTracker {
 
     if (this.#activeStreamStartedAtMs === undefined) return false;
 
+    if (this.#streamStartMaxIdx < 0) {
+      this.#streamStartMaxIdx = overallMaxIdx;
+    }
+
     if (hasRunningStep || isGenerating || overallMaxIdx > this.#streamStartMaxIdx) {
       this.#activeStreamStartedAtMs = undefined;
       this.#streamStartMaxIdx = -1;
       return false;
-    }
-
-    if (this.#streamStartMaxIdx < 0) {
-      this.#streamStartMaxIdx = overallMaxIdx;
     }
 
     return (

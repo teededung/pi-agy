@@ -569,8 +569,9 @@ export class AgyAcpDriverSession implements AgyTurnExecutor {
         if (generation !== this.#generation) return;
         this.#log(`protocol-error:${err.message.slice(0, 80)}`);
         const turn = this.#active;
-        void this.#killProcess("dead").finally(() => {
-          turn?.settleError?.(new AgySpawnError(err.message, this.#stderrTail));
+        const transportErr = new AgySpawnError(err.message, this.#stderrTail);
+        void this.#killProcess("dead", transportErr).finally(() => {
+          turn?.settleError?.(transportErr);
         });
       },
     });
@@ -873,7 +874,7 @@ export class AgyAcpDriverSession implements AgyTurnExecutor {
     const stallError = new AgyStallError(turn.silenceMs, toolActive);
     this.#log(`stall:expired:${turn.silenceMs}ms`);
     this.#recordRecycle("unspecified");
-    await this.#killProcess("idle");
+    await this.#killProcess("idle", stallError);
     turn.settleError?.(stallError);
   }
 
@@ -915,15 +916,16 @@ export class AgyAcpDriverSession implements AgyTurnExecutor {
     })();
   }
 
-  async #killProcess(nextState: AgyDriverState): Promise<void> {
+  async #killProcess(nextState: AgyDriverState, reasonError?: Error): Promise<void> {
     const child = this.#child;
     const client = this.#client;
     if (!child) {
       this.#state = nextState;
       return;
     }
+    const failErr =
+      reasonError ?? new AgySpawnError("agy acp process was terminated.", this.#stderrTail);
     this.#detachChild(child, "stopping");
-    client?.failAll(new AgySpawnError("agy acp process was terminated.", this.#stderrTail));
     trackAgyChild(child);
     await new Promise<void>((resolve) => {
       const finish = () => {
@@ -942,6 +944,7 @@ export class AgyAcpDriverSession implements AgyTurnExecutor {
       if (child.exitCode !== null || child.signalCode !== null) finish();
     });
     this.#state = nextState;
+    client?.failAll(failErr);
   }
 
   #detachChild(child: AcpChildProcess, nextState: AgyDriverState): void {
