@@ -504,6 +504,7 @@ export class AgyThoughtTracker {
   #lastCliLogScanAtMs = 0;
   #pendingMonitorCalls = 0;
   #activeStreamStartedAtMs: number | undefined;
+  #activeStreamResponseId: string | undefined;
   #streamStartMaxIdx = -1;
   #retryUntilMs = 0;
   #sawRetrySinceLastPoll = false;
@@ -549,6 +550,7 @@ export class AgyThoughtTracker {
     this.#cliLogRemainder = "";
     this.#pendingMonitorCalls = 0;
     this.#activeStreamStartedAtMs = undefined;
+    this.#activeStreamResponseId = undefined;
     this.#streamStartMaxIdx = -1;
     this.#retryUntilMs = 0;
     this.#sawRetrySinceLastPoll = false;
@@ -642,6 +644,7 @@ export class AgyThoughtTracker {
       }
     }
 
+    const prePollMaxIdx = this.#lastMaxIdx >= 0 ? this.#lastMaxIdx : overallMaxIdx;
     let maxIdx = this.#lastMaxIdx;
     let totalBytes = 0;
     const statusParts: string[] = [];
@@ -741,7 +744,14 @@ export class AgyThoughtTracker {
       }
     }
 
-    const cliCompacting = this.#pollCliCompacting(overallMaxIdx, hasRunningStep, isGenerating, nowMs);
+    const cliCompacting = this.#pollCliCompacting(
+      overallMaxIdx,
+      prePollMaxIdx,
+      rows,
+      hasRunningStep,
+      isGenerating,
+      nowMs,
+    );
     const isCompacting = sqlCheckpointActive || cliCompacting;
     if (hasRunningStep || isGenerating) {
       this.#retryUntilMs = 0;
@@ -1068,20 +1078,36 @@ export class AgyThoughtTracker {
 
   #pollCliCompacting(
     overallMaxIdx: number,
+    prePollMaxIdx: number,
+    rows: StepRow[],
     hasRunningStep: boolean,
     isGenerating: boolean,
     nowMs: number,
   ): boolean {
-    this.#tailCliLog(overallMaxIdx, nowMs);
+    this.#tailCliLog(prePollMaxIdx, nowMs);
 
     if (this.#activeStreamStartedAtMs === undefined) return false;
 
     if (this.#streamStartMaxIdx < 0) {
-      this.#streamStartMaxIdx = overallMaxIdx;
+      this.#streamStartMaxIdx = prePollMaxIdx;
     }
 
-    if (hasRunningStep || isGenerating || overallMaxIdx > this.#streamStartMaxIdx) {
+    const matchedStepPayload =
+      this.#activeStreamResponseId !== undefined &&
+      rows.some(
+        (row) =>
+          row.step_payload != null &&
+          toBuffer(row.step_payload).includes(this.#activeStreamResponseId!),
+      );
+
+    if (
+      hasRunningStep ||
+      isGenerating ||
+      overallMaxIdx > this.#streamStartMaxIdx ||
+      matchedStepPayload
+    ) {
       this.#activeStreamStartedAtMs = undefined;
+      this.#activeStreamResponseId = undefined;
       this.#streamStartMaxIdx = -1;
       return false;
     }
@@ -1110,10 +1136,12 @@ export class AgyThoughtTracker {
       if (
         cid &&
         (line.includes(`Forwarding user message to conversation ${cid}`) ||
-          line.includes(`Sending user message to conversation ${cid}`))
+          line.includes(`Sending user message to conversation ${cid}`) ||
+          line.includes(`Stream goroutine exited for ${cid}`))
       ) {
         this.#pendingMonitorCalls = 0;
         this.#activeStreamStartedAtMs = undefined;
+        this.#activeStreamResponseId = undefined;
         this.#streamStartMaxIdx = -1;
         this.#retryUntilMs = 0;
         this.#sawRetrySinceLastPoll = false;
@@ -1123,6 +1151,9 @@ export class AgyThoughtTracker {
         line,
       );
       if (retryMatch) {
+        this.#activeStreamStartedAtMs = undefined;
+        this.#activeStreamResponseId = undefined;
+        this.#streamStartMaxIdx = -1;
         const parsedMs = parseGlogTimestampMs(line, nowMs);
         if (isInitialReplay && parsedMs !== undefined && nowMs - parsedMs > 120_000) {
           continue;
@@ -1155,7 +1186,9 @@ export class AgyThoughtTracker {
         if (isInitialReplay && parsedMs !== undefined && nowMs - parsedMs > 180_000) {
           continue;
         }
+        const respIdMatch = /\bResponseID:\s*([A-Za-z0-9_-]+)/.exec(line);
         this.#activeStreamStartedAtMs = parsedMs ?? nowMs;
+        this.#activeStreamResponseId = respIdMatch?.[1];
         this.#streamStartMaxIdx = overallMaxIdx;
       }
     }

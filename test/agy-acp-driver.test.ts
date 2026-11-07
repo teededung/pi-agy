@@ -1664,6 +1664,56 @@ test("AgyAcpDriverSession rejects stalls with AgyStallError and AgyThoughtTracke
     const pollRes = tracker.poll();
     assert.equal(pollRes.lastContextTokens, 175_309);
     assert.equal(pollRes.isCompacting, true);
+
+    // If a normal PLANNER_RESPONSE (step_type = 15) and fast tool step (step_type = 132)
+    // complete within the same 250ms poll interval as their http_helpers.go:403 line,
+    // tracker must NOT falsely report isCompacting = true while waiting on the next step.
+    const db2 = new DatabaseSync(dbPath);
+    db2
+      .prepare("INSERT INTO steps (idx, step_type, status, step_payload) VALUES (?, ?, ?, ?)")
+      .run(
+        546,
+        15,
+        3,
+        Buffer.concat([stepPayload, Buffer.from(" ResponseID: resp-step-546 ")]),
+      );
+    db2
+      .prepare("INSERT INTO steps (idx, step_type, status, step_payload) VALUES (?, ?, ?, ?)")
+      .run(547, 132, 3, Buffer.from("git log -n 1 --stat"));
+    db2.close();
+    writeFileSync(
+      acpLogPath,
+      [
+        `I1107 13:07:40.000000 1 server.go:1826] Sending user message to conversation ${cid} (items=1, media=0)`,
+        `I1107 13:07:45.000000 2 http_helpers.go:403] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse Trace: 0x1`,
+        `I1107 13:07:50.000000 3 http_helpers.go:403] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse Trace: 0x2 ResponseID: resp-step-546`,
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    nowMs = new Date(2026, 10, 7, 13, 7, 50, 100).getTime();
+    assert.equal(tracker.poll().isCompacting, false);
+    nowMs += 3_000;
+    assert.equal(tracker.poll().isCompacting, false);
+
+    // And if an active stream logs `retrying in 4s`, isCompacting resets to false and isRetrying turns true
+    writeFileSync(
+      acpLogPath,
+      [
+        `I1107 13:07:40.000000 1 server.go:1826] Sending user message to conversation ${cid} (items=1, media=0)`,
+        `I1107 13:07:45.000000 2 http_helpers.go:403] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse Trace: 0x1`,
+        `I1107 13:07:50.000000 3 http_helpers.go:403] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse Trace: 0x2 ResponseID: resp-step-546`,
+        `I1107 13:07:55.000000 4 http_helpers.go:403] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse Trace: 0x3 ResponseID: resp-unindexed`,
+        `I1107 13:07:56.000000 5 run.go:307] Run: attempt 1 failed (INTERNAL (code 500): Internal error encountered.), retrying in 4s`,
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    nowMs = new Date(2026, 10, 7, 13, 7, 58, 0).getTime();
+    const retryPoll = tracker.poll();
+    assert.equal(retryPoll.isCompacting, false);
+    assert.equal(retryPoll.isRetrying, true);
+
     tracker.close();
   } finally {
     rmSync(tmpDir, { recursive: true, force: true });
