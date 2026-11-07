@@ -931,6 +931,26 @@ interface TrackedAcpToolCall {
 }
 
 /**
+ * `agy acp` serializes internal `CortexStepErrorMessage` (`step_type = 17`) rows
+ * — such as in-process retry notices (`API error (attempt 1): ...`), mid-stream
+ * recovery prompts (`The stream was interrupted. Please continue the task you
+ * were working on.`), length/tool-call recovery prompts, and terminal quota/API
+ * errors — as standalone `agent_message_chunk` updates formatted with
+ * `fmt.Sprintf("\n⚠ %s\n", msg)`.
+ *
+ * Those chunks are internal runner diagnostics or model-directed retry prompts,
+ * NOT assistant prose. Appending them as `text` deltas corrupts assistant
+ * markdown mid-sentence and permanently saves runner prompts in chat history.
+ */
+export function extractAcpStepWarningMessage(rawText: string): string | undefined {
+  if (!rawText.startsWith("\n⚠ ") || !rawText.endsWith("\n")) {
+    return undefined;
+  }
+  const body = rawText.slice(3, -1).trim();
+  return body.length > 0 ? body : undefined;
+}
+
+/**
  * Stateful per-turn normalizer converting ACP `session/update` notifications
  * into `pi-agy` `AgyActivity` events and accumulating `outcome.response`.
  */
@@ -944,6 +964,7 @@ export class AcpTurnNormalizer {
   #sawPostToolChunk = false;
   #streamedTextSegments: string[] = [];
   #currentSegment = "";
+  #lastStepWarning: string | undefined;
 
   constructor(outcome: AgyTurnOutcome) {
     this.#outcome = outcome;
@@ -963,6 +984,7 @@ export class AcpTurnNormalizer {
         if (content?.type === "text" && typeof content.text === "string" && content.text) {
           const clean = content.text.replace(/[\uFFF9-\uFFFB]/g, "");
           if (clean) {
+            this.#lastStepWarning = undefined;
             if (this.#toolBatches > 0) this.#sawPostToolChunk = true;
             this.#inToolBatch = false;
             activities.push({
@@ -977,12 +999,34 @@ export class AcpTurnNormalizer {
       case "agent_message_chunk": {
         const content = asRecord(update.content);
         if (content?.type === "text" && typeof content.text === "string" && content.text) {
+          const stepWarning = extractAcpStepWarningMessage(content.text);
+          if (stepWarning !== undefined) {
+            this.#lastStepWarning = stepWarning;
+            const interruptedMidText = this.#currentSegment.length > 0;
+            if (interruptedMidText) {
+              this.#streamedTextSegments.push(this.#currentSegment);
+              this.#currentSegment = "";
+            }
+            this.#responseStepIndex += 1;
+            if (
+              interruptedMidText ||
+              stepWarning.startsWith("The stream was interrupted.") ||
+              stepWarning.startsWith("Please continue from where you left off")
+            ) {
+              activities.push({
+                type: "stream_retry",
+                message: "agy stream was interrupted upstream — continuing the turn automatically",
+              });
+            }
+            break;
+          }
           const delta = sanitizeAgentResponseDelta(
             this.#outcome,
             this.#responseStepIndex,
             content.text,
           );
           if (delta) {
+            this.#lastStepWarning = undefined;
             if (this.#toolBatches > 0) this.#sawPostToolChunk = true;
             this.#inToolBatch = false;
             this.#currentSegment += delta;
@@ -997,6 +1041,7 @@ export class AcpTurnNormalizer {
       }
       case "tool_call":
       case "tool_call_update": {
+        this.#lastStepWarning = undefined;
         const toolCallId =
           typeof update.toolCallId === "string" && update.toolCallId
             ? update.toolCallId
@@ -1151,6 +1196,11 @@ export class AcpTurnNormalizer {
     }
     const last = this.#streamedTextSegments.at(-1) ?? "";
     return stripHallucinatedTurnSuffix(last);
+  }
+
+  /** Latest unrecovered `CortexStepErrorMessage` warning (`\n⚠ ...\n`), if the turn ended on it. */
+  lastWarningText(): string | undefined {
+    return this.#lastStepWarning;
   }
 }
 

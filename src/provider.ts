@@ -1385,6 +1385,7 @@ export function streamAntigravity(
         let usage: AgyUsage | undefined;
         let textIndex: number | null = null;
         let textBuffer = "";
+        let textStepId: number | undefined;
         /**
          * Live thinking block populated from SQLite `thinking_delta` events.
          */
@@ -1574,6 +1575,7 @@ export function streamAntigravity(
           });
           textIndex = null;
           textBuffer = "";
+          textStepId = undefined;
         };
 
         const attachUsage = (u: AgyUsage | undefined, final: boolean) => {
@@ -1828,19 +1830,8 @@ export function streamAntigravity(
           thoughtIndex = null;
         };
 
-        /**
-         * Render a runtime stall/retry as a collapsed thinking line so the
-         * user sees why a turn restarted instead of a silent multi-minute
-         * spinner. Uses the same reserved-slot mechanism as thought markers
-         * so the event stream stays delta-replay legal.
-         */
-        const emitStallMarker = (activity: Extract<AgyActivity, { type: "stall" }>): void => {
+        const emitThoughtSummaryLine = (summary: string): void => {
           closeText();
-          const seconds = Math.max(1, Math.round(activity.stalledMs / 1000));
-          const summary =
-            `agy stream stalled for ${seconds}s with no events` +
-            `${activity.toolActive ? " while a tool step was active" : ""}` +
-            ` — restarting the turn (retry ${activity.retry} of ${activity.maxRetries})`;
           const index = reserveThought();
           const block = output.content[index];
           if (block.type === "thinking") block.thinking = summary;
@@ -1857,6 +1848,21 @@ export function streamAntigravity(
             partial: output,
           });
           thoughtIndex = null;
+        };
+
+        /**
+         * Render a runtime stall/retry as a collapsed thinking line so the
+         * user sees why a turn restarted instead of a silent multi-minute
+         * spinner. Uses the same reserved-slot mechanism as thought markers
+         * so the event stream stays delta-replay legal.
+         */
+        const emitStallMarker = (activity: Extract<AgyActivity, { type: "stall" }>): void => {
+          const seconds = Math.max(1, Math.round(activity.stalledMs / 1000));
+          const summary =
+            `agy stream stalled for ${seconds}s with no events` +
+            `${activity.toolActive ? " while a tool step was active" : ""}` +
+            ` — restarting the turn (retry ${activity.retry} of ${activity.maxRetries})`;
+          emitThoughtSummaryLine(summary);
         };
 
         while (true) {
@@ -1976,6 +1982,11 @@ export function streamAntigravity(
               emitStallMarker(activity);
               break;
             }
+            case "stream_retry": {
+              controller.beginTextSegment();
+              emitThoughtSummaryLine(activity.message);
+              break;
+            }
             case "tool_start": {
               controller.beginTextSegment();
               if (isolatedRequest) {
@@ -2068,6 +2079,14 @@ export function streamAntigravity(
             }
             case "text": {
               if (thinkingIndex !== null) closeThinking();
+              if (
+                textIndex !== null &&
+                activity.stepId !== undefined &&
+                textStepId !== undefined &&
+                activity.stepId !== textStepId
+              ) {
+                closeText();
+              }
               if (textIndex === null) {
                 // Reserve the synthetic thought slot BEFORE the text block only
                 // when no real SQLite thinking text was streamed for this step.
@@ -2080,6 +2099,7 @@ export function streamAntigravity(
                 output.content.push({ type: "text", text: "" });
                 textIndex = output.content.length - 1;
                 textBuffer = "";
+                textStepId = activity.stepId;
                 stream.push({ type: "text_start", contentIndex: textIndex, partial: output });
               }
               controller.recordEmittedText(activity.delta, activity.stepId);

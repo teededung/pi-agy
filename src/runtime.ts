@@ -581,6 +581,7 @@ const makeRuntime = (
                */
               const runTurnWithStallRetries = async (): Promise<AgyTurnOutcome> => {
                 let retry = 0;
+                let hadStallRetry = false;
                 let freshFallback = false;
                 let turnPromptDelivered = false;
                 const startFreshFallback = () => {
@@ -599,6 +600,7 @@ const makeRuntime = (
                   freshFallback = true;
                   turnPromptDelivered = false;
                   retry = 0;
+                  hadStallRetry = false;
                 };
                 for (;;) {
                   if (turnAbort.signal.aborted) throw abortFailure();
@@ -615,7 +617,7 @@ const makeRuntime = (
                   // during silent auth before init on an existing conversationId,
                   // the user prompt was never recorded server-side and must be resent.
                   const resumingRetry =
-                    retry > 0 && turnPromptDelivered && resumableConversationId !== undefined;
+                    hadStallRetry && turnPromptDelivered && resumableConversationId !== undefined;
                   const carriedRelay = resumingRetry
                     ? pendingSystemPromptRelay
                     : freshFallback
@@ -662,7 +664,7 @@ const makeRuntime = (
                       : {}),
                     images: resumingRetry ? undefined : spawnRequest.images,
                     conversationId: resumableConversationId,
-                    timeoutMs: retry === 0 && !freshFallback ? timeoutMs : remainingMs,
+                    timeoutMs: !hadStallRetry && !freshFallback ? timeoutMs : remainingMs,
                     progressTimeoutMs: timeoutMs,
                     onProgress: recordProgress,
                     onConversation: (id) => {
@@ -677,6 +679,17 @@ const makeRuntime = (
                       trackActiveToolStep(attemptActiveTools, activity);
                       if (isAgyProgressActivity(activity, repeatedToolStart)) {
                         recordProgress();
+                      }
+                      if (
+                        retry > 0 &&
+                        (activity.type === "bridge_call" ||
+                          activity.type === "tool_done" ||
+                          activity.type === "tool_error" ||
+                          activity.type === "checkpoint" ||
+                          activity.type === "usage" ||
+                          activity.type === "text")
+                      ) {
+                        retry = 0;
                       }
                       spawnRequest.onActivity?.(activity);
                     },
@@ -727,6 +740,7 @@ const makeRuntime = (
                       throw error;
                     }
                     retry += 1;
+                    hadStallRetry = true;
                     controller.push({
                       type: "stall",
                       retry,

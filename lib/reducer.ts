@@ -63,6 +63,12 @@ export type AgyActivity =
       stalledMs: number;
       toolActive: boolean;
     }
+  | {
+      /** Synthetic — emitted in ACP mode when agy's internal runner recovers
+       * from an upstream mid-stream interruption inside the same turn. */
+      type: "stream_retry";
+      message: string;
+    }
   | { type: "text"; delta: string; stepId?: number }
   | { type: "thinking_delta"; delta: string; stepId?: number }
   | {
@@ -393,6 +399,7 @@ export function isAgyProgressActivity(
     case "tool_done":
     case "tool_error":
     case "bridge_call":
+    case "stream_retry":
     case "text":
     case "thinking_delta":
     case "thought":

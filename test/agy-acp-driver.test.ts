@@ -1668,7 +1668,147 @@ test("AgyAcpDriverSession rejects stalls with AgyStallError and AgyThoughtTracke
   } finally {
     rmSync(tmpDir, { recursive: true, force: true });
   }
+
+  // Verify AcpTurnNormalizer strips internal CortexStepErrorMessage (`\n⚠ ...\n`) chunks
+  // from assistant prose and emits `stream_retry` when interrupted mid-sentence
+  const normOutcome = newTurnOutcome();
+  const normalizer = new AcpTurnNormalizer(normOutcome);
+  // Pre-text API retry warning is suppressed from text and recorded as lastWarningText
+  const preRetryActs = normalizer.consumeUpdate({
+    sessionId: "s1",
+    update: {
+      sessionUpdate: "agent_message_chunk",
+      content: {
+        type: "text",
+        text: "\n⚠ API error (attempt 1): UNAVAILABLE (code 503): The service is currently unavailable.\n",
+      },
+    },
+  });
+  assert.deepEqual(preRetryActs, []);
+  assert.equal(
+    normalizer.lastWarningText(),
+    "API error (attempt 1): UNAVAILABLE (code 503): The service is currently unavailable.",
+  );
+
+  // Partial prose arrives, then mid-stream interruption (`step_type = 17`)
+  const textAct1 = normalizer.consumeUpdate({
+    sessionId: "s1",
+    update: {
+      sessionUpdate: "agent_message_chunk",
+      content: {
+        type: "text",
+        text: "*Skipped: Giữ nguyên `Vị trí: ^777777Trang sức (trái)^000000`",
+      },
+    },
+  });
+  assert.equal(textAct1.length, 1);
+  assert.equal(textAct1[0]!.type, "text");
+  assert.equal(normalizer.lastWarningText(), undefined);
+
+  const interruptActs = normalizer.consumeUpdate({
+    sessionId: "s1",
+    update: {
+      sessionUpdate: "agent_message_chunk",
+      content: {
+        type: "text",
+        text: "\n⚠ The stream was interrupted. Please continue the task you were working on.\n",
+      },
+    },
+  });
+  assert.deepEqual(interruptActs, [
+    {
+      type: "stream_retry",
+      message: "agy stream was interrupted upstream — continuing the turn automatically",
+    },
+  ]);
+
+  // Retry step continues with a new stepId and never contains "Please continue the task you were working on."
+  const textAct2 = normalizer.consumeUpdate({
+    sessionId: "s1",
+    update: {
+      sessionUpdate: "agent_message_chunk",
+      content: {
+        type: "text",
+        text: "Tất cả các thay đổi đã được xác thực sạch sẽ.",
+      },
+    },
+  });
+  assert.equal(textAct2.length, 1);
+  assert.equal(textAct2[0]!.type, "text");
+  assert.notEqual(
+    (textAct2[0] as Extract<typeof textAct2[0], { type: "text" }>).stepId,
+    (textAct1[0] as Extract<typeof textAct1[0], { type: "text" }>).stepId,
+  );
+  assert.equal(normalizer.finalResponseText(), "Tất cả các thay đổi đã được xác thực sạch sẽ.");
+  assert.doesNotMatch(normalizer.finalResponseText(), /Please continue the task you were working on/);
+
+  // Verify AntigravityRuntime resets consecutive stall counter (`retry 1 of 3` -> `retry 2 of 3` -> recovers -> `retry 1 of 3`)
+  const prevBackoff = process.env.AGY_STALL_RETRY_BACKOFF_MS;
+  process.env.AGY_STALL_RETRY_BACKOFF_MS = "1";
+  try {
+    let callIdx = 0;
+    const seenPrompts: string[] = [];
+    const stallRetries: number[] = [];
+    const runtime = createAntigravityRuntime(async (req) => {
+      callIdx += 1;
+      seenPrompts.push(req.prompt);
+      req.onConversation?.("conv-reset-stall");
+      if (callIdx === 1 || callIdx === 2) {
+        throw new AgyStallError(90_000, false);
+      }
+      if (callIdx === 3) {
+        // Agent recovers and completes a step (`usage` / `tool_done`), then stalls later in the turn!
+        req.onActivity?.({
+          type: "usage",
+          usage: { input_tokens: 1000, output_tokens: 50, total_tokens: 1050 },
+        });
+        throw new AgyStallError(90_000, false);
+      }
+      const resAct = {
+        type: "result" as const,
+        status: "OK" as const,
+        response: "recovered after second stall wave",
+      };
+      req.onActivity?.(resAct);
+      return {
+        conversationId: "conv-reset-stall",
+        status: "OK",
+        response: "recovered after second stall wave",
+        activities: [resAct],
+        usage: undefined,
+        finished: true,
+      };
+    });
+    try {
+      const svc = runtime.runSync(AntigravityRuntime);
+      const ctrl = await runtime.runPromise(
+        svc.beginStreamTurn({
+          prompt: "Initial user question",
+          systemPrompt: "Sys",
+          modelId: "gemini-4-argon",
+        }),
+      );
+      for (;;) {
+        const act = await ctrl.next();
+        if (act === null) break;
+        if (act.type === "stall") {
+          stallRetries.push(act.retry);
+        }
+      }
+      await runtime.runPromise(svc.finishTurn);
+    } finally {
+      await runtime.dispose();
+    }
+    // Stalls 1 & 2 increment (1, 2); after callIdx=3 recovers and emits usage, the next stall resets to 1!
+    assert.deepEqual(stallRetries, [1, 2, 1]);
+    // Call 4 still uses stallContinuationPrompt() rather than resending the initial user question
+    assert.match(seenPrompts[3]!, /The stream was interrupted before your previous turn completed/);
+  } finally {
+    if (prevBackoff === undefined) delete process.env.AGY_STALL_RETRY_BACKOFF_MS;
+    else process.env.AGY_STALL_RETRY_BACKOFF_MS = prevBackoff;
+  }
 });
+
 
 
 

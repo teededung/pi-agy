@@ -1260,13 +1260,14 @@ async function awaitTurnExecution(
         : undefined;
 
   const finalText = normalizer.finalResponseText();
+  const fallbackErr = rawErr?.trim() ? rawErr : normalizer.lastWarningText();
   outcome.finished = true;
   outcome.status = isOk ? "OK" : "ERROR";
   outcome.finishedReason = finishedReason;
   outcome.response = finalText;
   outcome.error = isOk
     ? undefined
-    : formatAcpStopError(stopReason, rawErr, finalText, quota);
+    : formatAcpStopError(stopReason, fallbackErr, finalText, quota);
 
   const resultActivity: AgyActivity = {
     type: "result",
