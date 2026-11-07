@@ -1093,7 +1093,10 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   const piToolsAgent = createPiToolsAgent(path.join(mcpConfig.directory, ".agents", "agents"));
   bridge.requireToken(bridgeToken);
   bridge.setOnCall((call) => {
-    const cleanedArgs = toolSummaries.recordBridgeCall(call);
+    const cleanedArgs = toolSummaries.recordBridgeCall(
+      call,
+      bridge.getToolParameters(call.tool),
+    );
     persistToolSummaries();
     return service.pushBridgeCall({ ...call, args: cleanedArgs });
   });
@@ -1739,7 +1742,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       };
     },
     renderCall(args, theme) {
-      return new Text(formatAgyCall(args.tool, args.input, theme), 0, 0);
+      return new Text(formatAgyCall(args.tool, args.input, theme, { includeSummary: false }), 0, 0);
     },
     renderResult(result, { expanded }, theme, context) {
       const rawBody = result.content[0]?.type === "text" ? result.content[0].text : "";

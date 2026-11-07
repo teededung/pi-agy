@@ -1077,7 +1077,7 @@ function renderThemedToolCard(
   const summary =
     cleanTranscriptString(unwrappedArgs.toolSummary) ??
     cleanTranscriptString(unwrappedArgs.toolAction);
-  const callFormatted = formatAgyCall(toolName, unwrappedArgs, theme);
+  const callFormatted = formatAgyCall(toolName, unwrappedArgs, theme, { includeSummary: false });
 
   let bgToken: "toolPendingBg" | "toolErrorBg" | "toolSuccessBg" = "toolSuccessBg";
   const resultLines: string[] = [];

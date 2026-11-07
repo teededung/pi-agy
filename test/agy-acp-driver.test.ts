@@ -1109,11 +1109,39 @@ test("ToolSummaryTracker + createSummaryToolRendererResolver render muted toolSu
     args: { limit: 50, offset: 1, path: "/repo/a.ts", toolSummary: "Read header of a.ts" },
   });
 
-  // Strict-schema safety: toolSummary is stripped from returned bridge args
+  // Strict-schema safety: toolSummary is stripped from returned bridge args unless
+  // the bridged tool's own schema explicitly declares that parameter (agy 1.5.2+).
   assert.deepEqual(cleanA, { limit: 50, offset: 1, path: "/repo/a.ts" });
   assert.deepEqual(cleanB, { limit: 20, offset: 10, path: "/repo/b.ts" });
   assert.equal(tracker.get("pi-bridge-1"), "Read header of a.ts");
   assert.equal(tracker.get("pi-bridge-2"), "Read helper in b.ts");
+
+  const cleanDeclared = tracker.recordBridgeCall(
+    {
+      id: "pi-bridge-declared",
+      tool: "custom_mcp_tool",
+      args: {
+        query: "status",
+        toolSummary: "Custom declared summary",
+        waitForPreviousTools: true,
+        toolAction: "unrequested-meta",
+      },
+    },
+    {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        toolSummary: { type: "string" },
+        waitForPreviousTools: { type: "boolean" },
+      },
+    },
+  );
+  assert.deepEqual(cleanDeclared, {
+    query: "status",
+    toolSummary: "Custom declared summary",
+    waitForPreviousTools: true,
+  });
+  assert.equal(tracker.get("pi-bridge-declared"), "Custom declared summary");
 
   // 2. Late tool_start (after bridge_call) binds summary and invalidates live TUI card
   tracker.recordBridgeCall({
@@ -1124,7 +1152,9 @@ test("ToolSummaryTracker + createSummaryToolRendererResolver render muted toolSu
   let invalidated = 0;
   const mockTheme = {
     fg: (color: string, text: string) => `[${color}]${text}[/${color}]`,
+    bg: (color: string, text: string) => `[bg:${color}]${text}[/bg:${color}]`,
     bold: (text: string) => `<b>${text}</b>`,
+    italic: (text: string) => `<i>${text}</i>`,
   } as unknown as Theme;
 
   let innerRenderReused = false;
@@ -1136,9 +1166,15 @@ test("ToolSummaryTracker + createSummaryToolRendererResolver render muted toolSu
       t.setText(theme.fg("toolTitle", theme.bold(`$ ${(args as { command: string }).command}`)));
       return t;
     },
+    renderResult(result, _options, theme) {
+      const txt = result.content[0]?.type === "text" ? result.content[0].text : "";
+      return new Text(theme.fg("toolOutput", txt), 0, 0);
+    },
   }))!;
+  assert.equal(bashRenderer.renderShell, "self");
 
   type RenderCallCtx = Parameters<NonNullable<ToolRenderers["renderCall"]>>[2];
+  const sharedState: Record<string, unknown> = {};
   const mkCtx = (
     toolCallId: string,
     lastComponent: unknown,
@@ -1151,7 +1187,7 @@ test("ToolSummaryTracker + createSummaryToolRendererResolver render muted toolSu
         invalidated += 1;
       },
       lastComponent,
-      state: {},
+      state: sharedState,
       cwd: "/repo",
       executionStarted: true,
       argsComplete: true,
@@ -1165,18 +1201,18 @@ test("ToolSummaryTracker + createSummaryToolRendererResolver render muted toolSu
       keyHint: (k: string) => k,
     }) as unknown as RenderCallCtx;
 
-  // Before tool_start arrives (or on a Codex call with no summary): renders exact native 1-line component
+  // Before tool_start arrives (or on a Codex call with no summary): renders ONLY the native Box (no outside caption)
   const firstComp = bashRenderer.renderCall!(
     { command: "git status -s" },
     mockTheme,
     mkCtx("pi-bridge-3", undefined, true),
   );
-  assert.deepEqual(
-    firstComp.render(120).map((l) => l.trimEnd()),
-    ["[toolTitle]<b>$ git status -s</b>[/toolTitle]"],
-  );
+  const firstLines = firstComp.render(60);
+  assert.equal(firstLines.length, 3, "top pad + $ command + bottom pad inside Box");
+  assert.ok(firstLines.every((l) => l.startsWith("[bg:toolPendingBg]")), "entire Codex/no-summary card stays inside Box");
+  assert.ok(firstLines[1]!.includes("[toolTitle]<b>$ git status -s</b>[/toolTitle]"));
 
-  // Now tool_start arrives on stdout -> triggers live invalidate and wraps with muted title above native $ line
+  // Now tool_start arrives on stdout -> triggers live invalidate and renders Codex-style caption OUTSIDE the Box
   tracker.recordToolStart(
     {
       name: `Run mcp_${serverName}_pi__bash`,
@@ -1194,14 +1230,30 @@ test("ToolSummaryTracker + createSummaryToolRendererResolver render muted toolSu
     mockTheme,
     mkCtx("pi-bridge-3", firstComp, false),
   );
-  assert.equal(innerRenderReused, true);
-  assert.deepEqual(
-    wrappedComp.render(120).map((l) => l.trimEnd()),
-    [
-      "[muted]Check git status across both repos[/muted]",
-      "[toolTitle]<b>$ git status -s</b>[/toolTitle]",
-    ],
+  const resultCarrier = bashRenderer.renderResult!(
+    { content: [{ type: "text", text: "M lib/tool-summary.ts" }], details: {} },
+    { expanded: false, isPartial: false },
+    mockTheme,
+    mkCtx("pi-bridge-3", undefined, false) as any,
   );
+  assert.equal(innerRenderReused, true);
+  assert.deepEqual(resultCarrier.render(60), [], "result carrier renders inside sharedBox without duplicate rows");
+
+  const wrappedLines = wrappedComp.render(120);
+  // Row 0: Codex-style bold+italic thinkingText caption OUTSIDE the tool box (no [bg:...], 1-space outputPad)
+  assert.equal(
+    wrappedLines[0]!.trimEnd(),
+    " <b><i>[thinkingText]Check git status across both repos[/thinkingText]</i></b>",
+  );
+  assert.ok(!wrappedLines[0]!.includes("[bg:"), "caption sits on main chat canvas outside tool box");
+  // Row 1: 1 blank spacer row on main chat canvas before the green tool box
+  assert.equal(wrappedLines[1], "", "1 blank row separates caption from green tool box");
+  // Rows 2..5: single unified toolSuccessBg Box containing both call and result
+  const boxLines = wrappedLines.slice(2);
+  assert.equal(boxLines.length, 4, "top pad + call + result + bottom pad in one unified Box");
+  assert.ok(boxLines.every((l) => l.startsWith("[bg:toolSuccessBg]")), "tool box uses toolSuccessBg");
+  assert.ok(boxLines[1]!.includes("[toolTitle]<b>$ git status -s</b>[/toolTitle]"));
+  assert.ok(boxLines[2]!.includes("[toolOutput]M lib/tool-summary.ts[/toolOutput]"));
 
   // Persistence round-trip across session reload
   const dirty = tracker.flushDirty();

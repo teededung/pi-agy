@@ -2,8 +2,9 @@
  * Correlate Antigravity's per-call `toolSummary` captions (emitted on ACP /
  * stream-json `tool_start` events before `agy` strips `toolSummary` from the
  * HTTP MCP `tools/call` payload) with bridged Pi `toolCallId`s, and render
- * them as a compact muted title line above Pi's native tool cards via
- * `pi.registerToolRenderer(...)` without mutating `toolCall.arguments`.
+ * them outside the tool card box in Codex style (`thinkingText` + italic + 1
+ * blank row above the tool box) via `pi.registerToolRenderer(...)` without
+ * mutating `toolCall.arguments`.
  */
 
 import type { JsonObject } from "@earendil-works/pi-ai";
@@ -12,7 +13,7 @@ import type {
   ToolRendererResolver,
   ToolRenderers,
 } from "@earendil-works/pi-coding-agent";
-import { Container, Text, type Component } from "@earendil-works/pi-tui";
+import { Box, Container, Spacer, Text, type Component } from "@earendil-works/pi-tui";
 import { BRIDGE_TOOL_PREFIX, canonicalJson } from "./bridge.ts";
 import { WRAPPER_TOOL_NAME } from "./prompt.ts";
 
@@ -32,10 +33,26 @@ export function cleanToolSummaryText(value: unknown): string | undefined {
   return cleaned.length > 0 ? cleaned : undefined;
 }
 
-function stripAgyMetaArgs(args: Record<string, unknown>): JsonObject {
+function schemaDeclaresProperty(schema: unknown, key: string): boolean {
+  if (!schema || typeof schema !== "object") return false;
+  const rec = schema as Record<string, unknown>;
+  if (rec.properties && typeof rec.properties === "object" && !Array.isArray(rec.properties)) {
+    if (Object.prototype.hasOwnProperty.call(rec.properties, key)) return true;
+  }
+  for (const compositeKey of ["allOf", "anyOf", "oneOf"] as const) {
+    const items = rec[compositeKey];
+    if (Array.isArray(items) && items.some((item) => schemaDeclaresProperty(item, key))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function stripAgyMetaArgs(args: Record<string, unknown>, toolParameters?: unknown): JsonObject {
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(args)) {
-    if (AGY_META_ARG_KEYS.has(key) || value === undefined) continue;
+    if (value === undefined) continue;
+    if (AGY_META_ARG_KEYS.has(key) && !schemaDeclaresProperty(toolParameters, key)) continue;
     out[key] = value;
   }
   return out as JsonObject;
@@ -174,15 +191,18 @@ export class ToolSummaryTracker {
 
   /**
    * Record an incoming `AgyPiBridge` HTTP `tools/call` invocation and return
-   * sanitized arguments (with any accidental `agy` meta keys removed so strict
-   * tool schemas never reject unknown `toolSummary` properties).
+   * sanitized arguments (with any accidental `agy` meta keys removed unless the
+   * bridged tool's own JSON schema declares them, matching `agy 1.5.2+`).
    */
-  recordBridgeCall(call: { id: string; tool: string; args: JsonObject }): JsonObject {
+  recordBridgeCall(
+    call: { id: string; tool: string; args: JsonObject },
+    toolParameters?: unknown,
+  ): JsonObject {
     const rawArgs = (call.args ?? {}) as Record<string, unknown>;
     const inlineSummary =
       cleanToolSummaryText(rawArgs.toolSummary) ?? cleanToolSummaryText(rawArgs.toolAction);
-    const cleanedArgs = stripAgyMetaArgs(rawArgs);
-    const fingerprint = fingerprintBridgedCall(call.tool, cleanedArgs);
+    const cleanedArgs = stripAgyMetaArgs(rawArgs, toolParameters);
+    const fingerprint = fingerprintBridgedCall(call.tool, rawArgs);
 
     let matchIdx = this.#pendingStarts.findIndex((s) => s.fingerprint === fingerprint);
     if (matchIdx < 0 && !inlineSummary) {
@@ -259,18 +279,96 @@ export class ToolSummaryTracker {
   }
 }
 
-class SummaryCallContainer extends Container {
-  readonly summaryText = new Text("", 0, 0);
-  inner: Component | undefined;
+const FALLBACK_RESULT_PREVIEW_LINES = 10;
+const SUMMARY_SHELL_STATE = Symbol("piAgySummaryShell");
 
-  update(styledSummary: string, nextInner: Component): void {
-    this.summaryText.setText(styledSummary);
-    if (this.inner !== nextInner || this.children.length !== 2) {
+type ToolBgToken = "toolPendingBg" | "toolErrorBg" | "toolSuccessBg";
+
+function resolveToolBoxBgFn(
+  theme: Theme,
+  isPartial: boolean,
+  isError: boolean,
+): ((text: string) => string) | undefined {
+  if (typeof (theme as { bg?: unknown }).bg !== "function") return undefined;
+  const token: ToolBgToken = isPartial
+    ? "toolPendingBg"
+    : isError
+      ? "toolErrorBg"
+      : "toolSuccessBg";
+  return (text: string) => theme.bg(token, text);
+}
+
+function formatCodexStyleSummary(theme: Theme, summary: string): string {
+  const colored = theme.fg("thinkingText", summary).replace(/\x1b\[2m/g, "");
+  const italicized =
+    typeof (theme as { italic?: unknown }).italic === "function"
+      ? theme.italic(colored)
+      : colored;
+  return typeof (theme as { bold?: unknown }).bold === "function"
+    ? theme.bold(italicized)
+    : italicized;
+}
+
+function extractWrapperInputSummary(args: unknown): string | undefined {
+  if (!args || typeof args !== "object" || Array.isArray(args)) return undefined;
+  const input = (args as { input?: unknown }).input;
+  if (!input || typeof input !== "object" || Array.isArray(input)) return undefined;
+  const rec = input as Record<string, unknown>;
+  return cleanToolSummaryText(rec.toolSummary) ?? cleanToolSummaryText(rec.toolAction);
+}
+
+class SummaryShellContainer extends Container {
+  readonly summaryText = new Text("", 1, 0);
+  readonly summarySpacer = new Spacer(1);
+  readonly sharedBox = new Box(1, 1);
+  inner: Component | undefined;
+  hasSummary = false;
+
+  update(
+    styledSummary: string | undefined,
+    outputPad: number,
+    bgFn: ((text: string) => string) | undefined,
+    nextInner: Component,
+  ): void {
+    this.sharedBox.clear();
+    this.sharedBox.setPaddingX(outputPad);
+    this.sharedBox.setBgFn(bgFn);
+    this.sharedBox.addChild(nextInner);
+    this.inner = nextInner;
+
+    if (styledSummary) {
+      this.summaryText.setPaddingX(outputPad);
+      this.summaryText.setText(styledSummary);
+      if (!this.hasSummary || this.children.length !== 3) {
+        this.clear();
+        this.addChild(this.summaryText);
+        this.addChild(this.summarySpacer);
+        this.addChild(this.sharedBox);
+        this.hasSummary = true;
+      }
+    } else if (this.hasSummary || this.children.length !== 1) {
       this.clear();
-      this.addChild(this.summaryText);
-      this.addChild(nextInner);
-      this.inner = nextInner;
+      this.addChild(this.sharedBox);
+      this.hasSummary = false;
     }
+  }
+}
+
+class SharedBoxResultCarrier implements Component {
+  inner: Component | undefined;
+  sharedBox: Box | undefined;
+
+  get children(): Component[] | undefined {
+    return (this.inner as { children?: Component[] } | undefined)?.children;
+  }
+
+  render(_width: number): string[] {
+    return [];
+  }
+
+  invalidate(): void {
+    this.inner?.invalidate?.();
+    this.sharedBox?.invalidate();
   }
 }
 
@@ -305,29 +403,51 @@ function formatFallbackToolCall(
   return `${header} ${theme.fg("muted", preview)}`;
 }
 
+function formatFallbackToolResult(
+  result: { content: Array<{ type: string; text?: string; mimeType?: string }> },
+  expanded: boolean,
+  theme: Theme,
+  keyHint: (id: string, description: string) => string,
+): string | undefined {
+  const textBlocks = result.content.filter((c) => c.type === "text");
+  const output = textBlocks
+    .map((c) => (c.text || "").replace(/\x1b\[[0-9;]*[A-Za-z]/g, "").replace(/\r/g, ""))
+    .join("\n");
+  if (!output) return undefined;
+  const lines = output.split("\n");
+  const displayLines = expanded ? lines : lines.slice(0, FALLBACK_RESULT_PREVIEW_LINES);
+  const remaining = lines.length - displayLines.length;
+  let text = displayLines.map((line) => theme.fg("toolOutput", line)).join("\n");
+  if (remaining > 0) {
+    const hint = keyHint("app.tools.expand", "to expand") || "ctrl+o to expand";
+    text += `${theme.fg("muted", `\n... (${remaining} more lines,`)} ${hint}${theme.fg("muted", ")")}`;
+  }
+  return text;
+}
+
 /**
- * Create a Pi `ToolRendererResolver` that prepends a muted `toolSummary` title
- * line above Pi's built-in / MCP / extension `renderCall` output whenever the
- * call originated from Antigravity with a `toolSummary`, while leaving Codex
- * and summary-less calls 100% untouched.
+ * Create a Pi `ToolRendererResolver` that renders Antigravity's `toolSummary`
+ * outside the tool card box in Codex style (`thinkingText` + italic + 1 blank
+ * row above the tool box), while keeping `innerCall` + `innerResult` inside a
+ * single native `Box` and leaving Codex / summary-less calls 100% untouched.
  */
 export function createSummaryToolRendererResolver(
   tracker: ToolSummaryTracker,
 ): ToolRendererResolver {
   return (toolName: string, next: () => ToolRenderers | undefined): ToolRenderers | undefined => {
     const base = next();
-    if (toolName === WRAPPER_TOOL_NAME || base?.renderShell === "self") {
+    if (base?.renderShell === "self") {
       return base;
     }
     return {
-      renderShell: base?.renderShell,
+      renderShell: "self",
       renderCall(args, theme, context) {
         tracker.trackInvalidate(context.toolCallId, context.isPartial, context.invalidate);
-        const prevWrapper =
-          context.lastComponent instanceof SummaryCallContainer
+        const prevShell =
+          context.lastComponent instanceof SummaryShellContainer
             ? context.lastComponent
             : undefined;
-        const innerLast = prevWrapper ? prevWrapper.inner : context.lastComponent;
+        const innerLast = prevShell ? prevShell.inner : context.lastComponent;
 
         let inner: Component;
         if (base?.renderCall) {
@@ -341,16 +461,70 @@ export function createSummaryToolRendererResolver(
           inner = fallbackText;
         }
 
-        const summary = tracker.get(context.toolCallId);
-        if (!summary) {
-          return inner;
+        const summary =
+          tracker.get(context.toolCallId) ??
+          (toolName === WRAPPER_TOOL_NAME ? extractWrapperInputSummary(args) : undefined);
+        const styledSummary = summary ? formatCodexStyleSummary(theme, summary) : undefined;
+        const outputPad = context.outputPad ?? 1;
+        const bgFn = resolveToolBoxBgFn(theme, context.isPartial, context.isError);
+
+        const shell = prevShell ?? new SummaryShellContainer();
+        shell.update(styledSummary, outputPad, bgFn, inner);
+        if (context.state && typeof context.state === "object") {
+          (context.state as Record<symbol, unknown>)[SUMMARY_SHELL_STATE] = shell;
+        }
+        return shell;
+      },
+      renderResult(result, options, theme, context) {
+        const prevCarrier =
+          context.lastComponent instanceof SharedBoxResultCarrier
+            ? context.lastComponent
+            : undefined;
+        const innerLast = prevCarrier ? prevCarrier.inner : context.lastComponent;
+
+        let innerResult: Component | undefined;
+        if (base?.renderResult) {
+          innerResult = base.renderResult(result, options, theme, {
+            ...context,
+            lastComponent: innerLast,
+          });
+        } else {
+          const fallback = formatFallbackToolResult(
+            result as { content: Array<{ type: string; text?: string; mimeType?: string }> },
+            options.expanded,
+            theme,
+            (id, desc) =>
+              typeof (context as { keyHint?: unknown }).keyHint === "function"
+                ? (context as { keyHint: (k: string, d: string) => string }).keyHint(id, desc)
+                : "",
+          );
+          if (fallback) {
+            const fallbackText = innerLast instanceof Text ? innerLast : new Text("", 0, 0);
+            fallbackText.setText(fallback);
+            innerResult = fallbackText;
+          }
         }
 
-        const container = prevWrapper ?? new SummaryCallContainer();
-        container.update(theme.fg("muted", summary), inner);
-        return container;
+        const shell =
+          context.state && typeof context.state === "object"
+            ? ((context.state as Record<symbol, SummaryShellContainer | undefined>)[
+                SUMMARY_SHELL_STATE
+              ] ?? undefined)
+            : undefined;
+
+        if (shell) {
+          shell.sharedBox.setBgFn(resolveToolBoxBgFn(theme, options.isPartial, context.isError));
+          if (innerResult) {
+            shell.sharedBox.addChild(innerResult);
+          }
+          const carrier = prevCarrier ?? new SharedBoxResultCarrier();
+          carrier.inner = innerResult;
+          carrier.sharedBox = shell.sharedBox;
+          return carrier;
+        }
+
+        return innerResult ?? new Container();
       },
-      renderResult: base?.renderResult,
     };
   };
 }

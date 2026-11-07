@@ -173,6 +173,14 @@ export class AgyPiBridge {
     return this.#tools.some((tool) => tool.name === name) || this.#dynamic.has(name);
   }
 
+  /** Return the JSON schema parameters for a bridged tool, if known. */
+  getToolParameters(name: string): unknown {
+    return (
+      this.#dynamic.get(name)?.parameters ??
+      this.#tools.find((tool) => tool.name === name)?.parameters
+    );
+  }
+
   get catalogRevision(): number {
     return this.#catalogRevision;
   }

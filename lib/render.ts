@@ -130,10 +130,18 @@ function formatGenericArgs(input: Record<string, unknown>, theme: Theme): string
  * One-line call summary, aligned with pi's native tool cards:
  * bold label + accent arguments, no dot prefix, no JSON dump.
  */
-export function formatAgyCall(tool: string, input: unknown, theme: Theme): string {
+export function formatAgyCall(
+  tool: string,
+  input: unknown,
+  theme: Theme,
+  options?: { includeSummary?: boolean },
+): string {
   const args = asRecord(input);
   const normalizedTool = normalizeAgyToolKey(tool);
-  const summary = pickArg(args, ["toolSummary", "toolAction"])?.replace(/\s+/g, " ").trim();
+  const summary =
+    options?.includeSummary === false
+      ? undefined
+      : pickArg(args, ["toolSummary", "toolAction"])?.replace(/\s+/g, " ").trim();
   const prefix = summary ? `${theme.fg("muted", summary)}\n` : "";
   const label = theme.fg("toolTitle", theme.bold(agyToolLabel(normalizedTool)));
   const invalid = theme.fg("error", "[invalid arg]");
