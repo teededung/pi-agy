@@ -88,6 +88,7 @@ const LIFECYCLE_LIMIT = 24;
 const CANCEL_GRACE_MS = 1_500;
 const TERM_CLOSE_MS = 1_000;
 const MAX_OPEN_SESSIONS = 8;
+const MAX_MODEL_LIVENESS_GRACES = 3;
 const MAX_TOOL_LIVENESS_GRACES = 12;
 const PARKED_POLL_MS = 5_000;
 
@@ -423,6 +424,7 @@ export class AgyAcpDriverSession implements AgyTurnExecutor {
       this.#conversationsDir,
       {
         ...(this.#logDir ? { logDir: this.#logDir } : {}),
+        ...(child.pid !== undefined ? { pid: child.pid } : {}),
         emitThinkingDeltas: false,
         emitStepUsage: true,
       },
@@ -804,7 +806,7 @@ export class AgyAcpDriverSession implements AgyTurnExecutor {
     const retrying = turn.thoughtTracker.isRetrying;
     if (
       (turn.thoughtTracker.isGenerating || likelyCompacting || retrying) &&
-      (graceRemainingMs > 0 || turn.stallGraces < MAX_TOOL_LIVENESS_GRACES)
+      (graceRemainingMs > 0 || turn.stallGraces < MAX_MODEL_LIVENESS_GRACES)
     ) {
       if (graceRemainingMs > 0) {
         this.#scheduleGraceCheck(turn, graceRemainingMs, epoch);
@@ -871,7 +873,11 @@ export class AgyAcpDriverSession implements AgyTurnExecutor {
       }
     }
 
-    const stallError = new AgyStallError(turn.silenceMs, toolActive);
+    const stallError = new AgyStallError(
+      turn.silenceMs,
+      toolActive,
+      turn.thoughtTracker.lastApiError,
+    );
     this.#log(`stall:expired:${turn.silenceMs}ms`);
     this.#recordRecycle("unspecified");
     await this.#killProcess("idle", stallError);

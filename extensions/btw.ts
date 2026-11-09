@@ -59,6 +59,31 @@ export const BTW_COMMANDS = [
   { name: "btw:thinking", description: "Show, set, or clear the BTW-only thinking override." },
 ] as const;
 
+export function parseOverlayBtwCommand(value: string): { name: string; args: string } | null {
+  const trimmed = value.trim();
+  const match = trimmed.match(/^\/(\S+)(?:\s+([\s\S]*))?$/);
+  if (!match) {
+    return null;
+  }
+
+  const rawCmd = match[1]!.toLowerCase();
+  const args = match[2]?.trim() ?? "";
+  // `/side` stays a main-session alias only; inside the modal it is not a command.
+  if (rawCmd === "side") {
+    return null;
+  }
+  if (rawCmd === "btw") {
+    return { name: "btw", args };
+  }
+
+  const normalized = rawCmd.startsWith("btw:") ? rawCmd : `btw:${rawCmd}`;
+  if (!BTW_COMMANDS.some((command) => command.name === normalized)) {
+    return null;
+  }
+
+  return { name: normalized, args };
+}
+
 const BTW_MESSAGE_TYPE = "btw-note";
 const BTW_ENTRY_TYPE = "btw-thread-entry";
 const BTW_RESET_TYPE = "btw-thread-reset";
@@ -2165,31 +2190,45 @@ export class BtwOverlayComponent extends Container implements Focusable {
     }
 
     if (/^\/[^\s]*$/.test(value)) {
-      this.completionItems = BTW_COMMANDS.filter((command) => `/${command.name}`.startsWith(value)).map((command) => ({
-        value: `/${command.name} `,
-        label: `/${command.name}`,
-        description: command.description,
-      }));
+      const query = value.toLowerCase();
+      const candidates = query.startsWith("/btw:")
+        ? BTW_COMMANDS
+        : [
+            ...BTW_COMMANDS.filter((command) => command.name.startsWith("btw:")).map((command) => ({
+              name: command.name.slice(4),
+              description: command.description,
+            })),
+            ...BTW_COMMANDS.filter((command) => !command.name.startsWith("btw:") && command.name !== "side"),
+          ];
+      this.completionItems = candidates
+        .filter((command) => `/${command.name}`.startsWith(query))
+        .map((command) => ({
+          value: `/${command.name} `,
+          label: `/${command.name}`,
+          description: command.description,
+        }));
       return;
     }
 
-    const modelArgMatch = value.match(/^\/btw:model\s+([^\s]*)$/i);
+    const modelArgMatch = value.match(/^(\/(?:btw:)?model)\s+([^\s]*)$/i);
     if (modelArgMatch) {
-      const argPrefix = modelArgMatch[1] ?? "";
+      const cmdPrefix = modelArgMatch[1]!.toLowerCase();
+      const argPrefix = modelArgMatch[2] ?? "";
       this.completionItems = getBtwModelCompletions(argPrefix, this.getOverlayContext()).map((item) => ({
-        value: `/btw:model ${item.value}`,
-        label: `/btw:model ${item.label}`,
+        value: `${cmdPrefix} ${item.value}`,
+        label: `${cmdPrefix} ${item.label}`,
         description: item.description,
       }));
       return;
     }
 
-    const thinkingArgMatch = value.match(/^\/btw:thinking\s+([^\s]*)$/i);
+    const thinkingArgMatch = value.match(/^(\/(?:btw:)?thinking)\s+([^\s]*)$/i);
     if (thinkingArgMatch) {
-      const argPrefix = thinkingArgMatch[1] ?? "";
+      const cmdPrefix = thinkingArgMatch[1]!.toLowerCase();
+      const argPrefix = thinkingArgMatch[2] ?? "";
       this.completionItems = getBtwThinkingCompletions(argPrefix).map((item) => ({
-        value: `/btw:thinking ${item.value}`,
-        label: `/btw:thinking ${item.label}`,
+        value: `${cmdPrefix} ${item.value}`,
+        label: `${cmdPrefix} ${item.label}`,
         description: item.description,
       }));
       return;
@@ -3831,19 +3870,6 @@ export default function (pi: ExtensionAPI) {
     }
 
     return false;
-  }
-
-  function parseOverlayBtwCommand(value: string): { name: string; args: string } | null {
-    const trimmed = value.trim();
-    const match = trimmed.match(/^\/(\S+)(?:\s+([\s\S]*))?$/);
-    if (!match || !BTW_COMMANDS.some((command) => command.name === match[1])) {
-      return null;
-    }
-
-    return {
-      name: match[1] === "side" ? "btw" : match[1],
-      args: match[2]?.trim() ?? "",
-    };
   }
 
   async function submitFromOverlay(ctx: ExtensionCommandContext | ExtensionContext, value: string): Promise<void> {

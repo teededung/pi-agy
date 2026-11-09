@@ -80,6 +80,8 @@ export interface AgyThoughtPollResult {
 export interface AgyThoughtTrackerOptions {
   /** Override `~/.gemini/antigravity-cli/log` (used in tests). */
   logDir?: string;
+  /** Spawned `agy acp` / `agy` PID for direct `acp-server-*-<pid>.log` binding. */
+  pid?: number;
   /** Clock override for deterministic compaction-grace tests. */
   now?: () => number;
   /**
@@ -498,6 +500,8 @@ export class AgyThoughtTracker {
   #compactedAfterIdx = -1;
 
   /** Incremental CLI log tail state for live compaction detection. */
+  #pid: number | undefined;
+  #boundByPid = false;
   #cliLogPath: string | undefined;
   #cliLogOffset = 0;
   #cliLogRemainder = "";
@@ -507,6 +511,7 @@ export class AgyThoughtTracker {
   #activeStreamResponseId: string | undefined;
   #streamStartMaxIdx = -1;
   #retryUntilMs = 0;
+  #lastApiError: string | undefined;
   #sawRetrySinceLastPoll = false;
 
   /** Turn-level stream synchronization state shared by AgyDriver and runAgyTurn. */
@@ -527,6 +532,7 @@ export class AgyThoughtTracker {
   ) {
     this.#conversationsDir = conversationsDir;
     this.#logDir = options?.logDir ?? defaultLogDirFromConversationsDir(conversationsDir);
+    this.#pid = options?.pid;
     this.#now = options?.now ?? Date.now;
     this.#emitThinkingDeltas = options?.emitThinkingDeltas ?? true;
     this.#emitStepUsage = options?.emitStepUsage ?? false;
@@ -534,6 +540,8 @@ export class AgyThoughtTracker {
     if (conversationId) {
       this.#conversationId = conversationId;
       this.#captureBaseline();
+    }
+    if (conversationId || this.#pid !== undefined) {
       this.#tryBindCliLog(this.#createdAtMs, true);
     }
   }
@@ -545,15 +553,18 @@ export class AgyThoughtTracker {
     this.#conversationId = conversationId;
     this.#lastUsageIdx = -1;
     this.#lastContextTokens = undefined;
-    this.#cliLogPath = undefined;
-    this.#cliLogOffset = 0;
-    this.#cliLogRemainder = "";
-    this.#pendingMonitorCalls = 0;
-    this.#activeStreamStartedAtMs = undefined;
-    this.#activeStreamResponseId = undefined;
-    this.#streamStartMaxIdx = -1;
-    this.#retryUntilMs = 0;
-    this.#sawRetrySinceLastPoll = false;
+    if (!this.#boundByPid) {
+      this.#cliLogPath = undefined;
+      this.#cliLogOffset = 0;
+      this.#cliLogRemainder = "";
+      this.#pendingMonitorCalls = 0;
+      this.#activeStreamStartedAtMs = undefined;
+      this.#activeStreamResponseId = undefined;
+      this.#streamStartMaxIdx = -1;
+      this.#retryUntilMs = 0;
+      this.#lastApiError = undefined;
+      this.#sawRetrySinceLastPoll = false;
+    }
     if (!this.#baselineCaptured) {
       // If the conversation already existed before this turn, anchor at the
       // newest USER_INPUT step so earlier turns are never replayed.
@@ -803,6 +814,11 @@ export class AgyThoughtTracker {
     return this.#lastIsGenerating;
   }
 
+  /** Last agy API error this turn (`UNAVAILABLE (code 503): No capacity ...`), if agy logged one. */
+  get lastApiError(): string | undefined {
+    return this.#lastApiError;
+  }
+
   /** True when agy logged an active in-process API/model retry (`Retry-After` / backoff). */
   get isRetrying(): boolean {
     return this.#lastIsRetrying;
@@ -813,14 +829,9 @@ export class AgyThoughtTracker {
     return this.#lastAgentProgressed;
   }
 
-  /** True when compaction is actively in flight or likely starting on a large trajectory. */
-  isLikelyCompacting(hasActiveTools: boolean): boolean {
-    return (
-      this.#emittedCompacting ||
-      (!hasActiveTools &&
-        this.#lastAwaitingPlannerAfterStep &&
-        (this.#lastContextTokens ?? 0) >= MIN_COMPACTION_CONTEXT_TOKENS)
-    );
+  /** True when compaction is actively in flight in SQLite or CLI/ACP logs. */
+  isLikelyCompacting(_hasActiveTools?: boolean): boolean {
+    return this.#emittedCompacting;
   }
 
   /** Emit `{ type: "compacting", active: false }` if a compaction indicator is still active. */
@@ -995,7 +1006,7 @@ export class AgyThoughtTracker {
   }
 
   #tryBindCliLog(nowMs: number, atTurnStart: boolean): void {
-    if (this.#cliLogPath || !this.#conversationId) return;
+    if (this.#cliLogPath || (!this.#conversationId && this.#pid === undefined)) return;
     if (nowMs - this.#lastCliLogScanAtMs < 1_000 && this.#lastCliLogScanAtMs > 0) return;
     this.#lastCliLogScanAtMs = nowMs;
     try {
@@ -1006,33 +1017,41 @@ export class AgyThoughtTracker {
           name.endsWith(".log"),
       );
       if (names.length === 0) return;
-      const candidates: Array<{ path: string; size: number; mtimeMs: number }> = [];
+      const pidSuffix = this.#pid !== undefined ? `-${this.#pid}.log` : undefined;
+      const candidates: Array<{ path: string; name: string; size: number; mtimeMs: number }> = [];
       for (const name of names) {
         const p = join(this.#logDir, name);
         try {
           const st = statSync(p);
           if (st.isFile() && st.size > 0) {
-            candidates.push({ path: p, size: st.size, mtimeMs: st.mtimeMs });
+            candidates.push({ path: p, name, size: st.size, mtimeMs: st.mtimeMs });
           }
         } catch {}
       }
       candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
-      const cid = this.#conversationId;
-      for (const candidate of candidates.slice(0, 4)) {
-        const tailBytes = Math.min(candidate.size, 131_072);
-        const startOffset = candidate.size - tailBytes;
-        const buf = readFileSlice(candidate.path, startOffset, tailBytes);
-        if (!buf) continue;
-        const text = buf.toString("utf8");
-        if (!text.includes(cid)) continue;
 
+      const bindCandidate = (
+        candidate: { path: string; size: number },
+        byPid: boolean,
+        tailText?: string,
+      ): void => {
         this.#cliLogPath = candidate.path;
-        if (atTurnStart) {
+        this.#boundByPid = byPid;
+        if (atTurnStart || !this.#conversationId) {
           // Bound before writing this turn's user message: only tail newly appended bytes.
           this.#cliLogOffset = candidate.size;
           this.#cliLogRemainder = "";
           return;
         }
+        const cid = this.#conversationId;
+        const text =
+          tailText ??
+          readFileSlice(
+            candidate.path,
+            candidate.size - Math.min(candidate.size, 131_072),
+            Math.min(candidate.size, 131_072),
+          )?.toString("utf8") ??
+          "";
         // Bound mid-turn: anchor at the latest user-message forwarding marker for this conversation.
         const forwardMarker = `Forwarding user message to conversation ${cid}`;
         const sendMarker = `Sending user message to conversation ${cid}`;
@@ -1049,6 +1068,28 @@ export class AgyThoughtTracker {
           this.#cliLogOffset = candidate.size;
           this.#cliLogRemainder = "";
         }
+      };
+
+      if (pidSuffix) {
+        const pidMatch = candidates.find(
+          (c) => c.name.startsWith("acp-server-") && c.name.endsWith(pidSuffix),
+        );
+        if (pidMatch) {
+          bindCandidate(pidMatch, true);
+          return;
+        }
+      }
+
+      const cid = this.#conversationId;
+      if (!cid) return;
+      for (const candidate of candidates.slice(0, 4)) {
+        const tailBytes = Math.min(candidate.size, 131_072);
+        const startOffset = candidate.size - tailBytes;
+        const buf = readFileSlice(candidate.path, startOffset, tailBytes);
+        if (!buf) continue;
+        const text = buf.toString("utf8");
+        if (!text.includes(cid)) continue;
+        bindCandidate(candidate, false, text);
         return;
       }
     } catch {}
@@ -1144,6 +1185,7 @@ export class AgyThoughtTracker {
         this.#activeStreamResponseId = undefined;
         this.#streamStartMaxIdx = -1;
         this.#retryUntilMs = 0;
+        this.#lastApiError = undefined;
         this.#sawRetrySinceLastPoll = false;
         continue;
       }
@@ -1158,6 +1200,8 @@ export class AgyThoughtTracker {
         if (isInitialReplay && parsedMs !== undefined && nowMs - parsedMs > 120_000) {
           continue;
         }
+        const apiError = /\battempt \d+ failed \((.+)\), retrying in/.exec(line);
+        if (apiError) this.#lastApiError = apiError[1];
         const delayMs = Math.min(parseGoDurationMs(retryMatch[1]!) ?? 30_000, 120_000);
         const untilMs = (parsedMs ?? nowMs) + delayMs + 15_000;
         if (untilMs > nowMs) {
@@ -1186,6 +1230,8 @@ export class AgyThoughtTracker {
         if (isInitialReplay && parsedMs !== undefined && nowMs - parsedMs > 180_000) {
           continue;
         }
+        // A response arrived, so any earlier API error was recovered by agy's own retry.
+        this.#lastApiError = undefined;
         const respIdMatch = /\bResponseID:\s*([A-Za-z0-9_-]+)/.exec(line);
         this.#activeStreamStartedAtMs = parsedMs ?? nowMs;
         this.#activeStreamResponseId = respIdMatch?.[1];

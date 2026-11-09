@@ -184,6 +184,7 @@ const TERM_CLOSE_MS = 500;
  */
 const STALL_PARKED_POLL_MS = 10_000;
 const STALL_PARKED_LIMIT = 2;
+const MAX_MODEL_LIVENESS_GRACES = 3;
 /**
  * While a tool step is ACTIVE, poll the off-stream transcript this often for a
  * final answer agy is withholding. agy emits nothing on stdout for the whole
@@ -925,9 +926,10 @@ export class AgyDriverSession implements AgyTurnExecutor {
     // CHECKPOINT step, do not count this window as a dead stream while within the grace ceiling.
     const likelyCompacting = turn.thoughtTracker.isLikelyCompacting(toolActive);
     const retrying = turn.thoughtTracker.isRetrying;
+    const modelGraceLimit = Math.min(this.#stallGraceLimit, MAX_MODEL_LIVENESS_GRACES);
     if (
       (turn.thoughtTracker.isGenerating || likelyCompacting || retrying) &&
-      (graceRemainingMs > 0 || turn.stallGraces < this.#stallGraceLimit)
+      (graceRemainingMs > 0 || turn.stallGraces < modelGraceLimit)
     ) {
       if (graceRemainingMs > 0) {
         this.#scheduleGraceCheck(turn, graceRemainingMs, epoch);
@@ -1065,7 +1067,7 @@ export class AgyDriverSession implements AgyTurnExecutor {
 
     await this.#terminateTurn(
       turn,
-      { error: new AgyStallError(turn.silenceMs, toolActive) },
+      { error: new AgyStallError(turn.silenceMs, toolActive, turn.thoughtTracker.lastApiError) },
       child,
     );
   }

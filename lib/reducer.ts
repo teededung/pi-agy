@@ -62,6 +62,8 @@ export type AgyActivity =
       maxRetries: number;
       stalledMs: number;
       toolActive: boolean;
+      /** Last agy-side API error before the stall, when agy logged one. */
+      apiError?: string;
     }
   | {
       /** Synthetic — emitted in ACP mode when agy's internal runner recovers

@@ -42,9 +42,11 @@ import {
 import { Text } from "@earendil-works/pi-tui";
 import type { Theme, ToolRenderers } from "@earendil-works/pi-coding-agent";
 import {
+  BTW_COMMANDS,
   BtwOverlayComponent,
   buildOverlayTranscript,
   formatInlineBtwToolLine,
+  parseOverlayBtwCommand,
   resolveBtwOverlayPalette,
 } from "../extensions/btw.ts";
 import {
@@ -1564,6 +1566,43 @@ test("/btw overlay palette and transcript render crisp thinking/tool colors and 
   const unfocusedInputRow = unfocusedRows[unfocusedRows.length - 3]!;
   assert.ok(!unfocusedInputRow.includes("\x1b_pi:fc\x07"), "unfocused composer hides fake cursor");
   assert.match(stripAnsi(unfocusedInputRow), /^│ ❯ Press .* to focus BTW input/);
+
+  // Main session command registrations remain /btw:* (plus /btw and /side)
+  assert.ok(
+    BTW_COMMANDS.every((c) => c.name === "btw" || c.name === "side" || c.name.startsWith("btw:")),
+    "main session commands keep /btw: prefix",
+  );
+
+  // Overlay command parser accepts both unprefixed and /btw: commands inside modal
+  assert.deepEqual(parseOverlayBtwCommand("/new check this"), { name: "btw:new", args: "check this" });
+  assert.deepEqual(parseOverlayBtwCommand("/clear"), { name: "btw:clear", args: "" });
+  assert.deepEqual(parseOverlayBtwCommand("/model argon"), { name: "btw:model", args: "argon" });
+  assert.deepEqual(parseOverlayBtwCommand("/thinking high"), { name: "btw:thinking", args: "high" });
+  assert.deepEqual(parseOverlayBtwCommand("/btw:model sonnet"), { name: "btw:model", args: "sonnet" });
+  assert.deepEqual(parseOverlayBtwCommand("/btw hello"), { name: "btw", args: "hello" });
+  assert.equal(parseOverlayBtwCommand("/side hello"), null);
+  assert.equal(parseOverlayBtwCommand("/unknown"), null);
+
+  // Overlay completions suggest unprefixed commands on `/m`, `/model `, `/thinking `, and prefixed on `/btw:m`
+  overlay.focused = true;
+  overlay.setDraft("/m");
+  const slashMPlain = overlay.render(80).map(stripAnsi).join("\n");
+  assert.match(slashMPlain, /→ \/minimize/);
+  assert.match(slashMPlain, /\/model/);
+  assert.doesNotMatch(slashMPlain, /\/btw:model/);
+
+  overlay.setDraft("/btw:m");
+  const slashBtwMPlain = overlay.render(80).map(stripAnsi).join("\n");
+  assert.match(slashBtwMPlain, /→ \/btw:minimize/);
+  assert.match(slashBtwMPlain, /\/btw:model/);
+
+  overlay.setDraft("/model argon");
+  const modelArgPlain = overlay.render(80).map(stripAnsi).join("\n");
+  assert.match(modelArgPlain, /→ \/model argon/);
+
+  overlay.setDraft("/thinking h");
+  const thinkingArgPlain = overlay.render(80).map(stripAnsi).join("\n");
+  assert.match(thinkingArgPlain, /\/thinking high/);
 });
 
 test("AgyAcpDriverSession rejects stalls with AgyStallError and AgyThoughtTracker binds acp-server-*.log", async () => {
@@ -1694,7 +1733,10 @@ test("AgyAcpDriverSession rejects stalls with AgyStallError and AgyThoughtTracke
     nowMs = new Date(2026, 10, 7, 13, 7, 50, 100).getTime();
     assert.equal(tracker.poll().isCompacting, false);
     nowMs += 3_000;
-    assert.equal(tracker.poll().isCompacting, false);
+    tracker.sync(cid, () => {});
+    // When >=100k context is simply waiting on the next planner request (e.g. hung upstream
+    // before HTTP headers arrive), isLikelyCompacting MUST be false so 90s stall detection fires.
+    assert.equal(tracker.isLikelyCompacting(false), false);
 
     // And if an active stream logs `retrying in 4s`, isCompacting resets to false and isRetrying turns true
     writeFileSync(
@@ -1715,6 +1757,36 @@ test("AgyAcpDriverSession rejects stalls with AgyStallError and AgyThoughtTracke
     assert.equal(retryPoll.isRetrying, true);
 
     tracker.close();
+
+    // Direct PID binding (`acp-server-*-<pid>.log`) stays bound even after >128KB of monitor logs
+    const filler = "I1107 13:08:00.000000 9 runner.go:453] Monitor severe_internal_risks_agy SKIPPED\n".repeat(
+      2_000,
+    );
+    writeFileSync(
+      acpLogPath,
+      `I1107 13:07:40.000000 1 server.go:1826] Sending user message to conversation ${cid} (items=1, media=0)\n${filler}`,
+      "utf8",
+    );
+    const pidTracker = new AgyThoughtTracker(cid, tmpDir, {
+      logDir: tmpDir,
+      pid: 77287,
+      now: () => nowMs,
+      emitThinkingDeltas: false,
+    });
+    pidTracker.sync(cid, () => {});
+    assert.equal(pidTracker.isLikelyCompacting(false), false);
+    writeFileSync(
+      acpLogPath,
+      `I1107 13:07:40.000000 1 server.go:1826] Sending user message to conversation ${cid} (items=1, media=0)\n${filler}` +
+        `I1107 13:08:05.000000 10 http_helpers.go:653] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse Trace: 0x9 ResponseID: resp-compact\n`,
+      "utf8",
+    );
+    nowMs = new Date(2026, 10, 7, 13, 8, 5, 0).getTime();
+    pidTracker.sync(cid, () => {});
+    nowMs += 2_000;
+    pidTracker.sync(cid, () => {});
+    assert.equal(pidTracker.isLikelyCompacting(false), true);
+    pidTracker.close();
   } finally {
     rmSync(tmpDir, { recursive: true, force: true });
   }
@@ -1862,3 +1934,73 @@ test("AgyAcpDriverSession rejects stalls with AgyStallError and AgyThoughtTracke
 
 
 
+
+test("agy 503 'No capacity' is surfaced on AgyStallError and the runtime fails fast instead of restarting", async () => {
+  const tmpDir = mkdtempSync(path.join(tmpdir(), "agy-capacity-"));
+  try {
+    // Tracker remembers agy's last API error and forgets it once a response arrives.
+    const cap =
+      "UNAVAILABLE (code 503): No capacity available for model gemini-4-argon-high on the server";
+    const logPath = path.join(tmpDir, "acp-server-20261109_220232-4242.log");
+    const cid = "conv-capacity";
+    writeFileSync(
+      logPath,
+      `I1109 22:02:34.000000 1 server.go:1826] Sending user message to conversation ${cid} (items=1, media=0)\n`,
+      "utf8",
+    );
+    let nowMs = new Date(2026, 10, 9, 22, 2, 34, 0).getTime();
+    const tracker = new AgyThoughtTracker(cid, tmpDir, {
+      logDir: tmpDir,
+      pid: 4242,
+      now: () => nowMs,
+      emitThinkingDeltas: false,
+    });
+    tracker.sync(cid, () => {});
+    assert.equal(tracker.lastApiError, undefined);
+    writeFileSync(
+      logPath,
+      `I1109 22:02:34.000000 1 server.go:1826] Sending user message to conversation ${cid} (items=1, media=0)\n` +
+        `I1109 22:03:31.000000 402 run.go:315] Run: attempt 1 failed (${cap}), retrying in 4s\n`,
+      "utf8",
+    );
+    nowMs = new Date(2026, 10, 9, 22, 3, 32, 0).getTime();
+    tracker.sync(cid, () => {});
+    assert.equal(tracker.lastApiError, cap);
+    tracker.close();
+
+    const err = new AgyStallError(90_000, false, tracker.lastApiError);
+    assert.equal(err.isCapacity, true);
+    assert.match(err.message, /No capacity available for model gemini-4-argon-high/);
+    assert.equal(new AgyStallError(90_000, false, "INTERNAL (code 500): Internal error").isCapacity, false);
+    assert.equal(new AgyStallError(90_000, false).isCapacity, false);
+
+    // Runtime: capacity stall => exactly one executor call, no restart, no fresh-conversation fallback.
+    let calls = 0;
+    const runtime = createAntigravityRuntime(async (req) => {
+      calls += 1;
+      req.onConversation?.("conv-capacity-run");
+      throw err;
+    });
+    try {
+      const svc = runtime.runSync(AntigravityRuntime);
+      const ctrl = await runtime.runPromise(
+        svc.beginStreamTurn({ prompt: "hi", systemPrompt: "Sys", modelId: "gemini-4-argon" }),
+      );
+      const seen: string[] = [];
+      await assert.rejects(async () => {
+        for (;;) {
+          const act = await ctrl.next();
+          if (act === null) break;
+          seen.push(act.type);
+        }
+      }, /no capacity for this model right now .*No capacity available/i);
+      assert.equal(calls, 1);
+      assert.ok(!seen.includes("stall") && !seen.includes("conversation_fallback"));
+      await runtime.runPromise(svc.finishTurn);
+    } finally {
+      await runtime.dispose();
+    }
+  } finally {
+    rmSync(tmpDir, { recursive: true, force: true });
+  }
+});

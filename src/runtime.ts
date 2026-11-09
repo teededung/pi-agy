@@ -718,6 +718,13 @@ const makeRuntime = (
                     if (!(error instanceof AgyStallError)) {
                       throw error;
                     }
+                    // Restarting (or a fresh conversation) only re-queues behind the same
+                    // capacity wall; agy already retried in-process with its own backoff.
+                    if (error.isCapacity) {
+                      throw new Error(
+                        `Antigravity has no capacity for this model right now (${error.apiError}). Retry later or switch model.`,
+                      );
+                    }
                     if (retry >= stallMaxRetries) {
                       if (
                         resumableConversationId !== undefined &&
@@ -747,6 +754,7 @@ const makeRuntime = (
                       maxRetries: stallMaxRetries,
                       stalledMs: error.stalledMs,
                       toolActive: error.toolActive,
+                      ...(error.apiError ? { apiError: error.apiError } : {}),
                     });
                     if (!(await waitForRetryBackoff(stallRetryBackoffMs, turnAbort.signal))) {
                       throw abortFailure();

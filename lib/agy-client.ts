@@ -134,16 +134,24 @@ export class AgySpawnError extends Error {
 export class AgyStallError extends Error {
   readonly stalledMs: number;
   readonly toolActive: boolean;
+  /** Last agy-side API error (e.g. `UNAVAILABLE (code 503): No capacity ...`) seen before the stall. */
+  readonly apiError?: string;
 
-  constructor(stalledMs: number, toolActive: boolean) {
+  constructor(stalledMs: number, toolActive: boolean, apiError?: string) {
     super(
       `agy stream stalled: no events for ${Math.round(stalledMs / 1000)}s${
         toolActive ? " while a tool step was active" : ""
-      }`,
+      }${apiError ? ` (agy: ${apiError})` : ""}`,
     );
     this.name = "AgyStallError";
     this.stalledMs = stalledMs;
     this.toolActive = toolActive;
+    if (apiError) this.apiError = apiError;
+  }
+
+  /** Server has no capacity for the model: restarting only re-queues the request, so callers should not retry. */
+  get isCapacity(): boolean {
+    return /\bNo capacity available\b/i.test(this.apiError ?? "");
   }
 }
 
@@ -526,7 +534,7 @@ async function runSingleAgyTurn(request: AgyTurnRequest): Promise<AgyTurnOutcome
           const likelyCompacting = thoughtTracker.isLikelyCompacting(activeTools.size > 0);
           if (
             (thoughtTracker.isGenerating || likelyCompacting || thoughtTracker.isRetrying) &&
-            stallGraces < 6
+            stallGraces < 3
           ) {
             stallGraces += 1;
             armStall();
@@ -535,7 +543,7 @@ async function runSingleAgyTurn(request: AgyTurnRequest): Promise<AgyTurnOutcome
           killAgyTree(child);
           untrack();
           finishLogical(() => {
-            reject(new AgyStallError(budgetMs, activeTools.size > 0));
+            reject(new AgyStallError(budgetMs, activeTools.size > 0, thoughtTracker.lastApiError));
           });
         }, budgetMs);
       };

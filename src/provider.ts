@@ -1861,7 +1861,8 @@ export function streamAntigravity(
           const summary =
             `agy stream stalled for ${seconds}s with no events` +
             `${activity.toolActive ? " while a tool step was active" : ""}` +
-            ` — restarting the turn (retry ${activity.retry} of ${activity.maxRetries})`;
+            ` — restarting the turn (retry ${activity.retry} of ${activity.maxRetries})` +
+            `${activity.apiError ? ` · agy: ${activity.apiError}` : ""}`;
           emitThoughtSummaryLine(summary);
         };
 
