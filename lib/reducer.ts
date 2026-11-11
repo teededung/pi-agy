@@ -62,6 +62,10 @@ export type AgyActivity =
       maxRetries: number;
       stalledMs: number;
       toolActive: boolean;
+      /** Progressive retry backoff delay in milliseconds before the next attempt starts. */
+      backoffMs?: number;
+      /** True when emitted inline inside an already-started assistant message. */
+      inline?: boolean;
       /** Last agy-side API error before the stall, when agy logged one. */
       apiError?: string;
     }
@@ -86,6 +90,16 @@ export type AgyActivity =
       type: "compacting";
       active: boolean;
       beforeTokens?: number;
+    }
+  | {
+      /** Live native agy retry status (detected via CLI/ACP log backoff lines). */
+      type: "retrying";
+      active: boolean;
+      attempt?: number;
+      maxAttempts?: number;
+      delaySeconds?: number;
+      message?: string;
+      apiError?: string;
     }
   | {
       /** Completed native context compaction (`step_type: "checkpoint", state: "DONE"`). */
@@ -409,6 +423,7 @@ export function isAgyProgressActivity(
     case "usage":
       return true;
     case "compacting":
+    case "retrying":
       return activity.active;
     default:
       return false;

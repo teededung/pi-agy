@@ -14,6 +14,7 @@ import {
   AcpTurnNormalizer,
   AgyAcpClient,
   AgyAcpRpcError,
+  acpEmptyTurnApiFailure,
   acpUsageToAgyUsage,
   buildAcpAgyArgs,
   buildAcpChildEnvironment,
@@ -26,9 +27,14 @@ import {
   selectAcpPermissionOutcome,
   type AcpChildProcess,
 } from "../lib/agy-acp-client.ts";
-import { AgyThoughtTracker, extractUsageFromStepPayload } from "../lib/agy-thoughts.ts";
+import {
+  AgyThoughtTracker,
+  extractUsageFromStepPayload,
+  formatAgyRetryStatus,
+} from "../lib/agy-thoughts.ts";
+import { AGY_COMPACTION_ENTRY, AGY_STALL_ENTRY, formatAgyStallSummary } from "../lib/agy-compaction.ts";
 import { AgyStallError } from "../lib/agy-client.ts";
-import { newTurnOutcome } from "../lib/reducer.ts";
+import { newTurnOutcome, type AgyActivity } from "../lib/reducer.ts";
 import { AgyPiBridge } from "../lib/bridge.ts";
 import { createAgyTurnExecutor } from "../lib/agy-driver.ts";
 import { createPrivateMcpConfig } from "../lib/mcp-config.ts";
@@ -54,7 +60,13 @@ import {
   isBridgedMcpStep,
   streamAntigravity,
 } from "../src/provider.ts";
-import { AntigravityRuntime, createAntigravityRuntime, runAntigravity } from "../src/runtime.ts";
+import {
+  AntigravityRuntime,
+  DEFAULT_STALL_RETRY_BACKOFF_MS,
+  computeStallRetryBackoffMs,
+  createAntigravityRuntime,
+  runAntigravity,
+} from "../src/runtime.ts";
 
 interface MockRpcCall {
   id?: number | string;
@@ -2002,5 +2014,323 @@ test("agy 503 'No capacity' is surfaced on AgyStallError and the runtime fails f
     }
   } finally {
     rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("acpEmptyTurnApiFailure turns agy's silent end_turn after exhausted 503 retries into an error", () => {
+  const cap = "UNAVAILABLE (code 503): No capacity available for model gemini-3.8-flash-medium on the server";
+  assert.match(acpEmptyTurnApiFailure("end_turn", "", cap)!, /gave up retrying .*No capacity available/);
+  assert.match(acpEmptyTurnApiFailure("end_turn", "  \n", cap)!, /gave up retrying/);
+  // Real text, no recorded API error, or non-end_turn reasons keep their normal handling.
+  assert.equal(acpEmptyTurnApiFailure("end_turn", "done", cap), undefined);
+  assert.equal(acpEmptyTurnApiFailure("end_turn", "", undefined), undefined);
+  assert.equal(acpEmptyTurnApiFailure("refusal", "", cap), undefined);
+});
+
+test("AgyThoughtTracker waits for its own acp-server-<pid>.log instead of binding a dead log for the same resumed conversation", () => {
+  const tmpDir = mkdtempSync(path.join(tmpdir(), "pi-agy-pid-race-"));
+  const cid = "6cfbf1bc-588f-46d5-a25e-ad5b332691d0";
+  try {
+    const dbPath = path.join(tmpDir, `${cid}.db`);
+    const db = new DatabaseSync(dbPath);
+    db.exec(
+      "CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, step_payload BLOB)",
+    );
+    const encodeVarint = (value: number): number[] => {
+      const out: number[] = [];
+      let v = value;
+      while (v >= 0x80) {
+        out.push((v & 0x7f) | 0x80);
+        v = Math.floor(v / 128);
+      }
+      out.push(v);
+      return out;
+    };
+    const genMeta = Buffer.from([
+      0x10,
+      ...encodeVarint(5_251),
+      0x18,
+      ...encodeVarint(1_200),
+      0x28,
+      ...encodeVarint(260_000),
+    ]);
+    const stepMeta = Buffer.from([0x4a, ...encodeVarint(genMeta.length), ...genMeta]);
+    const stepPayload = Buffer.from([0x2a, ...encodeVarint(stepMeta.length), ...stepMeta]);
+    db.prepare("INSERT INTO steps (idx, step_type, status, step_payload) VALUES (?, ?, ?, ?)").run(
+      87,
+      15,
+      3,
+      stepPayload,
+    );
+    db.prepare("INSERT INTO steps (idx, step_type, status, step_payload) VALUES (?, ?, ?, ?)").run(
+      88,
+      132,
+      3,
+      Buffer.from("Check raw jump table dwords"),
+    );
+    db.close();
+
+    // Dead ACP server log from the previous killed process already references `cid`.
+    const deadLogPath = path.join(tmpDir, "acp-server-20261111_090807-21717.log");
+    writeFileSync(
+      deadLogPath,
+      `I1111 09:08:09.000000 1 server.go:1817] Sending user message to conversation ${cid} (items=1, media=0)\n`,
+      "utf8",
+    );
+
+    let nowMs = new Date(2026, 10, 11, 9, 12, 59, 0).getTime();
+    // Newly spawned process (pid 22847) has NOT opened `acp-server-*-22847.log` yet at t=0ms.
+    const tracker = new AgyThoughtTracker(cid, tmpDir, {
+      logDir: tmpDir,
+      pid: 22847,
+      now: () => nowMs,
+      emitThinkingDeltas: false,
+    });
+    const activities: AgyActivity[] = [];
+    tracker.sync(cid, (a) => activities.push(a));
+    assert.equal(tracker.isLikelyCompacting(false), false);
+
+    // 250ms later, Go creates `acp-server-*-22847.log` (initially empty), then logs compaction HTTP call.
+    const liveLogPath = path.join(tmpDir, "acp-server-20261111_091259-22847.log");
+    writeFileSync(liveLogPath, "", "utf8");
+    nowMs += 250;
+    tracker.sync(cid, (a) => activities.push(a));
+
+    writeFileSync(
+      liveLogPath,
+      [
+        `I1111 09:13:01.000000 30 server.go:1817] Sending user message to conversation ${cid} (items=1, media=0)`,
+        `I1111 09:13:10.000000 42 http_helpers.go:654] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse Trace: 0x1 ResponseID: resp-compact-22847`,
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    nowMs = new Date(2026, 10, 11, 9, 13, 10, 0).getTime();
+    tracker.sync(cid, (a) => activities.push(a));
+    nowMs += 2_500;
+    tracker.sync(cid, (a) => activities.push(a));
+    assert.equal(tracker.isLikelyCompacting(false), true);
+    assert.deepEqual(activities, [
+      { type: "compacting", active: true, beforeTokens: 265_251 },
+    ]);
+    tracker.close();
+  } finally {
+    rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("AgyThoughtTracker emits native-style retrying status and runtime scales stall retry backoff progressively", () => {
+  assert.equal(DEFAULT_STALL_RETRY_BACKOFF_MS, 3_000);
+  assert.equal(computeStallRetryBackoffMs(3_000, 1), 3_000);
+  assert.equal(computeStallRetryBackoffMs(3_000, 2), 9_000);
+  assert.equal(computeStallRetryBackoffMs(3_000, 3), 27_000);
+  assert.equal(computeStallRetryBackoffMs(3_000, 4), 30_000);
+  assert.equal(computeStallRetryBackoffMs(0, 2), 0);
+  assert.equal(
+    formatAgyRetryStatus(
+      2,
+      9,
+      3,
+      "UNAVAILABLE (code 503): No capacity available for model gemini-4-argon-high on the server",
+    ),
+    "Model unavailable (attempt 2/9), retrying in 3s...",
+  );
+  assert.equal(
+    formatAgyStallSummary({
+      retry: 2,
+      maxRetries: 3,
+      stalledMs: 90_000,
+      toolActive: false,
+      backoffMs: 9_000,
+    }),
+    "agy stream stalled for 90s with no events — restarting the turn (attempt 2/3), retrying in 9s...",
+  );
+
+  const tmpDir = mkdtempSync(path.join(tmpdir(), "pi-agy-retry-ui-"));
+  const cid = "22641d79-f551-4439-a03e-63d67f5f1726";
+  try {
+    const logPath = path.join(tmpDir, "acp-server-20261111_100226-16266.log");
+    writeFileSync(
+      logPath,
+      `I1111 10:02:26.000000 1 server.go:1817] Sending user message to conversation ${cid} (items=1, media=0)\n`,
+      "utf8",
+    );
+    let nowMs = new Date(2026, 10, 11, 10, 2, 26, 0).getTime();
+    const tracker = new AgyThoughtTracker(cid, tmpDir, {
+      logDir: tmpDir,
+      pid: 16266,
+      now: () => nowMs,
+      emitThinkingDeltas: false,
+    });
+    const events: AgyActivity[] = [];
+    tracker.sync(cid, (a) => events.push(a));
+
+    writeFileSync(
+      logPath,
+      [
+        `I1111 10:02:26.000000 1 server.go:1817] Sending user message to conversation ${cid} (items=1, media=0)`,
+        `W1111 10:02:32.333805 16266 run.go:257] [${cid}] attempt 1 failed (UNAVAILABLE (code 503): No capacity available for model gemini-4-argon-high on the server), retrying in 3.2s`,
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    nowMs = new Date(2026, 10, 11, 10, 2, 32, 500).getTime();
+    tracker.sync(cid, (a) => events.push(a));
+    // Re-polling while the same attempt is still sleeping must not re-emit duplicate events.
+    nowMs += 500;
+    tracker.sync(cid, (a) => events.push(a));
+    assert.equal(events.length, 1);
+    assert.deepEqual(events[0], {
+      type: "retrying",
+      active: true,
+      attempt: 2,
+      maxAttempts: 9,
+      delaySeconds: 3,
+      message: "Model unavailable (attempt 2/9), retrying in 3s...",
+      apiError:
+        "UNAVAILABLE (code 503): No capacity available for model gemini-4-argon-high on the server",
+    });
+
+    writeFileSync(
+      logPath,
+      [
+        `I1111 10:02:26.000000 1 server.go:1817] Sending user message to conversation ${cid} (items=1, media=0)`,
+        `W1111 10:02:32.333805 16266 run.go:257] [${cid}] attempt 1 failed (UNAVAILABLE (code 503): No capacity available for model gemini-4-argon-high on the server), retrying in 3.2s`,
+        `W1111 10:03:00.289695 16266 run.go:257] [${cid}] attempt 4 failed (UNAVAILABLE (code 503): No capacity available for model gemini-4-argon-high on the server), retrying in 25.1s`,
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    nowMs = new Date(2026, 10, 11, 10, 3, 0, 500).getTime();
+    tracker.sync(cid, (a) => events.push(a));
+    assert.equal(events.length, 2);
+    assert.equal(
+      events[1]?.type === "retrying" ? events[1].message : "",
+      "Model unavailable (attempt 5/9), retrying in 25s...",
+    );
+
+    // Once upstream responds, `retrying` clears immediately.
+    writeFileSync(
+      logPath,
+      [
+        `I1111 10:02:26.000000 1 server.go:1817] Sending user message to conversation ${cid} (items=1, media=0)`,
+        `W1111 10:02:32.333805 16266 run.go:257] [${cid}] attempt 1 failed (UNAVAILABLE (code 503): No capacity available for model gemini-4-argon-high on the server), retrying in 3.2s`,
+        `W1111 10:03:00.289695 16266 run.go:257] [${cid}] attempt 4 failed (UNAVAILABLE (code 503): No capacity available for model gemini-4-argon-high on the server), retrying in 25.1s`,
+        `I1111 10:03:26.000000 16266 http_helpers.go:654] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse Trace: 0x2 ResponseID: resp-ok`,
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    nowMs = new Date(2026, 10, 11, 10, 3, 26, 100).getTime();
+    tracker.sync(cid, (a) => events.push(a));
+    assert.deepEqual(events[2], { type: "retrying", active: false });
+    tracker.close();
+  } finally {
+    rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("streamAntigravity keeps pre-compaction stall entries chronologically ahead of [compaction] and post-compaction content", async () => {
+  const prevBackoff = process.env.AGY_STALL_RETRY_BACKOFF_MS;
+  const prevPace = process.env.PI_ANTIGRAVITY_THINKING_PACE;
+  process.env.AGY_STALL_RETRY_BACKOFF_MS = "1";
+  process.env.PI_ANTIGRAVITY_THINKING_PACE = "0";
+
+  let attempt = 0;
+  const runtime = createAntigravityRuntime(async (request) => {
+    attempt += 1;
+    request.onConversation?.("conv-stall-compact");
+    if (attempt <= 3) {
+      throw new AgyStallError(90_000, false);
+    }
+    request.onActivity?.({
+      type: "checkpoint",
+      stepId: 89,
+      conversationId: "conv-stall-compact",
+      beforeTokens: 265_251,
+      summary: "Compacted summary",
+    });
+    request.onActivity?.({ type: "thinking_delta", delta: "Post-compaction thought", stepId: 90 });
+    request.onActivity?.({ type: "text", delta: "Resumed answer", stepId: 90 });
+    const result: AgyActivity = {
+      type: "result",
+      status: "OK",
+      response: "Resumed answer",
+      usage: { input_tokens: 12_000, output_tokens: 40, total_tokens: 12_040 },
+    };
+    request.onActivity?.(result);
+    return {
+      conversationId: "conv-stall-compact",
+      status: "OK",
+      response: "Resumed answer",
+      activities: [result],
+      usage: result.usage,
+      finished: true,
+    };
+  });
+
+  try {
+    const service = runtime.runSync(AntigravityRuntime);
+    const customEntries: Array<{ customType: string; summary?: string }> = [];
+    const streamFn = streamAntigravity(
+      runtime,
+      service,
+      new AgyReplayStore(),
+      new AgyPiBridge("pi-test"),
+      undefined,
+      undefined,
+      undefined,
+      (activity) => {
+        if (activity.type === "stall" && !activity.inline) {
+          customEntries.push({
+            customType: AGY_STALL_ENTRY,
+            summary: formatAgyStallSummary(activity),
+          });
+        } else if (activity.type === "checkpoint") {
+          customEntries.push({ customType: AGY_COMPACTION_ENTRY });
+        }
+      },
+    );
+
+    const model: Model<string> = {
+      id: "gemini-4-argon",
+      name: "Gemini 4 Argon",
+      api: "antigravity-stream-json",
+      provider: "antigravity",
+      baseUrl: "agy://local-stream-json",
+      reasoning: true,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 1_000_000,
+      maxTokens: 64_000,
+    };
+    const ctx = {
+      messages: [{ role: "user", content: "Continue after bridged tool", timestamp: 1 }],
+    } as unknown as TranscriptContext;
+
+    let finalBlocks: Array<{ type: string; thinking?: string; text?: string }> = [];
+    for await (const ev of streamFn(model, ctx, {})) {
+      if (ev.type === "done") {
+        finalBlocks = ev.message.content as Array<{ type: string; thinking?: string; text?: string }>;
+      }
+    }
+
+    // All 3 stall entries are appended BEFORE the compaction entry, and the
+    // final AssistantMessage holds only post-compaction thinking + text!
+    assert.deepEqual(
+      customEntries.map((e) => e.customType),
+      [AGY_STALL_ENTRY, AGY_STALL_ENTRY, AGY_STALL_ENTRY, AGY_COMPACTION_ENTRY],
+    );
+    assert.match(customEntries[0]?.summary ?? "", /restarting the turn \(attempt 1\/3\)/);
+    assert.deepEqual(finalBlocks, [
+      { type: "thinking", thinking: "Post-compaction thought" },
+      { type: "text", text: "Resumed answer" },
+    ]);
+  } finally {
+    if (prevBackoff === undefined) delete process.env.AGY_STALL_RETRY_BACKOFF_MS;
+    else process.env.AGY_STALL_RETRY_BACKOFF_MS = prevBackoff;
+    if (prevPace === undefined) delete process.env.PI_ANTIGRAVITY_THINKING_PACE;
+    else process.env.PI_ANTIGRAVITY_THINKING_PACE = prevPace;
+    await runtime.dispose();
   }
 });

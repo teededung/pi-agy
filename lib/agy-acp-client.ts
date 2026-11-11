@@ -564,6 +564,19 @@ export function extractAcpQuotaSnapshot(response: AcpPromptResponse): AcpQuotaSn
 }
 
 /**
+ * agy records an exhausted retry (e.g. `503 No capacity`) as an error step and then ends the
+ * stream with a normal `end_turn` and no text. Treat that empty turn as the API failure it is.
+ */
+export function acpEmptyTurnApiFailure(
+  stopReason: string,
+  responseText: string,
+  lastApiError: string | undefined,
+): string | undefined {
+  if (stopReason !== "end_turn" || responseText.trim() || !lastApiError) return undefined;
+  return `Antigravity request failed after agy gave up retrying (${lastApiError}).`;
+}
+
+/**
  * Format a clear user-facing error message when an ACP turn stops with a
  * non-`end_turn` reason (e.g. `stopReason === "refusal"` on quota exhaustion).
  */

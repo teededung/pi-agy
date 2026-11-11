@@ -1310,6 +1310,7 @@ export class AgyDriverSession implements AgyTurnExecutor {
 
   #settleTurn(turn: ActiveTurn, result: { outcome: AgyTurnOutcome } | { error: unknown }): void {
     if (this.#active !== turn) return;
+    turn.thoughtTracker.finishRetrying((activity) => this.#emitSideActivity(turn, activity));
     turn.thoughtTracker.finishCompacting((activity) => this.#emitSideActivity(turn, activity));
     turn.deadline?.clear();
     if (turn.stallTimer) clearTimeout(turn.stallTimer);

@@ -466,6 +466,7 @@ async function runSingleAgyTurn(request: AgyTurnRequest): Promise<AgyTurnOutcome
     const finishLogical = (fn: () => void) => {
       if (settled) return;
       settled = true;
+      thoughtTracker.finishRetrying(emitSideActivity);
       thoughtTracker.finishCompacting(emitSideActivity);
       killDeadline.clear();
       if (stallTimer !== undefined) {

@@ -114,8 +114,16 @@ function waitForRetryBackoff(ms: number, signal: AbortSignal): Promise<boolean> 
 }
 
 const DEFAULT_STALL_TIMEOUT_MS = 90_000;
-const DEFAULT_STALL_RETRY_BACKOFF_MS = 1_000;
+export const DEFAULT_STALL_RETRY_BACKOFF_MS = 3_000;
+const MAX_STALL_RETRY_BACKOFF_MS = 30_000;
 const DEFAULT_STALL_MAX_RETRIES = 3;
+
+/** Progressive backoff for outer stall restarts (`3s -> 9s -> 27s`, capped at `30s`). */
+export function computeStallRetryBackoffMs(baseMs: number, retry: number): number {
+  if (!(baseMs > 0)) return 0;
+  const exp = Math.max(0, retry - 1);
+  return Math.min(MAX_STALL_RETRY_BACKOFF_MS, Math.round(baseMs * 3 ** exp));
+}
 
 function isMissingConversationFailure(value: unknown): boolean {
   const text =
@@ -748,15 +756,17 @@ const makeRuntime = (
                     }
                     retry += 1;
                     hadStallRetry = true;
+                    const retryBackoffMs = computeStallRetryBackoffMs(stallRetryBackoffMs, retry);
                     controller.push({
                       type: "stall",
                       retry,
                       maxRetries: stallMaxRetries,
                       stalledMs: error.stalledMs,
                       toolActive: error.toolActive,
+                      backoffMs: retryBackoffMs,
                       ...(error.apiError ? { apiError: error.apiError } : {}),
                     });
-                    if (!(await waitForRetryBackoff(stallRetryBackoffMs, turnAbort.signal))) {
+                    if (!(await waitForRetryBackoff(retryBackoffMs, turnAbort.signal))) {
                       throw abortFailure();
                     }
                   }

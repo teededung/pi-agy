@@ -18,6 +18,7 @@ import {
   acpUsageToAgyUsage,
   buildAcpAgyArgs,
   buildAcpChildEnvironment,
+  acpEmptyTurnApiFailure,
   extractAcpQuotaSnapshot,
   formatAcpStopError,
   modelsFromAcpSessionState,
@@ -888,6 +889,7 @@ export class AgyAcpDriverSession implements AgyTurnExecutor {
     if (this.#active === turn) {
       this.#active = undefined;
     }
+    turn.thoughtTracker.finishRetrying((activity) => this.#emitSideActivity(turn, activity));
     turn.thoughtTracker.finishCompacting((activity) => this.#emitSideActivity(turn, activity));
     turn.deadline?.clear();
     if (turn.stallTimer) clearTimeout(turn.stallTimer);
@@ -1252,7 +1254,13 @@ async function awaitTurnExecution(
   }
 
   const stopReason = promptResponse.stopReason || "end_turn";
-  const isOk = stopReason === "end_turn";
+  const finalText = normalizer.finalResponseText();
+  const emptyTurnFailure = acpEmptyTurnApiFailure(
+    stopReason,
+    finalText,
+    thoughtTracker.lastApiError,
+  );
+  const isOk = stopReason === "end_turn" && !emptyTurnFailure;
   const finishedReason: AgyFinishedReason | undefined = isOk
     ? undefined
     : stopReason === "cancelled"
@@ -1265,7 +1273,6 @@ async function awaitTurnExecution(
         ? promptResponse.error.message
         : undefined;
 
-  const finalText = normalizer.finalResponseText();
   const fallbackErr = rawErr?.trim() ? rawErr : normalizer.lastWarningText();
   outcome.finished = true;
   outcome.status = isOk ? "OK" : "ERROR";
@@ -1273,7 +1280,7 @@ async function awaitTurnExecution(
   outcome.response = finalText;
   outcome.error = isOk
     ? undefined
-    : formatAcpStopError(stopReason, fallbackErr, finalText, quota);
+    : (emptyTurnFailure ?? formatAcpStopError(stopReason, fallbackErr, finalText, quota));
 
   const resultActivity: AgyActivity = {
     type: "result",

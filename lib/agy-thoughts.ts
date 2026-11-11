@@ -38,6 +38,24 @@ const STEP_STATUS_GENERATING = 8;
 
 /** Minimum context tokens before an unindexed streamGenerateContent call can be compaction. */
 const MIN_COMPACTION_CONTEXT_TOKENS = 100_000;
+
+/** Default total attempts in agy's internal model retry loop (`attempt 1..8 failed` -> `attempt 9/9`). */
+export const AGY_DEFAULT_MAX_RETRY_ATTEMPTS = 9;
+
+export function formatAgyRetryStatus(
+  attempt: number,
+  maxAttempts: number,
+  delaySeconds: number,
+  apiError?: string,
+): string {
+  const isModelUnavailable =
+    !apiError ||
+    /\bUNAVAILABLE\b|\b503\b|\b502\b|\b504\b|\bNo capacity\b|\boverloaded\b|\bRESOURCE_EXHAUSTED\b|\b429\b|\bDEADLINE_EXCEEDED\b|\btimeout\b|\bEOF\b|\bconnection\b/i.test(
+      apiError,
+    );
+  const prefix = isModelUnavailable ? "Model unavailable" : "API error";
+  return `${prefix} (attempt ${attempt}/${Math.max(attempt, maxAttempts)}), retrying in ${Math.max(1, Math.round(delaySeconds))}s...`;
+}
 /** Grace delay after HTTP response headers so normal PLANNER_RESPONSE steps have landed in SQLite. */
 const COMPACTION_STREAM_GRACE_MS = 1_500;
 
@@ -511,6 +529,19 @@ export class AgyThoughtTracker {
   #activeStreamResponseId: string | undefined;
   #streamStartMaxIdx = -1;
   #retryUntilMs = 0;
+  #retryStreak = 0;
+  #retrySeq = 0;
+  #emittedRetrySeq = 0;
+  #activeRetryInfo:
+    | {
+        seq: number;
+        attempt: number;
+        maxAttempts: number;
+        delaySeconds: number;
+        message: string;
+        apiError?: string;
+      }
+    | undefined;
   #lastApiError: string | undefined;
   #sawRetrySinceLastPoll = false;
 
@@ -520,6 +551,7 @@ export class AgyThoughtTracker {
   #lastAgentProgressed = false;
   #lastAwaitingPlannerAfterStep = false;
   #emittedCompacting = false;
+  #emittedRetrying = false;
   #emitThinkingDeltas = true;
   #emitStepUsage = false;
   #checkpointDetailsByStepId = new Map<number, AgyCheckpointSummaryInfo>();
@@ -557,11 +589,14 @@ export class AgyThoughtTracker {
       this.#cliLogPath = undefined;
       this.#cliLogOffset = 0;
       this.#cliLogRemainder = "";
+      this.#lastCliLogScanAtMs = 0;
       this.#pendingMonitorCalls = 0;
       this.#activeStreamStartedAtMs = undefined;
       this.#activeStreamResponseId = undefined;
       this.#streamStartMaxIdx = -1;
       this.#retryUntilMs = 0;
+      this.#retryStreak = 0;
+      this.#activeRetryInfo = undefined;
       this.#lastApiError = undefined;
       this.#sawRetrySinceLastPoll = false;
     }
@@ -585,6 +620,8 @@ export class AgyThoughtTracker {
       this.#tailCliLog(-1, nowMs);
       const retryAttempted = this.#sawRetrySinceLastPoll;
       this.#sawRetrySinceLastPoll = false;
+      const isRetrying = nowMs < this.#retryUntilMs;
+      if (!isRetrying) this.#activeRetryInfo = undefined;
       return {
         deltas: [],
         checkpoints: [],
@@ -593,7 +630,7 @@ export class AgyThoughtTracker {
         agentProgressed: retryAttempted,
         isGenerating: false,
         isCompacting: false,
-        isRetrying: nowMs < this.#retryUntilMs,
+        isRetrying,
         retryAttempted,
         lastContextTokens: this.#lastContextTokens,
         awaitingPlannerAfterStep: false,
@@ -766,10 +803,13 @@ export class AgyThoughtTracker {
     const isCompacting = sqlCheckpointActive || cliCompacting;
     if (hasRunningStep || isGenerating) {
       this.#retryUntilMs = 0;
+      this.#retryStreak = 0;
+      this.#activeRetryInfo = undefined;
     }
     const retryAttempted = this.#sawRetrySinceLastPoll;
     this.#sawRetrySinceLastPoll = false;
     const isRetrying = nowMs < this.#retryUntilMs;
+    if (!isRetrying) this.#activeRetryInfo = undefined;
 
     const statusSignature = statusParts.join(",");
     const agentStatusSignature = agentStatusParts.join(",");
@@ -841,6 +881,14 @@ export class AgyThoughtTracker {
     emitSideActivity({ type: "compacting", active: false });
   }
 
+  /** Emit `{ type: "retrying", active: false }` if a retry indicator is still active. */
+  finishRetrying(emitSideActivity: (activity: AgyActivity) => void): void {
+    this.#activeRetryInfo = undefined;
+    if (!this.#emittedRetrying) return;
+    this.#emittedRetrying = false;
+    emitSideActivity({ type: "retrying", active: false });
+  }
+
   /** Flush any SQLite-completed checkpoints whose stepId precedes `beforeStepId`. */
   flushUnemittedCheckpoints(
     conversationId: string | undefined,
@@ -887,6 +935,22 @@ export class AgyThoughtTracker {
       res.deltas.length > 0 ||
       res.checkpoints.length > 0 ||
       (compactingFlipped && res.isCompacting);
+    if (res.isCompacting || !res.isRetrying || res.deltas.length > 0) {
+      this.finishRetrying(emitSideActivity);
+    } else if (this.#activeRetryInfo && this.#activeRetryInfo.seq !== this.#emittedRetrySeq) {
+      const info = this.#activeRetryInfo;
+      this.#emittedRetrySeq = info.seq;
+      this.#emittedRetrying = true;
+      emitSideActivity({
+        type: "retrying",
+        active: true,
+        attempt: info.attempt,
+        maxAttempts: info.maxAttempts,
+        delaySeconds: info.delaySeconds,
+        message: info.message,
+        ...(info.apiError ? { apiError: info.apiError } : {}),
+      });
+    }
     if (compactingFlipped) {
       this.#emittedCompacting = res.isCompacting;
       emitSideActivity({
@@ -1018,17 +1082,6 @@ export class AgyThoughtTracker {
       );
       if (names.length === 0) return;
       const pidSuffix = this.#pid !== undefined ? `-${this.#pid}.log` : undefined;
-      const candidates: Array<{ path: string; name: string; size: number; mtimeMs: number }> = [];
-      for (const name of names) {
-        const p = join(this.#logDir, name);
-        try {
-          const st = statSync(p);
-          if (st.isFile() && st.size > 0) {
-            candidates.push({ path: p, name, size: st.size, mtimeMs: st.mtimeMs });
-          }
-        } catch {}
-      }
-      candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
 
       const bindCandidate = (
         candidate: { path: string; size: number },
@@ -1071,17 +1124,38 @@ export class AgyThoughtTracker {
       };
 
       if (pidSuffix) {
-        const pidMatch = candidates.find(
-          (c) => c.name.startsWith("acp-server-") && c.name.endsWith(pidSuffix),
-        );
-        if (pidMatch) {
-          bindCandidate(pidMatch, true);
-          return;
+        for (const name of names) {
+          if (!name.startsWith("acp-server-") || !name.endsWith(pidSuffix)) continue;
+          const p = join(this.#logDir, name);
+          try {
+            const st = statSync(p);
+            if (st.isFile()) {
+              bindCandidate({ path: p, size: st.size }, true);
+              return;
+            }
+          } catch {}
         }
+        // Known ACP child PID: never bind an older/dead process's log that
+        // happens to mention the same resumed conversationId. Reset scan
+        // throttle so the next 250ms poll binds `acp-server-*-<pid>.log` as
+        // soon as the Go runtime opens it.
+        this.#lastCliLogScanAtMs = 0;
+        return;
       }
 
       const cid = this.#conversationId;
       if (!cid) return;
+      const candidates: Array<{ path: string; name: string; size: number; mtimeMs: number }> = [];
+      for (const name of names) {
+        const p = join(this.#logDir, name);
+        try {
+          const st = statSync(p);
+          if (st.isFile() && st.size > 0) {
+            candidates.push({ path: p, name, size: st.size, mtimeMs: st.mtimeMs });
+          }
+        } catch {}
+      }
+      candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
       for (const candidate of candidates.slice(0, 4)) {
         const tailBytes = Math.min(candidate.size, 131_072);
         const startOffset = candidate.size - tailBytes;
@@ -1185,6 +1259,8 @@ export class AgyThoughtTracker {
         this.#activeStreamResponseId = undefined;
         this.#streamStartMaxIdx = -1;
         this.#retryUntilMs = 0;
+        this.#retryStreak = 0;
+        this.#activeRetryInfo = undefined;
         this.#lastApiError = undefined;
         this.#sawRetrySinceLastPoll = false;
         continue;
@@ -1200,13 +1276,32 @@ export class AgyThoughtTracker {
         if (isInitialReplay && parsedMs !== undefined && nowMs - parsedMs > 120_000) {
           continue;
         }
-        const apiError = /\battempt \d+ failed \((.+)\), retrying in/.exec(line);
-        if (apiError) this.#lastApiError = apiError[1];
+        const attemptFailure = /\battempt (\d+) failed \((.+)\), retrying in/.exec(line);
+        if (attemptFailure) {
+          const failedNum = Number(attemptFailure[1]);
+          this.#retryStreak =
+            Number.isFinite(failedNum) && failedNum > 0 ? failedNum : this.#retryStreak + 1;
+          this.#lastApiError = attemptFailure[2];
+        } else {
+          this.#retryStreak += 1;
+        }
         const delayMs = Math.min(parseGoDurationMs(retryMatch[1]!) ?? 30_000, 120_000);
         const untilMs = (parsedMs ?? nowMs) + delayMs + 15_000;
         if (untilMs > nowMs) {
           this.#retryUntilMs = Math.max(this.#retryUntilMs, untilMs);
           if (!isInitialReplay) this.#sawRetrySinceLastPoll = true;
+          const attempt = this.#retryStreak + 1;
+          const maxAttempts = Math.max(AGY_DEFAULT_MAX_RETRY_ATTEMPTS, attempt);
+          const delaySeconds = Math.max(1, Math.round(delayMs / 1000));
+          const seq = ++this.#retrySeq;
+          this.#activeRetryInfo = {
+            seq,
+            attempt,
+            maxAttempts,
+            delaySeconds,
+            message: formatAgyRetryStatus(attempt, maxAttempts, delaySeconds, this.#lastApiError),
+            ...(this.#lastApiError ? { apiError: this.#lastApiError } : {}),
+          };
         }
         continue;
       }
@@ -1231,6 +1326,9 @@ export class AgyThoughtTracker {
           continue;
         }
         // A response arrived, so any earlier API error was recovered by agy's own retry.
+        this.#retryUntilMs = 0;
+        this.#retryStreak = 0;
+        this.#activeRetryInfo = undefined;
         this.#lastApiError = undefined;
         const respIdMatch = /\bResponseID:\s*([A-Za-z0-9_-]+)/.exec(line);
         this.#activeStreamStartedAtMs = parsedMs ?? nowMs;

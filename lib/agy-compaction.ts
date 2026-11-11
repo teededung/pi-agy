@@ -1,6 +1,40 @@
 import type { AgyUsage } from "./events.ts";
+import type { AgyActivity } from "./reducer.ts";
 
 export const AGY_COMPACTION_ENTRY = "pi-agy-compaction";
+export const AGY_STALL_ENTRY = "pi-agy-stall";
+
+export interface AgyStallMarker {
+  version: 1;
+  summary: string;
+  retry: number;
+  maxRetries: number;
+  stalledMs: number;
+  toolActive: boolean;
+  backoffMs?: number;
+  apiError?: string;
+  detectedAt: string;
+}
+
+export function formatAgyStallSummary(
+  activity: Pick<
+    Extract<AgyActivity, { type: "stall" }>,
+    "retry" | "maxRetries" | "stalledMs" | "toolActive" | "backoffMs" | "apiError"
+  >,
+): string {
+  const seconds = Math.max(1, Math.round(activity.stalledMs / 1000));
+  const delaySeconds =
+    activity.backoffMs !== undefined && activity.backoffMs >= 1_000
+      ? Math.max(1, Math.round(activity.backoffMs / 1000))
+      : undefined;
+  const retrySuffix = delaySeconds !== undefined ? `, retrying in ${delaySeconds}s...` : "";
+  return (
+    `agy stream stalled for ${seconds}s with no events` +
+    `${activity.toolActive ? " while a tool step was active" : ""}` +
+    ` — restarting the turn (attempt ${activity.retry}/${activity.maxRetries})${retrySuffix}` +
+    `${activity.apiError ? ` · agy: ${activity.apiError}` : ""}`
+  );
+}
 
 /** Conservative inference thresholds; stream-json has no compaction event. */
 export const AGY_COMPACTION_MIN_BEFORE_TOKENS = 120_000;

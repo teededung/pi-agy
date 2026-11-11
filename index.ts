@@ -112,11 +112,14 @@ import {
 import type { AgyActivity } from "./lib/reducer.ts";
 import {
   AGY_COMPACTION_ENTRY,
+  AGY_STALL_ENTRY,
   agyContextTokens,
   detectAgyCompaction,
   formatAgyContextTokens,
+  formatAgyStallSummary,
   scopeCompactionPreparationToAgyCheckpoint,
   type AgyCompactionMarker,
+  type AgyStallMarker,
 } from "./lib/agy-compaction.ts";
 import {
   computeSessionUsageSnapshot,
@@ -609,7 +612,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   let subagentSpawnedThisTurn = false;
   let lastSettledSpawnedSubagent = false;
   let lastSettledOutcome: AgySettledTurnOutcome | undefined;
-  let compactingWorkingUiActive = false;
+  let agyWorkingUiMode: "idle" | "compacting" | "retrying" = "idle";
 
   interface ActiveGoalState {
     request: string;
@@ -775,6 +778,12 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     content.addChild(new Text(theme.fg("customMessageText", detail), 0, 0));
     box.addChild(content);
     return box;
+  });
+
+  pi.registerEntryRenderer(AGY_STALL_ENTRY, (entry, _options, theme) => {
+    const marker = entry.data as AgyStallMarker | undefined;
+    if (!marker?.summary) return undefined;
+    return new Text(theme.italic(theme.fg("thinkingText", marker.summary)), 1, 0);
   });
 
   pi.registerEntryRenderer(AGY_CONSULT_ENTRY, (entry, _options, theme) => {
@@ -1573,12 +1582,20 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     })();
   }
 
+  function resolveWorkingCancelHint(): string {
+    try {
+      return `(${keyText("app.interrupt")} to cancel)`;
+    } catch {
+      return "(esc to cancel)";
+    }
+  }
+
   function setAgyCompactingUi(active: boolean, beforeTokens?: number): void {
     const probedUi = activeSessionCtx ? probeCtx(() => activeSessionCtx?.ui) : undefined;
     const ui = tasksUi ?? (probedUi && !probedUi.stale ? probedUi.value : undefined);
     if (!active) {
-      if (!compactingWorkingUiActive) return;
-      compactingWorkingUiActive = false;
+      if (agyWorkingUiMode === "idle") return;
+      agyWorkingUiMode = "idle";
       try {
         ui?.setWorkingMessage(undefined);
       } catch {
@@ -1591,13 +1608,31 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       typeof beforeTokens === "number" && Number.isFinite(beforeTokens) && beforeTokens > 0
         ? ` (~${formatAgyContextTokens(beforeTokens)})`
         : "";
-    let cancelHint = "(esc to cancel)";
     try {
-      cancelHint = `(${keyText("app.interrupt")} to cancel)`;
-    } catch {}
+      ui.setWorkingMessage(`Auto-compacting${tokenHint}... ${resolveWorkingCancelHint()}`);
+      agyWorkingUiMode = "compacting";
+    } catch {
+      // Non-interactive UI stub may not implement setWorkingMessage.
+    }
+  }
+
+  function setAgyRetryingUi(active: boolean, message?: string): void {
+    const probedUi = activeSessionCtx ? probeCtx(() => activeSessionCtx?.ui) : undefined;
+    const ui = tasksUi ?? (probedUi && !probedUi.stale ? probedUi.value : undefined);
+    if (!active) {
+      if (agyWorkingUiMode !== "retrying") return;
+      agyWorkingUiMode = "idle";
+      try {
+        ui?.setWorkingMessage(undefined);
+      } catch {
+        // UI may already be disposed.
+      }
+      return;
+    }
+    if (!ui || !message || agyWorkingUiMode === "compacting") return;
     try {
-      ui.setWorkingMessage(`Auto-compacting${tokenHint}... ${cancelHint}`);
-      compactingWorkingUiActive = true;
+      ui.setWorkingMessage(`${message} ${resolveWorkingCancelHint()}`);
+      agyWorkingUiMode = "retrying";
     } catch {
       // Non-interactive UI stub may not implement setWorkingMessage.
     }
@@ -1619,6 +1654,39 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     }
     if (activity.type === "compacting") {
       setAgyCompactingUi(activity.active, activity.beforeTokens ?? observedContextTokens);
+      return;
+    }
+    if (activity.type === "retrying") {
+      setAgyRetryingUi(activity.active, activity.message);
+      return;
+    }
+    if (activity.type === "stall") {
+      setAgyCompactingUi(false);
+      if (!activity.inline) {
+        const marker: AgyStallMarker = {
+          version: 1,
+          summary: formatAgyStallSummary(activity),
+          retry: activity.retry,
+          maxRetries: activity.maxRetries,
+          stalledMs: activity.stalledMs,
+          toolActive: activity.toolActive,
+          ...(activity.backoffMs !== undefined ? { backoffMs: activity.backoffMs } : {}),
+          ...(activity.apiError ? { apiError: activity.apiError } : {}),
+          detectedAt: new Date().toISOString(),
+        };
+        try {
+          pi.appendEntry(AGY_STALL_ENTRY, marker);
+        } catch {
+          // Session replaced mid-activity; the marker is advisory only.
+        }
+      }
+      if (activity.backoffMs !== undefined && activity.backoffMs >= 1_000) {
+        const delaySec = Math.max(1, Math.round(activity.backoffMs / 1000));
+        setAgyRetryingUi(
+          true,
+          `Stream stalled (attempt ${activity.retry}/${activity.maxRetries}), retrying in ${delaySec}s...`,
+        );
+      }
       return;
     }
     if (activity.type === "checkpoint") {
@@ -1644,12 +1712,12 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       return;
     }
     if (
-      compactingWorkingUiActive &&
+      agyWorkingUiMode !== "idle" &&
       (activity.type === "thinking_delta" ||
         activity.type === "text" ||
         activity.type === "tool_start" ||
-        activity.type === "result" ||
-        activity.type === "stall")
+        activity.type === "stream_retry" ||
+        activity.type === "result")
     ) {
       setAgyCompactingUi(false);
     }
@@ -2468,7 +2536,8 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
           entry.type === "custom" &&
           (entry.customType === AGY_CONVERSATION_STATE_ENTRY ||
             entry.customType === "pi-antigravity-conversation-state" ||
-            entry.customType === AGY_COMPACTION_ENTRY),
+            entry.customType === AGY_COMPACTION_ENTRY ||
+            entry.customType === AGY_STALL_ENTRY),
       );
     await runAntigravity(runtime, service.setSession(sessionProbe.value.cwd, undefined, true));
     detachConversationMetadata(previousConversationId);

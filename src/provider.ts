@@ -36,6 +36,7 @@ import type { AgyEffort, AgyPromptImage } from "../lib/agy-client.ts";
 import {
   boundCompactionSummaryFileLists,
   extractAgyCompactionEntrySummary,
+  formatAgyStallSummary,
   isAgyCompactionBranchEntry,
 } from "../lib/agy-compaction.ts";
 import { type AgyPiBridge, resolveBridgeResultsFromContext } from "../lib/bridge.ts";
@@ -1857,13 +1858,7 @@ export function streamAntigravity(
          * so the event stream stays delta-replay legal.
          */
         const emitStallMarker = (activity: Extract<AgyActivity, { type: "stall" }>): void => {
-          const seconds = Math.max(1, Math.round(activity.stalledMs / 1000));
-          const summary =
-            `agy stream stalled for ${seconds}s with no events` +
-            `${activity.toolActive ? " while a tool step was active" : ""}` +
-            ` — restarting the turn (retry ${activity.retry} of ${activity.maxRetries})` +
-            `${activity.apiError ? ` · agy: ${activity.apiError}` : ""}`;
-          emitThoughtSummaryLine(summary);
+          emitThoughtSummaryLine(formatAgyStallSummary(activity));
         };
 
         while (true) {
@@ -1896,14 +1891,20 @@ export function streamAntigravity(
             throw new Error(ended);
           }
 
+          const inlineStall =
+            activity.type === "stall" &&
+            (isolatedRequest || !onActivity || output.content.length > 0);
+          const sideActivity =
+            activity.type === "stall" && inlineStall ? { ...activity, inline: true } : activity;
           try {
-            if (!isolatedRequest) onActivity?.(activity);
+            if (!isolatedRequest) onActivity?.(sideActivity);
           } catch {
             // UI side channels are best-effort and must never fail the turn.
           }
           switch (activity.type) {
             case "conversation_fallback":
             case "compacting":
+            case "retrying":
             case "checkpoint": {
               // Runtime/index side channel only; no assistant content.
               break;
@@ -1980,7 +1981,7 @@ export function streamAntigravity(
               break;
             }
             case "stall": {
-              emitStallMarker(activity);
+              if (inlineStall) emitStallMarker(activity);
               break;
             }
             case "stream_retry": {
