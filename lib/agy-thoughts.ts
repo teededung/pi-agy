@@ -43,12 +43,22 @@ const MIN_COMPACTION_CONTEXT_TOKENS = 100_000;
 export const AGY_DEFAULT_MAX_RETRY_ATTEMPTS = 10;
 
 export function resolveAgyRetryLabel(apiError?: string): string {
-  const isModelUnavailable =
-    !apiError ||
-    /\bUNAVAILABLE\b|\b503\b|\b502\b|\b504\b|\bNo capacity\b|\boverloaded\b|\bRESOURCE_EXHAUSTED\b|\b429\b|\bDEADLINE_EXCEEDED\b|\btimeout\b|\bEOF\b|\bconnection\b/i.test(
+  if (!apiError) return "Model unavailable";
+  if (
+    /\bstream (?:reading|idle)\b|\bDEADLINE_EXCEEDED\b|\bcontext deadline exceeded\b|\btimeout\b|\bEOF\b|\bconnection\b|\breset by peer\b|\bbroken pipe\b/i.test(
       apiError,
-    );
-  return isModelUnavailable ? "Model unavailable" : "API error";
+    )
+  ) {
+    return "Stream interrupted";
+  }
+  if (
+    /\bUNAVAILABLE\b|\b503\b|\b502\b|\b504\b|\bNo capacity\b|\boverloaded\b|\bRESOURCE_EXHAUSTED\b|\b429\b/i.test(
+      apiError,
+    )
+  ) {
+    return "Model unavailable";
+  }
+  return "API error";
 }
 
 export interface AgyRetryCountdownState {
@@ -63,7 +73,10 @@ export function formatAgyLiveRetryLine(
   state: AgyRetryCountdownState,
   nowMs = Date.now(),
 ): { text: string; countingDown: boolean } {
-  const base = `${state.label} (attempt ${state.attempt}/${Math.max(state.attempt, state.maxAttempts)})`;
+  const base =
+    state.attempt > 0 && state.maxAttempts > 0
+      ? `${state.label} (attempt ${state.attempt}/${Math.max(state.attempt, state.maxAttempts)})`
+      : state.label;
   const remainingSec =
     state.retryAtMs !== undefined ? Math.ceil((state.retryAtMs - nowMs) / 1000) : 0;
   if (remainingSec > 0) {
@@ -561,6 +574,7 @@ export class AgyThoughtTracker {
   #cliLogRemainder = "";
   #lastCliLogScanAtMs = 0;
   #pendingMonitorCalls = 0;
+  #awaitingUpstreamHeadersSinceMs: number | undefined;
   #activeStreamStartedAtMs: number | undefined;
   #activeStreamResponseId: string | undefined;
   #streamStartMaxIdx = -1;
@@ -581,6 +595,7 @@ export class AgyThoughtTracker {
       }
     | undefined;
   #lastApiError: string | undefined;
+  #lastApiErrorRetryEndsAtMs = 0;
   #sawRetrySinceLastPoll = false;
 
   /** Turn-level stream synchronization state shared by AgyDriver and runAgyTurn. */
@@ -629,6 +644,7 @@ export class AgyThoughtTracker {
       this.#cliLogRemainder = "";
       this.#lastCliLogScanAtMs = 0;
       this.#pendingMonitorCalls = 0;
+      this.#awaitingUpstreamHeadersSinceMs = undefined;
       this.#activeStreamStartedAtMs = undefined;
       this.#activeStreamResponseId = undefined;
       this.#streamStartMaxIdx = -1;
@@ -636,6 +652,7 @@ export class AgyThoughtTracker {
       this.#retryStreak = 0;
       this.#activeRetryInfo = undefined;
       this.#lastApiError = undefined;
+      this.#lastApiErrorRetryEndsAtMs = 0;
       this.#sawRetrySinceLastPoll = false;
     }
     if (!this.#baselineCaptured) {
@@ -840,9 +857,12 @@ export class AgyThoughtTracker {
     );
     const isCompacting = sqlCheckpointActive || cliCompacting;
     if (hasRunningStep || isGenerating) {
+      this.#awaitingUpstreamHeadersSinceMs = undefined;
       this.#retryUntilMs = 0;
       this.#retryStreak = 0;
       this.#activeRetryInfo = undefined;
+      this.#lastApiError = undefined;
+      this.#lastApiErrorRetryEndsAtMs = 0;
     }
     const retryAttempted = this.#sawRetrySinceLastPoll;
     this.#sawRetrySinceLastPoll = false;
@@ -892,9 +912,38 @@ export class AgyThoughtTracker {
     return this.#lastIsGenerating;
   }
 
-  /** Last agy API error this turn (`UNAVAILABLE (code 503): No capacity ...`), if agy logged one. */
+  /** Last agy API error this turn (`UNAVAILABLE (code 503): No capacity ...`), if still relevant. */
   get lastApiError(): string | undefined {
+    if (
+      this.#lastApiError &&
+      this.#lastApiErrorRetryEndsAtMs > 0 &&
+      this.#now() - this.#lastApiErrorRetryEndsAtMs > 45_000
+    ) {
+      this.#lastApiError = undefined;
+      this.#lastApiErrorRetryEndsAtMs = 0;
+    }
     return this.#lastApiError;
+  }
+
+  /**
+   * True when `acp-server-*.log` confirmed an upstream request or open SSE stream
+   * that is still awaiting its first SQLite planner step (TTFB / high-effort prefill).
+   */
+  get isAwaitingUpstreamStream(): boolean {
+    const nowMs = this.#now();
+    if (
+      this.#activeStreamStartedAtMs !== undefined &&
+      nowMs - this.#activeStreamStartedAtMs < 180_000
+    ) {
+      return true;
+    }
+    if (
+      this.#awaitingUpstreamHeadersSinceMs !== undefined &&
+      nowMs - this.#awaitingUpstreamHeadersSinceMs < 180_000
+    ) {
+      return true;
+    }
+    return false;
   }
 
   /** True when agy logged an active in-process API/model retry (`Retry-After` / backoff). */
@@ -1030,7 +1079,25 @@ export class AgyThoughtTracker {
     conversationId: string | undefined,
     emitSideActivity: (activity: AgyActivity) => void,
   ): boolean {
+    if (activity.type === "stream_retry") {
+      this.#lastApiError = undefined;
+      this.#lastApiErrorRetryEndsAtMs = 0;
+      this.#awaitingUpstreamHeadersSinceMs = this.#now();
+      return true;
+    }
+    if (
+      activity.type === "thinking_delta" ||
+      activity.type === "text" ||
+      activity.type === "tool_start" ||
+      activity.type === "result"
+    ) {
+      this.#lastApiError = undefined;
+      this.#lastApiErrorRetryEndsAtMs = 0;
+      this.#awaitingUpstreamHeadersSinceMs = undefined;
+    }
     if (activity.type === "checkpoint") {
+      this.#lastApiError = undefined;
+      this.#lastApiErrorRetryEndsAtMs = 0;
       this.finishCompacting(emitSideActivity);
       if (activity.stepId !== undefined) {
         if (this.#streamEmittedCheckpoints.has(activity.stepId)) {
@@ -1294,7 +1361,10 @@ export class AgyThoughtTracker {
           line.includes(`Sending user message to conversation ${cid}`) ||
           line.includes(`Stream goroutine exited for ${cid}`))
       ) {
+        const exited = line.includes(`Stream goroutine exited for ${cid}`);
+        const parsedMs = parseGlogTimestampMs(line, nowMs);
         this.#pendingMonitorCalls = 0;
+        this.#awaitingUpstreamHeadersSinceMs = exited ? undefined : (parsedMs ?? nowMs);
         this.#activeStreamStartedAtMs = undefined;
         this.#activeStreamResponseId = undefined;
         this.#streamStartMaxIdx = -1;
@@ -1302,6 +1372,7 @@ export class AgyThoughtTracker {
         this.#retryStreak = 0;
         this.#activeRetryInfo = undefined;
         this.#lastApiError = undefined;
+        this.#lastApiErrorRetryEndsAtMs = 0;
         this.#sawRetrySinceLastPoll = false;
         continue;
       }
@@ -1309,6 +1380,7 @@ export class AgyThoughtTracker {
         line,
       );
       if (retryMatch) {
+        this.#awaitingUpstreamHeadersSinceMs = undefined;
         this.#activeStreamStartedAtMs = undefined;
         this.#activeStreamResponseId = undefined;
         this.#streamStartMaxIdx = -1;
@@ -1316,17 +1388,18 @@ export class AgyThoughtTracker {
         if (isInitialReplay && parsedMs !== undefined && nowMs - parsedMs > 120_000) {
           continue;
         }
+        const delayMs = Math.min(parseGoDurationMs(retryMatch[1]!) ?? 30_000, 120_000);
+        const sleepEndsAtMs = (parsedMs ?? nowMs) + delayMs;
         const attemptFailure = /\battempt (\d+) failed \((.+)\), retrying in/.exec(line);
         if (attemptFailure) {
           const failedNum = Number(attemptFailure[1]);
           this.#retryStreak =
             Number.isFinite(failedNum) && failedNum > 0 ? failedNum : this.#retryStreak + 1;
           this.#lastApiError = attemptFailure[2];
+          this.#lastApiErrorRetryEndsAtMs = sleepEndsAtMs;
         } else {
           this.#retryStreak += 1;
         }
-        const delayMs = Math.min(parseGoDurationMs(retryMatch[1]!) ?? 30_000, 120_000);
-        const sleepEndsAtMs = (parsedMs ?? nowMs) + delayMs;
         const untilMs = sleepEndsAtMs + 15_000;
         if (untilMs > nowMs) {
           this.#retryUntilMs = Math.max(this.#retryUntilMs, untilMs);
@@ -1373,10 +1446,12 @@ export class AgyThoughtTracker {
           continue;
         }
         // A response arrived, so any earlier API error was recovered by agy's own retry.
+        this.#awaitingUpstreamHeadersSinceMs = undefined;
         this.#retryUntilMs = 0;
         this.#retryStreak = 0;
         this.#activeRetryInfo = undefined;
         this.#lastApiError = undefined;
+        this.#lastApiErrorRetryEndsAtMs = 0;
         const respIdMatch = /\bResponseID:\s*([A-Za-z0-9_-]+)/.exec(line);
         this.#activeStreamStartedAtMs = parsedMs ?? nowMs;
         this.#activeStreamResponseId = respIdMatch?.[1];

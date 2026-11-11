@@ -120,7 +120,6 @@ import {
   agyContextTokens,
   detectAgyCompaction,
   formatAgyContextTokens,
-  formatAgyStallSummary,
   scopeCompactionPreparationToAgyCheckpoint,
   type AgyCompactionMarker,
   type AgyStallMarker,
@@ -1720,26 +1719,18 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       });
       return;
     }
+    if (activity.type === "stream_retry") {
+      setAgyCompactingUi(false);
+      setAgyRetryingUi(true, {
+        label: "Stream interrupted upstream",
+        attempt: 0,
+        maxAttempts: 0,
+        activeSuffix: "continuing...",
+      });
+      return;
+    }
     if (activity.type === "stall") {
       setAgyCompactingUi(false);
-      if (!activity.inline) {
-        const marker: AgyStallMarker = {
-          version: 1,
-          summary: formatAgyStallSummary(activity),
-          retry: activity.retry,
-          maxRetries: activity.maxRetries,
-          stalledMs: activity.stalledMs,
-          toolActive: activity.toolActive,
-          ...(activity.backoffMs !== undefined ? { backoffMs: activity.backoffMs } : {}),
-          ...(activity.apiError ? { apiError: activity.apiError } : {}),
-          detectedAt: new Date().toISOString(),
-        };
-        try {
-          pi.appendEntry(AGY_STALL_ENTRY, marker);
-        } catch {
-          // Session replaced mid-activity; the marker is advisory only.
-        }
-      }
       const attempt = activity.retry + 1;
       const maxAttempts = Math.max(attempt, activity.maxRetries + 1);
       const retryAtMs =
@@ -1783,7 +1774,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       (activity.type === "thinking_delta" ||
         activity.type === "text" ||
         activity.type === "tool_start" ||
-        activity.type === "stream_retry" ||
+        activity.type === "bridge_call" ||
         activity.type === "result")
     ) {
       setAgyCompactingUi(false);

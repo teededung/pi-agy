@@ -1891,11 +1891,14 @@ export function streamAntigravity(
             throw new Error(ended);
           }
 
-          const inlineStall =
-            activity.type === "stall" &&
-            (isolatedRequest || !onActivity || output.content.length > 0);
+          // When an interactive `onActivity` UI handler is attached, transient
+          // `stall` and `stream_retry` notices render on the live working spinner
+          // (matching native `agy`) instead of polluting permanent assistant content.
+          const inlineTransientNotice = isolatedRequest || !onActivity;
           const sideActivity =
-            activity.type === "stall" && inlineStall ? { ...activity, inline: true } : activity;
+            activity.type === "stall" && inlineTransientNotice
+              ? { ...activity, inline: true }
+              : activity;
           try {
             if (!isolatedRequest) onActivity?.(sideActivity);
           } catch {
@@ -1981,12 +1984,12 @@ export function streamAntigravity(
               break;
             }
             case "stall": {
-              if (inlineStall) emitStallMarker(activity);
+              if (inlineTransientNotice) emitStallMarker(activity);
               break;
             }
             case "stream_retry": {
               controller.beginTextSegment();
-              emitThoughtSummaryLine(activity.message);
+              if (inlineTransientNotice) emitThoughtSummaryLine(activity.message);
               break;
             }
             case "tool_start": {

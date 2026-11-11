@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -1646,6 +1646,45 @@ test("AgyAcpDriverSession rejects stalls with AgyStallError and AgyThoughtTracke
         return true;
       },
     );
+    // First stall cancels cooperatively via `session/cancel`, keeping the ACP server warm!
+    assert.equal(driver.snapshot().state, "ready");
+    assert.equal(fake.getSpawnCount(), 1);
+    assert.ok(fake.rpcLog.some((c) => c.method === "session/cancel"));
+
+    // Subsequent normal turn reuses the warm ACP server with zero respawn:
+    const recovered = await driver.run({
+      binary: "agy",
+      prompt: "recover after cooperative stall cancel",
+      conversationId: "acp-conv-1",
+      inactivityTimeoutMs: 200,
+      spawnOverride: fake.spawnOverride,
+    });
+    assert.equal(recovered.status, "OK");
+    assert.equal(fake.getSpawnCount(), 1);
+
+    // Two consecutive stalls without progress recycle the process on the 2nd stall
+    // so wedged HTTP/2 pools inside `agy acp` still get refreshed cleanly:
+    await assert.rejects(
+      driver.run({
+        binary: "agy",
+        prompt: "HANG_ME consecutive #1",
+        conversationId: "acp-conv-1",
+        inactivityTimeoutMs: 40,
+        spawnOverride: fake.spawnOverride,
+      }),
+      (err: unknown) => err instanceof AgyStallError,
+    );
+    assert.equal(driver.snapshot().state, "ready");
+    await assert.rejects(
+      driver.run({
+        binary: "agy",
+        prompt: "HANG_ME consecutive #2",
+        conversationId: "acp-conv-1",
+        inactivityTimeoutMs: 40,
+        spawnOverride: fake.spawnOverride,
+      }),
+      (err: unknown) => err instanceof AgyStallError,
+    );
     assert.equal(driver.snapshot().state, "idle");
   } finally {
     await driver.close("shutdown");
@@ -2143,6 +2182,15 @@ test("AgyThoughtTracker emits native-style retrying status and runtime scales st
     formatAgyRetryStatus(2, 10, 0),
     "Model unavailable (attempt 2/10), retrying...",
   );
+  assert.equal(
+    formatAgyRetryStatus(
+      2,
+      10,
+      4,
+      "stream reading error: stream idle timeout (5m0s): context deadline exceeded",
+    ),
+    "Stream interrupted (attempt 2/10), retrying in 4s",
+  );
   // Live countdown ticks down every second and switches to active status when remaining <= 0s
   assert.deepEqual(
     formatAgyLiveRetryLine(
@@ -2171,6 +2219,18 @@ test("AgyThoughtTracker emits native-style retrying status and runtime scales st
     ),
     { text: "Stream stalled (attempt 2/10), restarting turn...", countingDown: false },
   );
+  assert.deepEqual(
+    formatAgyLiveRetryLine(
+      {
+        label: "Stream interrupted upstream",
+        attempt: 0,
+        maxAttempts: 0,
+        activeSuffix: "continuing...",
+      },
+      10_500,
+    ),
+    { text: "Stream interrupted upstream, continuing...", countingDown: false },
+  );
   assert.equal(
     formatAgyStallSummary({
       retry: 1,
@@ -2179,18 +2239,14 @@ test("AgyThoughtTracker emits native-style retrying status and runtime scales st
       toolActive: false,
       backoffMs: 3_000,
     }),
-    "agy stream stalled for 90s with no events — restarting the turn (attempt 2/10), retrying in 3s",
+    "agy stream stalled for 90s with no events — restarting the turn (attempt 2/10)",
   );
 
   const tmpDir = mkdtempSync(path.join(tmpdir(), "pi-agy-retry-ui-"));
   const cid = "22641d79-f551-4439-a03e-63d67f5f1726";
   try {
     const logPath = path.join(tmpDir, "acp-server-20261111_100226-16266.log");
-    writeFileSync(
-      logPath,
-      `I1111 10:02:26.000000 1 server.go:1817] Sending user message to conversation ${cid} (items=1, media=0)\n`,
-      "utf8",
-    );
+    writeFileSync(logPath, "I1111 10:02:25.000000 1 server.go:100] ACP server ready\n", "utf8");
     let nowMs = new Date(2026, 10, 11, 10, 2, 26, 0).getTime();
     const tracker = new AgyThoughtTracker(cid, tmpDir, {
       logDir: tmpDir,
@@ -2198,16 +2254,19 @@ test("AgyThoughtTracker emits native-style retrying status and runtime scales st
       now: () => nowMs,
       emitThinkingDeltas: false,
     });
+    appendFileSync(
+      logPath,
+      `I1111 10:02:26.000000 1 server.go:1817] Sending user message to conversation ${cid} (items=1, media=0)\n`,
+      "utf8",
+    );
     const events: AgyActivity[] = [];
     tracker.sync(cid, (a) => events.push(a));
+    // Confirmed `Sending user message` in ACP log sets `isAwaitingUpstreamStream` while waiting for TTFB
+    assert.equal(tracker.isAwaitingUpstreamStream, true);
 
-    writeFileSync(
+    appendFileSync(
       logPath,
-      [
-        `I1111 10:02:26.000000 1 server.go:1817] Sending user message to conversation ${cid} (items=1, media=0)`,
-        `W1111 10:02:32.333805 16266 run.go:257] [${cid}] attempt 1 failed (UNAVAILABLE (code 503): No capacity available for model gemini-4-argon-high on the server), retrying in 3.2s`,
-        "",
-      ].join("\n"),
+      `W1111 10:02:32.333805 16266 run.go:257] [${cid}] attempt 1 failed (UNAVAILABLE (code 503): No capacity available for model gemini-4-argon-high on the server), retrying in 3.2s\n`,
       "utf8",
     );
     nowMs = new Date(2026, 10, 11, 10, 2, 32, 500).getTime();
@@ -2228,14 +2287,9 @@ test("AgyThoughtTracker emits native-style retrying status and runtime scales st
       assert.equal(typeof firstRetry.retryAtMs, "number");
     }
 
-    writeFileSync(
+    appendFileSync(
       logPath,
-      [
-        `I1111 10:02:26.000000 1 server.go:1817] Sending user message to conversation ${cid} (items=1, media=0)`,
-        `W1111 10:02:32.333805 16266 run.go:257] [${cid}] attempt 1 failed (UNAVAILABLE (code 503): No capacity available for model gemini-4-argon-high on the server), retrying in 3.2s`,
-        `W1111 10:03:00.289695 16266 run.go:257] [${cid}] attempt 4 failed (UNAVAILABLE (code 503): No capacity available for model gemini-4-argon-high on the server), retrying in 25.1s`,
-        "",
-      ].join("\n"),
+      `W1111 10:03:00.289695 16266 run.go:257] [${cid}] attempt 4 failed (UNAVAILABLE (code 503): No capacity available for model gemini-4-argon-high on the server), retrying in 25.1s\n`,
       "utf8",
     );
     nowMs = new Date(2026, 10, 11, 10, 3, 0, 500).getTime();
@@ -2247,20 +2301,47 @@ test("AgyThoughtTracker emits native-style retrying status and runtime scales st
     );
 
     // Once upstream responds, `retrying` clears immediately.
-    writeFileSync(
+    appendFileSync(
       logPath,
-      [
-        `I1111 10:02:26.000000 1 server.go:1817] Sending user message to conversation ${cid} (items=1, media=0)`,
-        `W1111 10:02:32.333805 16266 run.go:257] [${cid}] attempt 1 failed (UNAVAILABLE (code 503): No capacity available for model gemini-4-argon-high on the server), retrying in 3.2s`,
-        `W1111 10:03:00.289695 16266 run.go:257] [${cid}] attempt 4 failed (UNAVAILABLE (code 503): No capacity available for model gemini-4-argon-high on the server), retrying in 25.1s`,
-        `I1111 10:03:26.000000 16266 http_helpers.go:654] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse Trace: 0x2 ResponseID: resp-ok`,
-        "",
-      ].join("\n"),
+      `I1111 10:03:26.000000 16266 http_helpers.go:654] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse Trace: 0x2 ResponseID: resp-ok\n`,
       "utf8",
     );
     nowMs = new Date(2026, 10, 11, 10, 3, 26, 100).getTime();
     tracker.sync(cid, (a) => events.push(a));
     assert.deepEqual(events[2], { type: "retrying", active: false });
+    assert.equal(tracker.lastApiError, undefined);
+    // Open `streamGenerateContent` SSE stream also counts as awaiting upstream until first SQLite step lands
+    assert.equal(tracker.isAwaitingUpstreamStream, true);
+
+    // Stale `lastApiError` is cleared both on `stream_retry` and when >45s elapse past retry sleep without a new failure:
+    appendFileSync(
+      logPath,
+      `I1111 10:08:26.000000 16266 run.go:315] Run: attempt 1 failed (stream reading error: stream idle timeout (5m0s): context deadline exceeded), retrying in 4s\n`,
+      "utf8",
+    );
+    nowMs = new Date(2026, 10, 11, 10, 8, 26, 500).getTime();
+    tracker.sync(cid, (a) => events.push(a));
+    assert.match(tracker.lastApiError ?? "", /stream idle timeout/);
+    tracker.prepareStreamActivity(
+      { type: "stream_retry", message: "agy stream was interrupted upstream — continuing the turn automatically" },
+      cid,
+      () => {},
+    );
+    assert.equal(tracker.lastApiError, undefined);
+    assert.equal(tracker.isAwaitingUpstreamStream, true);
+
+    // Also verify 45s expiry prevents a single transient 503 on attempt 1 from triggering `isCapacity` 90s later:
+    appendFileSync(
+      logPath,
+      `W1111 10:09:00.000000 16266 run.go:257] [${cid}] attempt 1 failed (UNAVAILABLE (code 503): No capacity available for model gemini-4-argon-high on the server), retrying in 3s\n`,
+      "utf8",
+    );
+    nowMs = new Date(2026, 10, 11, 10, 9, 1, 0).getTime();
+    tracker.sync(cid, () => {});
+    assert.match(tracker.lastApiError ?? "", /No capacity available/);
+    // 90s later on silent attempt 2 TTFB -> stale attempt-1 capacity error has expired!
+    nowMs = new Date(2026, 10, 11, 10, 10, 30, 0).getTime();
+    assert.equal(tracker.lastApiError, undefined);
     tracker.close();
   } finally {
     rmSync(tmpDir, { recursive: true, force: true });
@@ -2277,6 +2358,14 @@ test("streamAntigravity keeps pre-compaction stall entries chronologically ahead
   const runtime = createAntigravityRuntime(async (request) => {
     attempt += 1;
     request.onConversation?.("conv-stall-compact");
+    if (attempt === 1) {
+      request.onActivity?.({ type: "thinking_delta", delta: "Initial thought before stall", stepId: 88 });
+      request.onActivity?.({
+        type: "stream_retry",
+        message: "agy stream was interrupted upstream — continuing the turn automatically",
+      });
+      throw new AgyStallError(90_000, false);
+    }
     if (attempt <= 3) {
       throw new AgyStallError(90_000, false);
     }
@@ -2308,7 +2397,7 @@ test("streamAntigravity keeps pre-compaction stall entries chronologically ahead
 
   try {
     const service = runtime.runSync(AntigravityRuntime);
-    const customEntries: Array<{ customType: string; summary?: string }> = [];
+    const sideEvents: Array<{ kind: string; summary?: string }> = [];
     const streamFn = streamAntigravity(
       runtime,
       service,
@@ -2318,13 +2407,16 @@ test("streamAntigravity keeps pre-compaction stall entries chronologically ahead
       undefined,
       undefined,
       (activity) => {
-        if (activity.type === "stall" && !activity.inline) {
-          customEntries.push({
-            customType: AGY_STALL_ENTRY,
+        if (activity.type === "stream_retry") {
+          sideEvents.push({ kind: "stream_retry", summary: activity.message });
+        } else if (activity.type === "stall") {
+          assert.equal(activity.inline, undefined);
+          sideEvents.push({
+            kind: AGY_STALL_ENTRY,
             summary: formatAgyStallSummary(activity),
           });
         } else if (activity.type === "checkpoint") {
-          customEntries.push({ customType: AGY_COMPACTION_ENTRY });
+          sideEvents.push({ kind: AGY_COMPACTION_ENTRY });
         }
       },
     );
@@ -2352,14 +2444,16 @@ test("streamAntigravity keeps pre-compaction stall entries chronologically ahead
       }
     }
 
-    // All 3 stall entries are appended BEFORE the compaction entry, and the
-    // final AssistantMessage holds only post-compaction thinking + text!
+    // All transient notices (`stream_retry` + 3 `stall`s) route strictly to `onActivity`
+    // in chronological order BEFORE `[compaction]`, while `finalBlocks` stays completely
+    // free of frozen `retrying in Ns` / `interrupted upstream` clutter!
     assert.deepEqual(
-      customEntries.map((e) => e.customType),
-      [AGY_STALL_ENTRY, AGY_STALL_ENTRY, AGY_STALL_ENTRY, AGY_COMPACTION_ENTRY],
+      sideEvents.map((e) => e.kind),
+      ["stream_retry", AGY_STALL_ENTRY, AGY_STALL_ENTRY, AGY_STALL_ENTRY, AGY_COMPACTION_ENTRY],
     );
-    assert.match(customEntries[0]?.summary ?? "", /restarting the turn \(attempt 2\/10\)/);
+    assert.match(sideEvents[1]?.summary ?? "", /restarting the turn \(attempt 2\/10\)$/);
     assert.deepEqual(finalBlocks, [
+      { type: "thinking", thinking: "Initial thought before stall" },
       { type: "thinking", thinking: "Post-compaction thought" },
       { type: "text", text: "Resumed answer" },
     ]);

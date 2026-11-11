@@ -90,6 +90,7 @@ const CANCEL_GRACE_MS = 1_500;
 const TERM_CLOSE_MS = 1_000;
 const MAX_OPEN_SESSIONS = 8;
 const MAX_MODEL_LIVENESS_GRACES = 3;
+const MAX_UPSTREAM_STREAM_GRACES = 1;
 const MAX_TOOL_LIVENESS_GRACES = 12;
 const PARKED_POLL_MS = 5_000;
 
@@ -126,6 +127,7 @@ interface ActiveAcpTurn {
   lastSubagentUpdateMs?: number;
   subagentSpawned?: boolean;
   aborted: boolean;
+  stallError?: AgyStallError;
   cancelTimer?: NodeJS.Timeout;
   abortHandler?: () => void;
   settleError?: (err: unknown) => void;
@@ -176,6 +178,7 @@ export class AgyAcpDriverSession implements AgyTurnExecutor {
   #reusedTurns = 0;
   #recycleCount = 0;
   #currentProcessTurns = 0;
+  #consecutiveStalls = 0;
   #recycleReasons = new Map<AgyRecycleCause, number>();
   #lastRecycleReason: AgyRecycleCause | undefined;
   #lastQuota: AcpQuotaSnapshot | undefined;
@@ -458,7 +461,7 @@ export class AgyAcpDriverSession implements AgyTurnExecutor {
     }
 
     try {
-      return await awaitTurnExecution(
+      const result = await awaitTurnExecution(
         turn,
         child,
         client,
@@ -488,6 +491,8 @@ export class AgyAcpDriverSession implements AgyTurnExecutor {
           },
         },
       );
+      this.#consecutiveStalls = 0;
+      return result;
     } catch (error) {
       if (
         outcome.activities.length === 0 &&
@@ -805,6 +810,7 @@ export class AgyAcpDriverSession implements AgyTurnExecutor {
 
     const likelyCompacting = turn.thoughtTracker.isLikelyCompacting(toolActive);
     const retrying = turn.thoughtTracker.isRetrying;
+    const awaitingUpstream = !toolActive && turn.thoughtTracker.isAwaitingUpstreamStream;
     if (
       (turn.thoughtTracker.isGenerating || likelyCompacting || retrying) &&
       (graceRemainingMs > 0 || turn.stallGraces < MAX_MODEL_LIVENESS_GRACES)
@@ -821,6 +827,16 @@ export class AgyAcpDriverSession implements AgyTurnExecutor {
             ? `stall:compacting:${turn.stallGraces}`
             : `stall:db-generating:${turn.stallGraces}`,
       );
+      this.#scheduleGraceCheck(turn, this.#stallBudgetMs(turn), epoch);
+      return;
+    }
+    if (awaitingUpstream && (graceRemainingMs > 0 || turn.stallGraces < MAX_UPSTREAM_STREAM_GRACES)) {
+      if (graceRemainingMs > 0) {
+        this.#scheduleGraceCheck(turn, graceRemainingMs, epoch);
+        return;
+      }
+      turn.stallGraces += 1;
+      this.#log(`stall:upstream-stream:${turn.stallGraces}`);
       this.#scheduleGraceCheck(turn, this.#stallBudgetMs(turn), epoch);
       return;
     }
@@ -879,6 +895,35 @@ export class AgyAcpDriverSession implements AgyTurnExecutor {
       toolActive,
       turn.thoughtTracker.lastApiError,
     );
+    this.#consecutiveStalls += 1;
+    // Prefer cooperative `session/cancel` on the first stall so `agy acp` stays
+    // warm, background tasks survive, and no "server restart" system notice is
+    // injected into SQLite. Fall back to process recycle on a second consecutive
+    // stall (to refresh HTTP/2 pools) or if `session/cancel` hangs past grace.
+    if (
+      !turn.stallError &&
+      this.#consecutiveStalls === 1 &&
+      turn.sessionId &&
+      this.#client &&
+      this.#child === child
+    ) {
+      turn.stallError = stallError;
+      this.#log(`stall:cancel:${turn.silenceMs}ms`);
+      this.#client.cancel(turn.sessionId);
+      if (!turn.cancelTimer) {
+        turn.cancelTimer = setTimeout(() => {
+          if (this.#active !== turn) return;
+          this.#consecutiveStalls = 0;
+          this.#recordRecycle("unspecified");
+          void this.#killProcess("idle", stallError).finally(() => {
+            turn.settleError?.(stallError);
+          });
+        }, this.#cancelGraceMs);
+        turn.cancelTimer.unref?.();
+      }
+      return;
+    }
+    this.#consecutiveStalls = 0;
     this.#log(`stall:expired:${turn.silenceMs}ms`);
     this.#recordRecycle("unspecified");
     await this.#killProcess("idle", stallError);
@@ -969,6 +1014,7 @@ export class AgyAcpDriverSession implements AgyTurnExecutor {
     this.#client = undefined;
     this.#openSessions.clear();
     this.#currentProcessTurns = 0;
+    this.#consecutiveStalls = 0;
     this.#state = nextState;
     this.#generation += 1;
   }
@@ -1205,6 +1251,9 @@ async function awaitTurnExecution(
       outcome.error = "agy turn was aborted.";
       return outcome;
     }
+    if (turn.stallError) {
+      throw turn.stallError;
+    }
     if (err instanceof AgyAcpRpcError) {
       throw new AgySpawnError(err.message, "");
     }
@@ -1218,6 +1267,10 @@ async function awaitTurnExecution(
 
   hooks.onPollThoughts();
   thoughtTracker.flushUnemittedCheckpoints(sessionId, hooks.onEmitSideActivity);
+
+  if (turn.stallError && !turn.aborted && !request.signal?.aborted) {
+    throw turn.stallError;
+  }
 
   if (turn.aborted || request.signal?.aborted || promptResponse.stopReason === "cancelled") {
     outcome.finished = true;
