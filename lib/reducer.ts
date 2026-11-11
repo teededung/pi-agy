@@ -64,6 +64,8 @@ export type AgyActivity =
       toolActive: boolean;
       /** Progressive retry backoff delay in milliseconds before the next attempt starts. */
       backoffMs?: number;
+      /** Wall-clock epoch milliseconds when the backoff wait ends. */
+      retryAtMs?: number;
       /** True when emitted inline inside an already-started assistant message. */
       inline?: boolean;
       /** Last agy-side API error before the stall, when agy logged one. */
@@ -95,9 +97,11 @@ export type AgyActivity =
       /** Live native agy retry status (detected via CLI/ACP log backoff lines). */
       type: "retrying";
       active: boolean;
+      label?: string;
       attempt?: number;
       maxAttempts?: number;
       delaySeconds?: number;
+      retryAtMs?: number;
       message?: string;
       apiError?: string;
     }

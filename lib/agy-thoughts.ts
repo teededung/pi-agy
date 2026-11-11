@@ -39,22 +39,58 @@ const STEP_STATUS_GENERATING = 8;
 /** Minimum context tokens before an unindexed streamGenerateContent call can be compaction. */
 const MIN_COMPACTION_CONTEXT_TOKENS = 100_000;
 
-/** Default total attempts in agy's internal model retry loop (`attempt 1..8 failed` -> `attempt 9/9`). */
-export const AGY_DEFAULT_MAX_RETRY_ATTEMPTS = 9;
+/** Default total attempts in agy's internal model retry loop (`ModelRequestStatus.max_attempts = 10`). */
+export const AGY_DEFAULT_MAX_RETRY_ATTEMPTS = 10;
 
-export function formatAgyRetryStatus(
-  attempt: number,
-  maxAttempts: number,
-  delaySeconds: number,
-  apiError?: string,
-): string {
+export function resolveAgyRetryLabel(apiError?: string): string {
   const isModelUnavailable =
     !apiError ||
     /\bUNAVAILABLE\b|\b503\b|\b502\b|\b504\b|\bNo capacity\b|\boverloaded\b|\bRESOURCE_EXHAUSTED\b|\b429\b|\bDEADLINE_EXCEEDED\b|\btimeout\b|\bEOF\b|\bconnection\b/i.test(
       apiError,
     );
-  const prefix = isModelUnavailable ? "Model unavailable" : "API error";
-  return `${prefix} (attempt ${attempt}/${Math.max(attempt, maxAttempts)}), retrying in ${Math.max(1, Math.round(delaySeconds))}s...`;
+  return isModelUnavailable ? "Model unavailable" : "API error";
+}
+
+export interface AgyRetryCountdownState {
+  label: string;
+  attempt: number;
+  maxAttempts: number;
+  retryAtMs?: number;
+  activeSuffix?: string;
+}
+
+export function formatAgyLiveRetryLine(
+  state: AgyRetryCountdownState,
+  nowMs = Date.now(),
+): { text: string; countingDown: boolean } {
+  const base = `${state.label} (attempt ${state.attempt}/${Math.max(state.attempt, state.maxAttempts)})`;
+  const remainingSec =
+    state.retryAtMs !== undefined ? Math.ceil((state.retryAtMs - nowMs) / 1000) : 0;
+  if (remainingSec > 0) {
+    return {
+      text: `${base}, retrying in ${remainingSec}s`,
+      countingDown: true,
+    };
+  }
+  const suffix = state.activeSuffix ?? "retrying...";
+  return {
+    text: suffix ? `${base}, ${suffix}` : base,
+    countingDown: false,
+  };
+}
+
+export function formatAgyRetryStatus(
+  attempt: number,
+  maxAttempts: number,
+  remainingSeconds?: number,
+  apiError?: string,
+): string {
+  const prefix = resolveAgyRetryLabel(apiError);
+  const base = `${prefix} (attempt ${attempt}/${Math.max(attempt, maxAttempts)})`;
+  if (remainingSeconds !== undefined && remainingSeconds > 0) {
+    return `${base}, retrying in ${Math.max(1, Math.round(remainingSeconds))}s`;
+  }
+  return `${base}, retrying...`;
 }
 /** Grace delay after HTTP response headers so normal PLANNER_RESPONSE steps have landed in SQLite. */
 const COMPACTION_STREAM_GRACE_MS = 1_500;
@@ -535,9 +571,11 @@ export class AgyThoughtTracker {
   #activeRetryInfo:
     | {
         seq: number;
+        label: string;
         attempt: number;
         maxAttempts: number;
         delaySeconds: number;
+        retryAtMs: number;
         message: string;
         apiError?: string;
       }
@@ -944,9 +982,11 @@ export class AgyThoughtTracker {
       emitSideActivity({
         type: "retrying",
         active: true,
+        label: info.label,
         attempt: info.attempt,
         maxAttempts: info.maxAttempts,
         delaySeconds: info.delaySeconds,
+        retryAtMs: info.retryAtMs,
         message: info.message,
         ...(info.apiError ? { apiError: info.apiError } : {}),
       });
@@ -1286,19 +1326,26 @@ export class AgyThoughtTracker {
           this.#retryStreak += 1;
         }
         const delayMs = Math.min(parseGoDurationMs(retryMatch[1]!) ?? 30_000, 120_000);
-        const untilMs = (parsedMs ?? nowMs) + delayMs + 15_000;
+        const sleepEndsAtMs = (parsedMs ?? nowMs) + delayMs;
+        const untilMs = sleepEndsAtMs + 15_000;
         if (untilMs > nowMs) {
           this.#retryUntilMs = Math.max(this.#retryUntilMs, untilMs);
           if (!isInitialReplay) this.#sawRetrySinceLastPoll = true;
           const attempt = this.#retryStreak + 1;
           const maxAttempts = Math.max(AGY_DEFAULT_MAX_RETRY_ATTEMPTS, attempt);
-          const delaySeconds = Math.max(1, Math.round(delayMs / 1000));
+          const remainingMs = Math.max(0, sleepEndsAtMs - nowMs);
+          const delaySeconds =
+            remainingMs > 0 ? Math.max(1, Math.ceil(remainingMs / 1000)) : 0;
+          const retryAtMs = Date.now() + remainingMs;
+          const label = resolveAgyRetryLabel(this.#lastApiError);
           const seq = ++this.#retrySeq;
           this.#activeRetryInfo = {
             seq,
+            label,
             attempt,
             maxAttempts,
             delaySeconds,
+            retryAtMs,
             message: formatAgyRetryStatus(attempt, maxAttempts, delaySeconds, this.#lastApiError),
             ...(this.#lastApiError ? { apiError: this.#lastApiError } : {}),
           };

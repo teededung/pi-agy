@@ -111,6 +111,10 @@ import {
 } from "./lib/models.ts";
 import type { AgyActivity } from "./lib/reducer.ts";
 import {
+  formatAgyLiveRetryLine,
+  type AgyRetryCountdownState,
+} from "./lib/agy-thoughts.ts";
+import {
   AGY_COMPACTION_ENTRY,
   AGY_STALL_ENTRY,
   agyContextTokens,
@@ -613,6 +617,9 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   let lastSettledSpawnedSubagent = false;
   let lastSettledOutcome: AgySettledTurnOutcome | undefined;
   let agyWorkingUiMode: "idle" | "compacting" | "retrying" = "idle";
+  let activeRetryCountdown: AgyRetryCountdownState | undefined;
+  let retryCountdownTimer: NodeJS.Timeout | undefined;
+  let lastRenderedRetryWorkingMsg: string | undefined;
 
   interface ActiveGoalState {
     request: string;
@@ -1590,10 +1597,20 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     }
   }
 
+  function stopRetryCountdownTimer(): void {
+    if (retryCountdownTimer !== undefined) {
+      clearInterval(retryCountdownTimer);
+      retryCountdownTimer = undefined;
+    }
+    activeRetryCountdown = undefined;
+    lastRenderedRetryWorkingMsg = undefined;
+  }
+
   function setAgyCompactingUi(active: boolean, beforeTokens?: number): void {
     const probedUi = activeSessionCtx ? probeCtx(() => activeSessionCtx?.ui) : undefined;
     const ui = tasksUi ?? (probedUi && !probedUi.stale ? probedUi.value : undefined);
     if (!active) {
+      stopRetryCountdownTimer();
       if (agyWorkingUiMode === "idle") return;
       agyWorkingUiMode = "idle";
       try {
@@ -1603,6 +1620,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       }
       return;
     }
+    stopRetryCountdownTimer();
     if (!ui) return;
     const tokenHint =
       typeof beforeTokens === "number" && Number.isFinite(beforeTokens) && beforeTokens > 0
@@ -1616,10 +1634,35 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     }
   }
 
-  function setAgyRetryingUi(active: boolean, message?: string): void {
+  function renderRetryCountdownTick(): void {
+    if (agyWorkingUiMode !== "retrying" || !activeRetryCountdown) {
+      stopRetryCountdownTimer();
+      return;
+    }
+    const probedUi = activeSessionCtx ? probeCtx(() => activeSessionCtx?.ui) : undefined;
+    const ui = tasksUi ?? (probedUi && !probedUi.stale ? probedUi.value : undefined);
+    if (!ui) return;
+    const { text, countingDown } = formatAgyLiveRetryLine(activeRetryCountdown, Date.now());
+    const fullMessage = `${text} ${resolveWorkingCancelHint()}`;
+    if (fullMessage !== lastRenderedRetryWorkingMsg) {
+      lastRenderedRetryWorkingMsg = fullMessage;
+      try {
+        ui.setWorkingMessage(fullMessage);
+      } catch {
+        // Non-interactive UI stub may not implement setWorkingMessage.
+      }
+    }
+    if (!countingDown && retryCountdownTimer !== undefined) {
+      clearInterval(retryCountdownTimer);
+      retryCountdownTimer = undefined;
+    }
+  }
+
+  function setAgyRetryingUi(active: boolean, state?: AgyRetryCountdownState): void {
     const probedUi = activeSessionCtx ? probeCtx(() => activeSessionCtx?.ui) : undefined;
     const ui = tasksUi ?? (probedUi && !probedUi.stale ? probedUi.value : undefined);
     if (!active) {
+      stopRetryCountdownTimer();
       if (agyWorkingUiMode !== "retrying") return;
       agyWorkingUiMode = "idle";
       try {
@@ -1629,12 +1672,14 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       }
       return;
     }
-    if (!ui || !message || agyWorkingUiMode === "compacting") return;
-    try {
-      ui.setWorkingMessage(`${message} ${resolveWorkingCancelHint()}`);
-      agyWorkingUiMode = "retrying";
-    } catch {
-      // Non-interactive UI stub may not implement setWorkingMessage.
+    if (!ui || !state || agyWorkingUiMode === "compacting") return;
+    stopRetryCountdownTimer();
+    activeRetryCountdown = state;
+    agyWorkingUiMode = "retrying";
+    renderRetryCountdownTick();
+    if (state.retryAtMs !== undefined && state.retryAtMs > Date.now()) {
+      retryCountdownTimer = setInterval(renderRetryCountdownTick, 250);
+      retryCountdownTimer.unref?.();
     }
   }
 
@@ -1657,7 +1702,22 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       return;
     }
     if (activity.type === "retrying") {
-      setAgyRetryingUi(activity.active, activity.message);
+      if (!activity.active) {
+        setAgyRetryingUi(false);
+        return;
+      }
+      const attempt = activity.attempt ?? 2;
+      const maxAttempts = activity.maxAttempts ?? 10;
+      const retryAtMs =
+        activity.retryAtMs ??
+        (activity.delaySeconds !== undefined ? Date.now() + activity.delaySeconds * 1_000 : undefined);
+      setAgyRetryingUi(true, {
+        label: activity.label ?? "Model unavailable",
+        attempt,
+        maxAttempts,
+        retryAtMs,
+        activeSuffix: "retrying...",
+      });
       return;
     }
     if (activity.type === "stall") {
@@ -1680,13 +1740,20 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
           // Session replaced mid-activity; the marker is advisory only.
         }
       }
-      if (activity.backoffMs !== undefined && activity.backoffMs >= 1_000) {
-        const delaySec = Math.max(1, Math.round(activity.backoffMs / 1000));
-        setAgyRetryingUi(
-          true,
-          `Stream stalled (attempt ${activity.retry}/${activity.maxRetries}), retrying in ${delaySec}s...`,
-        );
-      }
+      const attempt = activity.retry + 1;
+      const maxAttempts = Math.max(attempt, activity.maxRetries + 1);
+      const retryAtMs =
+        activity.retryAtMs ??
+        (activity.backoffMs !== undefined && activity.backoffMs > 0
+          ? Date.now() + activity.backoffMs
+          : undefined);
+      setAgyRetryingUi(true, {
+        label: "Stream stalled",
+        attempt,
+        maxAttempts,
+        retryAtMs,
+        activeSuffix: "restarting turn...",
+      });
       return;
     }
     if (activity.type === "checkpoint") {

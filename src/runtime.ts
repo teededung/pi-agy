@@ -116,13 +116,14 @@ function waitForRetryBackoff(ms: number, signal: AbortSignal): Promise<boolean> 
 const DEFAULT_STALL_TIMEOUT_MS = 90_000;
 export const DEFAULT_STALL_RETRY_BACKOFF_MS = 3_000;
 const MAX_STALL_RETRY_BACKOFF_MS = 30_000;
-const DEFAULT_STALL_MAX_RETRIES = 3;
+/** 9 retries after initial attempt #1 = 10 total attempts (`attempt 2/10 .. 10/10`), matching native `agy`. */
+export const DEFAULT_STALL_MAX_RETRIES = 9;
 
-/** Progressive backoff for outer stall restarts (`3s -> 9s -> 27s`, capped at `30s`). */
+/** Progressive 2x backoff matching native `agy` (`3s -> 6s -> 12s -> 24s -> 30s`). */
 export function computeStallRetryBackoffMs(baseMs: number, retry: number): number {
   if (!(baseMs > 0)) return 0;
   const exp = Math.max(0, retry - 1);
-  return Math.min(MAX_STALL_RETRY_BACKOFF_MS, Math.round(baseMs * 3 ** exp));
+  return Math.min(MAX_STALL_RETRY_BACKOFF_MS, Math.round(baseMs * 2 ** exp));
 }
 
 function isMissingConversationFailure(value: unknown): boolean {
@@ -757,6 +758,7 @@ const makeRuntime = (
                     retry += 1;
                     hadStallRetry = true;
                     const retryBackoffMs = computeStallRetryBackoffMs(stallRetryBackoffMs, retry);
+                    const retryAtMs = retryBackoffMs > 0 ? Date.now() + retryBackoffMs : undefined;
                     controller.push({
                       type: "stall",
                       retry,
@@ -764,6 +766,7 @@ const makeRuntime = (
                       stalledMs: error.stalledMs,
                       toolActive: error.toolActive,
                       backoffMs: retryBackoffMs,
+                      ...(retryAtMs !== undefined ? { retryAtMs } : {}),
                       ...(error.apiError ? { apiError: error.apiError } : {}),
                     });
                     if (!(await waitForRetryBackoff(retryBackoffMs, turnAbort.signal))) {

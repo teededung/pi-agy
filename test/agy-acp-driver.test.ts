@@ -30,6 +30,7 @@ import {
 import {
   AgyThoughtTracker,
   extractUsageFromStepPayload,
+  formatAgyLiveRetryLine,
   formatAgyRetryStatus,
 } from "../lib/agy-thoughts.ts";
 import { AGY_COMPACTION_ENTRY, AGY_STALL_ENTRY, formatAgyStallSummary } from "../lib/agy-compaction.ts";
@@ -62,6 +63,7 @@ import {
 } from "../src/provider.ts";
 import {
   AntigravityRuntime,
+  DEFAULT_STALL_MAX_RETRIES,
   DEFAULT_STALL_RETRY_BACKOFF_MS,
   computeStallRetryBackoffMs,
   createAntigravityRuntime,
@@ -2120,30 +2122,64 @@ test("AgyThoughtTracker waits for its own acp-server-<pid>.log instead of bindin
 });
 
 test("AgyThoughtTracker emits native-style retrying status and runtime scales stall retry backoff progressively", () => {
+  assert.equal(DEFAULT_STALL_MAX_RETRIES, 9);
   assert.equal(DEFAULT_STALL_RETRY_BACKOFF_MS, 3_000);
   assert.equal(computeStallRetryBackoffMs(3_000, 1), 3_000);
-  assert.equal(computeStallRetryBackoffMs(3_000, 2), 9_000);
-  assert.equal(computeStallRetryBackoffMs(3_000, 3), 27_000);
-  assert.equal(computeStallRetryBackoffMs(3_000, 4), 30_000);
+  assert.equal(computeStallRetryBackoffMs(3_000, 2), 6_000);
+  assert.equal(computeStallRetryBackoffMs(3_000, 3), 12_000);
+  assert.equal(computeStallRetryBackoffMs(3_000, 4), 24_000);
+  assert.equal(computeStallRetryBackoffMs(3_000, 5), 30_000);
   assert.equal(computeStallRetryBackoffMs(0, 2), 0);
   assert.equal(
     formatAgyRetryStatus(
       2,
-      9,
+      10,
       3,
       "UNAVAILABLE (code 503): No capacity available for model gemini-4-argon-high on the server",
     ),
-    "Model unavailable (attempt 2/9), retrying in 3s...",
+    "Model unavailable (attempt 2/10), retrying in 3s",
+  );
+  assert.equal(
+    formatAgyRetryStatus(2, 10, 0),
+    "Model unavailable (attempt 2/10), retrying...",
+  );
+  // Live countdown ticks down every second and switches to active status when remaining <= 0s
+  assert.deepEqual(
+    formatAgyLiveRetryLine(
+      { label: "Model unavailable", attempt: 2, maxAttempts: 10, retryAtMs: 10_000 },
+      7_200,
+    ),
+    { text: "Model unavailable (attempt 2/10), retrying in 3s", countingDown: true },
+  );
+  assert.deepEqual(
+    formatAgyLiveRetryLine(
+      { label: "Model unavailable", attempt: 2, maxAttempts: 10, retryAtMs: 10_000 },
+      10_000,
+    ),
+    { text: "Model unavailable (attempt 2/10), retrying...", countingDown: false },
+  );
+  assert.deepEqual(
+    formatAgyLiveRetryLine(
+      {
+        label: "Stream stalled",
+        attempt: 2,
+        maxAttempts: 10,
+        retryAtMs: 10_000,
+        activeSuffix: "restarting turn...",
+      },
+      10_500,
+    ),
+    { text: "Stream stalled (attempt 2/10), restarting turn...", countingDown: false },
   );
   assert.equal(
     formatAgyStallSummary({
-      retry: 2,
-      maxRetries: 3,
+      retry: 1,
+      maxRetries: 9,
       stalledMs: 90_000,
       toolActive: false,
-      backoffMs: 9_000,
+      backoffMs: 3_000,
     }),
-    "agy stream stalled for 90s with no events — restarting the turn (attempt 2/3), retrying in 9s...",
+    "agy stream stalled for 90s with no events — restarting the turn (attempt 2/10), retrying in 3s",
   );
 
   const tmpDir = mkdtempSync(path.join(tmpdir(), "pi-agy-retry-ui-"));
@@ -2180,16 +2216,17 @@ test("AgyThoughtTracker emits native-style retrying status and runtime scales st
     nowMs += 500;
     tracker.sync(cid, (a) => events.push(a));
     assert.equal(events.length, 1);
-    assert.deepEqual(events[0], {
-      type: "retrying",
-      active: true,
-      attempt: 2,
-      maxAttempts: 9,
-      delaySeconds: 3,
-      message: "Model unavailable (attempt 2/9), retrying in 3s...",
-      apiError:
-        "UNAVAILABLE (code 503): No capacity available for model gemini-4-argon-high on the server",
-    });
+    const firstRetry = events[0];
+    assert.equal(firstRetry?.type, "retrying");
+    if (firstRetry?.type === "retrying") {
+      assert.equal(firstRetry.active, true);
+      assert.equal(firstRetry.label, "Model unavailable");
+      assert.equal(firstRetry.attempt, 2);
+      assert.equal(firstRetry.maxAttempts, 10);
+      assert.equal(firstRetry.delaySeconds, 4);
+      assert.equal(firstRetry.message, "Model unavailable (attempt 2/10), retrying in 4s");
+      assert.equal(typeof firstRetry.retryAtMs, "number");
+    }
 
     writeFileSync(
       logPath,
@@ -2206,7 +2243,7 @@ test("AgyThoughtTracker emits native-style retrying status and runtime scales st
     assert.equal(events.length, 2);
     assert.equal(
       events[1]?.type === "retrying" ? events[1].message : "",
-      "Model unavailable (attempt 5/9), retrying in 25s...",
+      "Model unavailable (attempt 5/10), retrying in 25s",
     );
 
     // Once upstream responds, `retrying` clears immediately.
@@ -2321,7 +2358,7 @@ test("streamAntigravity keeps pre-compaction stall entries chronologically ahead
       customEntries.map((e) => e.customType),
       [AGY_STALL_ENTRY, AGY_STALL_ENTRY, AGY_STALL_ENTRY, AGY_COMPACTION_ENTRY],
     );
-    assert.match(customEntries[0]?.summary ?? "", /restarting the turn \(attempt 1\/3\)/);
+    assert.match(customEntries[0]?.summary ?? "", /restarting the turn \(attempt 2\/10\)/);
     assert.deepEqual(finalBlocks, [
       { type: "thinking", thinking: "Post-compaction thought" },
       { type: "text", text: "Resumed answer" },

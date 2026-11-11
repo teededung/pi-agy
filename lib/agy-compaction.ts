@@ -23,15 +23,17 @@ export function formatAgyStallSummary(
   >,
 ): string {
   const seconds = Math.max(1, Math.round(activity.stalledMs / 1000));
+  const attempt = activity.retry + 1;
+  const maxAttempts = Math.max(attempt, activity.maxRetries + 1);
   const delaySeconds =
     activity.backoffMs !== undefined && activity.backoffMs >= 1_000
       ? Math.max(1, Math.round(activity.backoffMs / 1000))
       : undefined;
-  const retrySuffix = delaySeconds !== undefined ? `, retrying in ${delaySeconds}s...` : "";
+  const retrySuffix = delaySeconds !== undefined ? `, retrying in ${delaySeconds}s` : "";
   return (
     `agy stream stalled for ${seconds}s with no events` +
     `${activity.toolActive ? " while a tool step was active" : ""}` +
-    ` — restarting the turn (attempt ${activity.retry}/${activity.maxRetries})${retrySuffix}` +
+    ` — restarting the turn (attempt ${attempt}/${maxAttempts})${retrySuffix}` +
     `${activity.apiError ? ` · agy: ${activity.apiError}` : ""}`
   );
 }
