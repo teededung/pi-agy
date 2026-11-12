@@ -16,7 +16,8 @@ export interface AgyModelInfo {
 /**
  * Build Pi's `thinkingLevelMap` from a model's discovered `agy` effort variants
  * so `/thinking` and thinking-level cycling only expose levels `agy` actually
- * supports for that model (e.g. `low`, `medium`, `high` — never `off` or `minimal`).
+ * supports for that model (e.g. `low`, `medium`, `high`, and `xhigh` when
+ * advertised — never `off` or `minimal`).
  */
 export function thinkingLevelMapForModel(
   model: Pick<AgyModelInfo, "supportedEfforts"> | undefined,
@@ -29,18 +30,24 @@ export function thinkingLevelMapForModel(
     low: supported.has("low") ? "low" : null,
     medium: supported.has("medium") ? "medium" : null,
     high: supported.has("high") ? "high" : null,
-    xhigh: null,
-    max: null,
+    xhigh: supported.has("xhigh") ? "xhigh" : null,
+    max: supported.has("max") ? "max" : null,
   };
 }
 
-const EFFORT_SUFFIX = /-(low|medium|high)$/i;
-const EFFORT_NAME_SUFFIX = /\s*\((?:low|medium|high)\)$/i;
+const VALID_AGY_EFFORTS = new Set<AgyEffort>(["low", "medium", "high", "xhigh", "max"]);
+
+export function asAgyEffort(raw: string | undefined): AgyEffort | undefined {
+  const normalized = raw?.trim().toLowerCase() as AgyEffort | undefined;
+  return normalized && VALID_AGY_EFFORTS.has(normalized) ? normalized : undefined;
+}
+
+const EFFORT_SUFFIX = /-(low|medium|high|xhigh|max)$/i;
+const EFFORT_NAME_SUFFIX = /\s*\((?:low|medium|high|xhigh|extra|max)\)$/i;
 
 function effortFromId(id: string): AgyEffort | undefined {
   const match = id.match(EFFORT_SUFFIX);
-  const effort = match?.[1]?.toLowerCase();
-  return effort === "low" || effort === "medium" || effort === "high" ? effort : undefined;
+  return asAgyEffort(match?.[1]);
 }
 
 /** Collapse one effort variant while retaining its discovered effort. */
@@ -94,10 +101,9 @@ export function mergeAgyModels(models: readonly AgyModelInfo[]): AgyModelInfo[] 
     if (isAgyModelHidden(raw.id)) continue;
     const normalized = normalizeAgyModelId(raw.id, raw.name);
     const efforts = raw.supportedEfforts?.length
-      ? raw.supportedEfforts.filter(
-          (effort): effort is AgyEffort =>
-            effort === "low" || effort === "medium" || effort === "high",
-        )
+      ? raw.supportedEfforts
+          .map((effort) => asAgyEffort(effort))
+          .filter((effort): effort is AgyEffort => effort !== undefined)
       : normalized.supportedEfforts;
     const existing = merged.find((model) => model.id === normalized.id);
     if (!existing) {
@@ -140,6 +146,11 @@ export function resolveAgyModelEffort(
 ): AgyEffort | undefined {
   if (!model || model.supportedEfforts.length === 0) return undefined;
   if (requested && model.supportedEfforts.includes(requested)) return requested;
+  // Clamp down one step at a time when a higher level (e.g. xhigh) is requested on a 3-tier model.
+  if (requested === "max" && model.supportedEfforts.includes("xhigh")) return "xhigh";
+  if ((requested === "max" || requested === "xhigh") && model.supportedEfforts.includes("high")) {
+    return "high";
+  }
   return model.defaultEffort ?? model.supportedEfforts[0];
 }
 
@@ -150,6 +161,18 @@ export const ALL_FALLBACK_MODELS: AgyModelInfo[] = [
     name: "Gemini 4 Argon",
     supportedEfforts: ["medium", "high", "low"],
     defaultEffort: "medium",
+  },
+  {
+    id: "gemini-4-carbon",
+    name: "Gemini 4 Carbon",
+    supportedEfforts: ["medium", "high", "low"],
+    defaultEffort: "medium",
+  },
+  {
+    id: "gemini-4-hydrogen",
+    name: "Gemini 4 Hydrogen",
+    supportedEfforts: ["high", "xhigh", "medium", "low"],
+    defaultEffort: "high",
   },
   {
     id: "gemini-3.8-flash",
@@ -267,6 +290,8 @@ export const CONSULT_MODEL_ALIASES: Readonly<Record<string, string>> = {
   opus: "claude-opus-5-5",
   sonnet: "claude-sonnet-5-5",
   argon: "gemini-4-argon",
+  carbon: "gemini-4-carbon",
+  hydrogen: "gemini-4-hydrogen",
   flash: "gemini-3.8-flash",
 };
 
@@ -283,6 +308,12 @@ export function parseConsultEffortToken(token: string | undefined): AgyEffort | 
     case "3":
     case "high":
       return "high";
+    case "4":
+    case "xhigh":
+    case "extra":
+      return "xhigh";
+    case "max":
+      return "max";
     default:
       return undefined;
   }
@@ -330,16 +361,16 @@ export type ResolvedAgyConsultSpec =
     };
 
 export const CONSULT_USAGE_MESSAGE =
-  'Usage: /m <opus|sonnet|argon|flash>[1|2|3] [prompt] (thinking: 1=low, 2=mid, 3=high, omit=session current)';
+  'Usage: /m <opus|sonnet|argon|carbon|hydrogen|flash>[1|2|3|4] [prompt] (thinking: 1=low, 2=mid, 3=high, 4=xhigh, omit=session current)';
 
 /**
  * Parse `/m <spec> [prompt]` arguments.
  * Supports:
  * - `/m argon <prompt>` (uses session's current thinking level)
- * - `/m argon3 <prompt>`, `/m opus2 <prompt>`, `/m sonnet1 <prompt>`, `/m flash3 <prompt>`
+ * - `/m argon3 <prompt>`, `/m hydrogen4 <prompt>`, `/m opus2 <prompt>`, `/m sonnet1 <prompt>`, `/m flash3 <prompt>`
  * - `/m argon 3 <prompt>`, `/m opus:2 <prompt>`, `/m argon-1 <prompt>`
  * - `/m argon3`, `/m flash` (when `allowEmptyPrompt: true`, switches session model/thinking)
- * - Full/partial model IDs (`gemini-4-argon`, `claude-opus-5-5`, etc.)
+ * - Full/partial model IDs (`gemini-4-argon`, `gemini-4-hydrogen`, `claude-opus-5-5`, etc.)
  */
 export function resolveAgyConsultSpec(
   args: string,
@@ -361,13 +392,15 @@ export function resolveAgyConsultSpec(
   let explicitEffort: AgyEffort | undefined;
 
   const aliasMatch = rawSpec.match(
-    /^(opus|sonnet|argon|flash)(?:[-:]?(1|2|3|low|mid|medium|high))?$/i,
+    /^(opus|sonnet|argon|carbon|hydrogen|flash)(?:[-:]?(1|2|3|4|low|mid|medium|high|xhigh|extra|max))?$/i,
   );
   if (aliasMatch) {
     modelToken = aliasMatch[1]!;
     explicitEffort = parseConsultEffortToken(aliasMatch[2]);
   } else {
-    const colonMatch = rawSpec.match(/^([a-z0-9][a-z0-9._-]*?):(1|2|3|low|mid|medium|high)$/i);
+    const colonMatch = rawSpec.match(
+      /^([a-z0-9][a-z0-9._-]*?):(1|2|3|4|low|mid|medium|high|xhigh|extra|max)$/i,
+    );
     if (colonMatch) {
       modelToken = colonMatch[1]!;
       explicitEffort = parseConsultEffortToken(colonMatch[2]);
@@ -378,12 +411,12 @@ export function resolveAgyConsultSpec(
   if (!model) {
     return {
       ok: false,
-      error: `Unknown model "${rawSpec}". Supported aliases: opus, sonnet, argon, flash (with optional 1=low, 2=mid, 3=high).`,
+      error: `Unknown model "${rawSpec}". Supported aliases: opus, sonnet, argon, carbon, hydrogen, flash (with optional 1=low, 2=mid, 3=high, 4=xhigh).`,
     };
   }
 
   if (explicitEffort === undefined && rest) {
-    const secondMatch = rest.match(/^(1|2|3|low|mid|medium|high)(?:\s+([\s\S]*))?$/i);
+    const secondMatch = rest.match(/^(1|2|3|4|low|mid|medium|high|xhigh|extra|max)(?:\s+([\s\S]*))?$/i);
     if (secondMatch) {
       explicitEffort = parseConsultEffortToken(secondMatch[1]);
       rest = (secondMatch[2] ?? "").trim();
@@ -414,7 +447,7 @@ export function getAgyConsultCompletions(
   if (argumentPrefix.includes(" ")) return null;
   const prefix = argumentPrefix.trim().toLowerCase();
   const activeId = currentModelId?.trim().toLowerCase();
-  const aliases = ["argon", "opus", "sonnet", "flash"] as const;
+  const aliases = ["hydrogen", "carbon", "argon", "opus", "sonnet", "flash"] as const;
   const items: Array<{ value: string; label: string; description: string }> = [];
 
   for (const alias of aliases) {
@@ -429,11 +462,15 @@ export function getAgyConsultCompletions(
         description: `${modelLabel} · session thinking`,
       });
     }
-    for (const [digit, level, effortValue] of [
+    const levels: Array<readonly [string, string, AgyEffort]> = [
       ["1", "low", "low"],
       ["2", "mid", "medium"],
       ["3", "high", "high"],
-    ] as const) {
+    ];
+    if (model?.supportedEfforts.includes("xhigh")) {
+      levels.push(["4", "xhigh", "xhigh"]);
+    }
+    for (const [digit, level, effortValue] of levels) {
       if (isCurrentModel && currentEffort === effortValue) continue;
       items.push({
         value: `${alias}${digit} `,

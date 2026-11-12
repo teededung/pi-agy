@@ -9,7 +9,7 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { splitAgyModelEffort, type AgyEffort } from "./agy-client.ts";
 import type { AgyExecutionMode } from "./agy-profile.ts";
-import { mergeAgyModels, type AgyModelInfo } from "./models.ts";
+import { asAgyEffort, mergeAgyModels, type AgyModelInfo } from "./models.ts";
 import {
   sanitizeAgentResponseDelta,
   stripHallucinatedTurnSuffix,
@@ -712,18 +712,6 @@ export function flattenSelectValues(opt: SelectConfigOption): AcpConfigSelectOpt
   return opt.options.flatMap((entry) => ("options" in entry ? entry.options : [entry]));
 }
 
-function asValidAgyEffort(raw: string | undefined): AgyEffort | undefined {
-  const normalized = raw?.trim().toLowerCase();
-  return normalized === "low" || normalized === "medium" || normalized === "high"
-    ? normalized
-    : undefined;
-}
-
-/**
- * Synthesize normalized `AgyModelInfo[]` from live ACP `configOptions` (or
- * legacy `models` state) so warm ACP sessions can populate/enrich Pi's model
- * and thinking-level catalog without spawning an extra `agy models` process.
- */
 export function modelsFromAcpSessionState(state: AcpSessionState): AgyModelInfo[] | undefined {
   const modelOpt = findAcpSelectOption(state, "model");
   const thoughtOpt = findAcpSelectOption(state, "thought_level");
@@ -731,36 +719,41 @@ export function modelsFromAcpSessionState(state: AcpSessionState): AgyModelInfo[
   const supportedEfforts: AgyEffort[] = [];
   if (thoughtOpt) {
     for (const item of flattenSelectValues(thoughtOpt)) {
-      const effort = asValidAgyEffort(item.value);
+      const effort = asAgyEffort(item.value);
       if (effort && !supportedEfforts.includes(effort)) {
         supportedEfforts.push(effort);
       }
     }
   }
-  const defaultEffort =
-    asValidAgyEffort(thoughtOpt?.currentValue) ?? supportedEfforts[0];
+  const defaultEffort = asAgyEffort(thoughtOpt?.currentValue) ?? supportedEfforts[0];
 
   const rawEntries: AgyModelInfo[] = [];
   if (modelOpt) {
+    const activeModelId = modelOpt.currentValue?.trim();
     for (const choice of flattenSelectValues(modelOpt)) {
       const id = choice.value.trim();
       if (!id) continue;
+      // ACP's `thought_level` options only reflect the currently selected model,
+      // so avoid copying model-specific tiers (like Hydrogen's `xhigh`) onto others.
+      const attachEfforts = !activeModelId || id === activeModelId;
       rawEntries.push({
         id,
         name: choice.name.trim() || id,
-        supportedEfforts: [...supportedEfforts],
-        ...(defaultEffort ? { defaultEffort } : {}),
+        supportedEfforts: attachEfforts ? [...supportedEfforts] : [],
+        ...(attachEfforts && defaultEffort ? { defaultEffort } : {}),
       });
     }
   } else if (state.models?.availableModels?.length) {
+    const activeModelId = state.models.currentModelId?.trim();
     for (const choice of state.models.availableModels) {
       const id = choice.modelId.trim();
       if (!id) continue;
+      const attachEfforts = !activeModelId || id === activeModelId;
       rawEntries.push({
         id,
         name: choice.name.trim() || id,
-        supportedEfforts: [...supportedEfforts],
-        ...(defaultEffort ? { defaultEffort } : {}),
+        supportedEfforts: attachEfforts ? [...supportedEfforts] : [],
+        ...(attachEfforts && defaultEffort ? { defaultEffort } : {}),
       });
     }
   }

@@ -835,12 +835,14 @@ const OVERFLOW_PATTERN = /context (length|window|size).*(exceed|limit)|exceeds.*
 const RECOVERED_INTERRUPTION_PATTERN =
   /stream was interrupted|network issue connecting to the server|connection reset|unexpected EOF|model request failed|API error|UNAVAILABLE|No capacity available|RESOURCE_EXHAUSTED|rate limit|overloaded|attempt \d+ failed|code (?:429|500|502|503|504)/i;
 
-/** Map an explicit pi thinking level to agy's `--effort` (low|medium|high). */
+/** Map an explicit pi thinking level to agy's `--effort` (low|medium|high|xhigh|max). */
 export function mapThinkingToEffort(level: ThinkingLevel | undefined): AgyEffort | undefined {
   if (level === undefined) return undefined;
   if (level === "low" || level === "minimal") return "low";
   if (level === "medium") return "medium";
-  return "high"; // high, xhigh, and max
+  if (level === "high") return "high";
+  if (level === "xhigh") return "xhigh";
+  return "max";
 }
 
 let replayCallSeq = 0;

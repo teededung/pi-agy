@@ -69,8 +69,13 @@ import { AgyDriverSession } from "../lib/agy-driver.ts";
 import {
   ALL_FALLBACK_MODELS,
   getAgyConsultCompletions,
+  mergeAgyModels,
+  parseAgyModels,
   resolveAgyConsultSpec,
+  resolveAgyModelEffort,
 } from "../lib/models.ts";
+import { splitAgyModelEffort } from "../lib/agy-client.ts";
+import { getSupportedThinkingLevels, type Api, type Model } from "@earendil-works/pi-ai";
 import {
   boundSummarizationPrompt,
   contextHasPriorBoostActivity,
@@ -79,6 +84,7 @@ import {
   isBridgedMcpStep,
   isReadOnlyAsideSystemPrompt,
   latestUserPrompt,
+  mapThinkingToEffort,
   mapUsage,
   piHistoryBootstrap,
   streamAntigravity,
@@ -3271,6 +3277,83 @@ test("agy 1.5.0 alignment: Retry-After backoff tracking, readOnlyPermissions arg
   assert.match(parsedErr, /terminated tasks: task-12, subagent-deepcoder/);
   assert.match(parsedErr, /\[agy\] print timeout after 30m0s/);
 });
+
+test("parseAgyModels collapses gemini-4-hydrogen-xhigh into one model with 4 thinking levels and heals stale cache", () => {
+  const rawOutput = [
+    "Fetching available models...",
+    "gemini-4-argon-medium\tGemini 4 Argon (Medium)",
+    "gemini-4-argon-high\tGemini 4 Argon (High)",
+    "gemini-4-argon-low\tGemini 4 Argon (Low)",
+    "gemini-4-hydrogen-high\tGemini 4 Hydrogen (High)",
+    "gemini-4-hydrogen-xhigh\tGemini 4 Hydrogen (XHigh)",
+    "gemini-4-hydrogen-medium\tGemini 4 Hydrogen (Medium)",
+    "gemini-4-hydrogen-low\tGemini 4 Hydrogen (Low)",
+  ].join("\n");
+
+  const parsed = parseAgyModels(rawOutput);
+  assert.deepEqual(
+    parsed.map((m) => m.id),
+    ["gemini-4-argon", "gemini-4-hydrogen"],
+  );
+
+  const hydrogen = parsed.find((m) => m.id === "gemini-4-hydrogen")!;
+  const argon = parsed.find((m) => m.id === "gemini-4-argon")!;
+  assert.equal(hydrogen.name, "Gemini 4 Hydrogen");
+  assert.deepEqual(hydrogen.supportedEfforts, ["high", "xhigh", "medium", "low"]);
+
+  const toAiModel = (info: typeof hydrogen) =>
+    ({
+      ...toProviderModel(info),
+      api: "antigravity-stream-json" as Api,
+      provider: "antigravity",
+      baseUrl: "",
+    }) as unknown as Model<Api>;
+
+  assert.deepEqual(getSupportedThinkingLevels(toAiModel(hydrogen)), [
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+  ]);
+  assert.deepEqual(getSupportedThinkingLevels(toAiModel(argon)), ["low", "medium", "high"]);
+
+  // Legacy cached model-list.json entries (`gemini-4-hydrogen` + unmerged `gemini-4-hydrogen-xhigh`) heal in place
+  const healed = mergeAgyModels([
+    {
+      id: "gemini-4-hydrogen",
+      name: "Gemini 4 Hydrogen",
+      supportedEfforts: ["high", "medium", "low"],
+      defaultEffort: "high",
+    },
+    {
+      id: "gemini-4-hydrogen-xhigh",
+      name: "Gemini 4 Hydrogen (XHigh)",
+      supportedEfforts: [],
+    },
+  ]);
+  assert.equal(healed.length, 1);
+  assert.deepEqual(healed[0]?.supportedEfforts, ["high", "medium", "low", "xhigh"]);
+
+  // Effort mapping, legacy split, clamping, and `/m` consult parsing for xhigh
+  assert.equal(mapThinkingToEffort("xhigh"), "xhigh");
+  assert.deepEqual(splitAgyModelEffort("gemini-4-hydrogen-xhigh", undefined), {
+    baseModel: "gemini-4-hydrogen",
+    effort: "xhigh",
+  });
+  assert.equal(resolveAgyModelEffort(hydrogen, "xhigh"), "xhigh");
+  assert.equal(resolveAgyModelEffort(argon, "xhigh"), "high");
+
+  const consult = resolveAgyConsultSpec("hydrogen4 inspect", parsed);
+  assert.equal(consult.ok, true);
+  if (consult.ok) {
+    assert.equal(consult.model.id, "gemini-4-hydrogen");
+    assert.equal(consult.effort, "xhigh");
+    assert.equal(consult.prompt, "inspect");
+  }
+  const completions = getAgyConsultCompletions("hydrogen", parsed);
+  assert.ok(completions?.some((item) => item.label === "hydrogen4"));
+});
+
 
 
 

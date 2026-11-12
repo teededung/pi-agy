@@ -311,7 +311,13 @@ async function discoverModels(
   const live = await listAgyModels();
   const combinedLive =
     live.length > 0 && acpFallbackModels?.length
-      ? mergeAgyModels([...live, ...acpFallbackModels])
+      ? mergeAgyModels([
+          ...live,
+          ...acpFallbackModels.filter(
+            (model) =>
+              !live.some((entry) => entry.id === model.id && entry.supportedEfforts.length > 0),
+          ),
+        ])
       : live.length > 0
         ? live
         : (acpFallbackModels ?? []);
@@ -3917,7 +3923,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
 
   const consultCommandOptions = {
     description:
-      "Switch or one-shot consult model: /m <opus|sonnet|argon|flash>[1|2|3] [prompt] (omit prompt to switch; with prompt, consults for 1 turn)",
+      "Switch or one-shot consult model: /m <opus|sonnet|argon|carbon|hydrogen|flash>[1|2|3|4] [prompt] (omit prompt to switch; with prompt, consults for 1 turn)",
     getArgumentCompletions: (argumentPrefix: string) => {
       const probedModelId = activeSessionCtx
         ? probeCtx(() =>

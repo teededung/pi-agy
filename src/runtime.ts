@@ -17,6 +17,7 @@ import type { AcpAuthMethod } from "../lib/agy-acp-client.ts";
 import {
   AgySpawnError,
   AgyStallError,
+  type AgyEffort,
   type AgyPromptImage,
   type AgyTurnRequest,
 } from "../lib/agy-client.ts";
@@ -200,7 +201,7 @@ export interface AntigravityRuntimeShape {
      */
     readonly bootstrapSuffix?: string;
     readonly modelId: string;
-    readonly effort?: "low" | "medium" | "high";
+    readonly effort?: AgyEffort;
     readonly agent?: string;
     readonly mode?: AgyExecutionMode;
     readonly readOnlyPermissions?: boolean;

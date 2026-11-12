@@ -29,7 +29,7 @@ import {
 import { AgyThoughtTracker } from "./agy-thoughts.ts";
 
 /** agy reasoning effort, as accepted by `agy --effort`. */
-export type AgyEffort = "low" | "medium" | "high";
+export type AgyEffort = "low" | "medium" | "high" | "xhigh" | "max";
 
 export interface AgyPromptImage {
   data: string;
@@ -155,7 +155,7 @@ export class AgyStallError extends Error {
   }
 }
 
-const MODEL_EFFORT_SUFFIX_RE = /^(.+)-(low|medium|high)$/i;
+const MODEL_EFFORT_SUFFIX_RE = /^(.+)-(low|medium|high|xhigh|max)$/i;
 const MODEL_EFFORT_FALLBACK_ERROR_RE =
   /invalid model selection|--effort(?:=\S+)? is not supported|effort isn't adjustable|conflicts with --effort|unrecognized effort|unknown model|doesn't support thinking level|unsupported thinking level|flag provided but not defined: --?effort|no such flag -+-?effort/i;
 

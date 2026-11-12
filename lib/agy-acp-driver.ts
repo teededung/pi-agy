@@ -32,7 +32,7 @@ import {
   type AcpSessionNotification,
   type AcpSessionState,
 } from "./agy-acp-client.ts";
-import type { AgyModelInfo } from "./models.ts";
+import { mergeAgyModels, type AgyModelInfo } from "./models.ts";
 import {
   killAgyTree,
   trackAgyChild,
@@ -1045,7 +1045,9 @@ export class AgyAcpDriverSession implements AgyTurnExecutor {
   #captureSessionModels(state: AcpSessionState): void {
     const discovered = modelsFromAcpSessionState(state);
     if (discovered?.length) {
-      this.#discoveredModels = discovered;
+      this.#discoveredModels = this.#discoveredModels?.length
+        ? mergeAgyModels([...this.#discoveredModels, ...discovered])
+        : discovered;
     }
   }
 

@@ -1085,6 +1085,48 @@ test("Group B1..B5: MCP HTTP bridge injection, loopback NO_PROXY, refusal/quota 
     )?.some((m) => m.id === "gemini-4-argon"),
   );
 
+  // ACP thought_level options for active gemini-4-hydrogen (including xhigh) must NOT leak onto other models
+  const acpHydrogenModels = modelsFromAcpSessionState(
+    decodeAcpSessionState({
+      configOptions: [
+        {
+          id: "model",
+          category: "model",
+          type: "select",
+          currentValue: "gemini-4-hydrogen",
+          options: [
+            { value: "gemini-4-hydrogen", name: "Gemini 4 Hydrogen" },
+            { value: "gemini-4-argon", name: "Gemini 4 Argon" },
+          ],
+        },
+        {
+          id: "thought_level",
+          category: "thought_level",
+          type: "select",
+          currentValue: "xhigh",
+          options: [
+            { value: "low", name: "Low" },
+            { value: "medium", name: "Medium" },
+            { value: "high", name: "High" },
+            { value: "xhigh", name: "Extra" },
+          ],
+        },
+      ],
+    }),
+  );
+  assert.deepEqual(
+    acpHydrogenModels?.find((m) => m.id === "gemini-4-hydrogen")?.supportedEfforts,
+    ["low", "medium", "high", "xhigh"],
+  );
+  assert.equal(
+    acpHydrogenModels?.find((m) => m.id === "gemini-4-hydrogen")?.defaultEffort,
+    "xhigh",
+  );
+  assert.deepEqual(
+    acpHydrogenModels?.find((m) => m.id === "gemini-4-argon")?.supportedEfforts,
+    [],
+  );
+
   const authErr = new AgyAcpRpcError(
     "session/prompt",
     ACP_AUTH_REQUIRED_CODE,
