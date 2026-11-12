@@ -8,8 +8,8 @@ import which from "which";
 import { killAgyTree, trackAgyChild, untrackAgyChild } from "./agy-children.ts";
 
 export const MIN_AGY_VERSION = "1.1.22";
-/** Soft target: includes 429/5xx Retry-After retries, headless background-task wait, finished_reason, and stall/artifact fixes. */
-export const RECOMMENDED_AGY_VERSION = "1.5.0";
+/** Soft target: includes ACP session/cancel fixes (1.5.4+), Carbon gateway thinking fix, background-input wakeups, and 1.5.7 reliability improvements. */
+export const RECOMMENDED_AGY_VERSION = "1.5.7";
 export function isBelowRecommendedAgy(version: string | undefined): boolean {
   return Boolean(version && valid(version) && !gte(version, RECOMMENDED_AGY_VERSION));
 }
