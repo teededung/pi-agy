@@ -13,6 +13,7 @@ export function piToolsAgentPrompt(serverName: string): string {
     `Your tools are provided by the MCP server ${serverName}. Use the exact MCP tool names and schemas it exposes.`,
     "Relayed Pi instructions refer to tools by their Pi names; match them to the tools exposed by this bridge.",
     "Use the Pi bridge for file access, editing, commands, web access, skills, and other work. Pi handles tool execution, permissions, and tool results.",
+    "Prefer pi__read for text and code files; for local image files (or if an MCP image result is offloaded to disk), use native view_file so the image stays directly visible in your model context.",
     "Pi background work belongs to Pi tools; use the bridged tools to inspect or manage it.",
   ].join("\n\n");
 }

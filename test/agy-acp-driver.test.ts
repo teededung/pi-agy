@@ -57,6 +57,7 @@ import {
   resolveBtwOverlayPalette,
 } from "../extensions/btw.ts";
 import {
+  extractReferencedPromptImages,
   formatIsolatedToolLine,
   isBridgedMcpStep,
   streamAntigravity,
@@ -2649,5 +2650,101 @@ test("streamAntigravity sends native ACP images without disk-path instructions a
     }
   } finally {
     await runAntigravity(legacyRuntime, legacyService.close);
+  }
+});
+
+test("extractReferencedPromptImages extracts valid local image paths and auto-attaches them in ACP streamAntigravity turns", async () => {
+  const tinyPngBase64 =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+  const fakeJpegBase64 = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46]).toString("base64");
+  const tempDir = mkdtempSync(path.join(tmpdir(), "pi-agy-ref-img-"));
+  const absPng = path.join(tempDir, "orca-paste-test.png");
+  const relJpegAsPng = path.join(tempDir, "shot.png");
+  const fakeTextPng = path.join(tempDir, "not-an-image.png");
+
+  writeFileSync(absPng, Buffer.from(tinyPngBase64, "base64"));
+  writeFileSync(relJpegAsPng, Buffer.from(fakeJpegBase64, "base64"));
+  writeFileSync(fakeTextPng, "not an image at all");
+
+  const fake = createFakeAcpSpawn();
+  const innerDriver = new AgyAcpDriverSession();
+  const acpExecutor = {
+    supportsNativeSystemPrompt: true,
+    supportsNativeImages: true,
+    run: (req: Parameters<typeof innerDriver.run>[0]) =>
+      innerDriver.run({ ...req, spawnOverride: fake.spawnOverride }),
+    snapshot: () => innerDriver.snapshot(),
+    close: (
+      reason: Parameters<typeof innerDriver.close>[0],
+      cause?: Parameters<typeof innerDriver.close>[1],
+    ) => innerDriver.close(reason, cause),
+  };
+  const runtime = createAntigravityRuntime(acpExecutor);
+  const service = runtime.runSync(AntigravityRuntime);
+  const replay = new AgyReplayStore();
+  const bridge = new AgyPiBridge("pi-test");
+  const prevPaceEnv = process.env.PI_ANTIGRAVITY_THINKING_PACE;
+  process.env.PI_ANTIGRAVITY_THINKING_PACE = "0";
+
+  const model: Model<string> = {
+    id: "gemini-4-argon",
+    name: "Gemini 4 Argon",
+    api: "antigravity-stream-json",
+    provider: "antigravity",
+    baseUrl: "agy://local-stream-json",
+    reasoning: true,
+    input: ["text", "image"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 1_000_000,
+    maxTokens: 64_000,
+  };
+
+  try {
+    const promptWithRefs = [
+      `Xem anh nay: ${absPng}`,
+      "Va @shot.png",
+      `Lap lai ${absPng}`,
+      `Bo qua https://example.com/a.png va ${fakeTextPng}`,
+    ].join("\n");
+
+    const extracted = extractReferencedPromptImages(promptWithRefs, tempDir);
+    assert.deepEqual(extracted, [
+      { data: tinyPngBase64, mimeType: "image/png" },
+      { data: fakeJpegBase64, mimeType: "image/jpeg" },
+    ]);
+
+    // Deduplicates bytes already present in existingImages
+    const deduped = extractReferencedPromptImages(promptWithRefs, tempDir, [
+      { data: tinyPngBase64, mimeType: "image/png" },
+    ]);
+    assert.deepEqual(deduped, [{ data: fakeJpegBase64, mimeType: "image/jpeg" }]);
+
+    // ACP streamAntigravity auto-attaches local pasted image paths even when content only has text
+    const streamFn = streamAntigravity(runtime, service, replay, bridge);
+    const textOnlyPrompt = `xem tai sao?\n${absPng}`;
+    const ctx = {
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: textOnlyPrompt }],
+          timestamp: 1,
+        },
+      ],
+    } as unknown as TranscriptContext;
+    for await (const _ev of streamFn(model, ctx)) {
+      // drain
+    }
+
+    const promptCalls = fake.rpcLog.filter((c) => c.method === "session/prompt");
+    assert.equal(promptCalls.length, 1);
+    assert.deepEqual(promptCalls[0]!.params.prompt, [
+      { type: "image", data: tinyPngBase64, mimeType: "image/png" },
+      { type: "text", text: textOnlyPrompt },
+    ]);
+  } finally {
+    if (prevPaceEnv === undefined) delete process.env.PI_ANTIGRAVITY_THINKING_PACE;
+    else process.env.PI_ANTIGRAVITY_THINKING_PACE = prevPaceEnv;
+    await runAntigravity(runtime, service.close);
+    rmSync(tempDir, { recursive: true, force: true });
   }
 });

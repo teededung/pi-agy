@@ -157,7 +157,10 @@ test("Pi tool agent scopes MCP to its bridge and removes only its own configurat
   await agent.prepare(bridge);
   assert.equal(agent.isPrepared(), true);
   const agentFile = path.join(root, agent.name, "agent.md");
-  const definition = JSON.parse((await readFile(agentFile, "utf8")).split("---\n")[1]);
+  const agentMarkdown = await readFile(agentFile, "utf8");
+  const definition = JSON.parse(agentMarkdown.split("---\n")[1]);
+  assert.equal(PI_TOOLS_AGENT_NATIVE_TOOLS.includes("view_file"), true);
+  assert.equal(agentMarkdown.includes("view_file"), true);
   assert.deepEqual(definition.tools, [...PI_TOOLS_AGENT_NATIVE_TOOLS]);
   assert.equal(EAGER_PI_BRIDGE_TOOLS_CONFIG.pi__web_search?.eager, true);
   assert.equal(EAGER_PI_BRIDGE_TOOLS_CONFIG.pi__fetch_content?.eager, true);

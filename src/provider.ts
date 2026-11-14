@@ -17,7 +17,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -347,6 +347,106 @@ function persistUserImagePart(
   const filePath = persistExtractedUserImage(extracted);
   if (!filePath) return undefined;
   return { filePath, image: extracted.image };
+}
+
+const MAX_REFERENCED_PROMPT_IMAGES = 8;
+const MAX_REFERENCED_PROMPT_IMAGE_BYTES = 10 * 1024 * 1024;
+const REFERENCED_IMAGE_PATH_RE =
+  /["']([^"'\r\n]+?\.(?:png|jpe?g|gif|webp|bmp))["']|(?<=^|[\s(\[:=])([^\s"'`<>()[\]{},;]+?\.(?:png|jpe?g|gif|webp|bmp))(?=$|[\s)\]}>,.;:!?'"`])/gi;
+
+function detectImageExtensionFromBytes(bytes: Buffer): string | undefined {
+  if (bytes.length >= 4 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) {
+    return "png";
+  }
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return "jpg";
+  }
+  if (bytes.length >= 4 && bytes.subarray(0, 4).toString("ascii") === "GIF8") {
+    return "gif";
+  }
+  if (
+    bytes.length >= 12 &&
+    bytes.subarray(0, 4).toString("ascii") === "RIFF" &&
+    bytes.subarray(8, 12).toString("ascii") === "WEBP"
+  ) {
+    return "webp";
+  }
+  if (bytes.length >= 2 && bytes[0] === 0x42 && bytes[1] === 0x4d) {
+    return "bmp";
+  }
+  return undefined;
+}
+
+function resolvePromptImageCandidate(rawToken: string, cwd: string): string | undefined {
+  let token = rawToken.trim();
+  if (!token) return undefined;
+  if (token.startsWith("@")) token = token.slice(1);
+  if (/^file:\/\//i.test(token)) {
+    try {
+      token = new URL(token).pathname;
+    } catch {
+      return undefined;
+    }
+  } else if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(token)) {
+    return undefined;
+  }
+  if (token === "~" || token.startsWith("~/") || token.startsWith("~\\")) {
+    token = path.join(homedir(), token.slice(2));
+  }
+  return path.isAbsolute(token) ? path.normalize(token) : path.resolve(cwd, token);
+}
+
+/**
+ * Resolve existing local image file paths referenced in user prompt text
+ * (e.g. terminal/Orca image pastes like `/var/.../orca-paste-*.png` or `@shot.png`)
+ * so ACP turns attach them natively instead of forcing tool/OCR round-trips.
+ */
+export function extractReferencedPromptImages(
+  text: string,
+  cwd: string,
+  existingImages: readonly AgyPromptImage[] = [],
+): AgyPromptImage[] {
+  if (!text) return [];
+  const seenPaths = new Set<string>();
+  const seenHashes = new Set<string>();
+  for (const existing of existingImages) {
+    if (!existing.data) continue;
+    try {
+      seenHashes.add(createHash("sha256").update(Buffer.from(existing.data, "base64")).digest("hex"));
+    } catch {
+      // ignore invalid base64 in existing images
+    }
+  }
+
+  const attached: AgyPromptImage[] = [];
+  REFERENCED_IMAGE_PATH_RE.lastIndex = 0;
+  for (const match of text.matchAll(REFERENCED_IMAGE_PATH_RE)) {
+    if (attached.length >= MAX_REFERENCED_PROMPT_IMAGES) break;
+    const rawToken = match[1] ?? match[2];
+    if (!rawToken) continue;
+    const resolved = resolvePromptImageCandidate(rawToken, cwd);
+    if (!resolved || seenPaths.has(resolved)) continue;
+    seenPaths.add(resolved);
+
+    try {
+      if (!existsSync(resolved)) continue;
+      const st = statSync(resolved);
+      if (!st.isFile() || st.size === 0 || st.size > MAX_REFERENCED_PROMPT_IMAGE_BYTES) continue;
+      const bytes = readFileSync(resolved);
+      const ext = detectImageExtensionFromBytes(bytes);
+      if (!ext) continue;
+      const hash = createHash("sha256").update(bytes).digest("hex");
+      if (seenHashes.has(hash)) continue;
+      seenHashes.add(hash);
+      attached.push({
+        data: bytes.toString("base64"),
+        mimeType: inferMimeTypeFromExtension(ext),
+      });
+    } catch {
+      // unreadable path — leave as plain text
+    }
+  }
+  return attached;
 }
 
 /**
@@ -1412,6 +1512,14 @@ export function streamAntigravity(
           sideSummaryRequest ||
           (sideRequest && isReadOnlyAsideSystemPrompt(systemPrompt));
 
+        const acpImages =
+          !summaryRequest && !sideSummaryRequest && executorMode === "acp"
+            ? [
+                ...userBatch.imageParts,
+                ...extractReferencedPromptImages(rawUserPrompt, turnCwd, userBatch.imageParts),
+              ]
+            : [];
+
         const controller = await turnRuntime.runPromise(
           turnService.beginStreamTurn({
             prompt: effectiveTurnPrompt,
@@ -1419,13 +1527,7 @@ export function streamAntigravity(
             // combine the slimmed Pi instruction relay with the aside directive
             // (stripping conflicting <btw_capabilities> tool claims).
             systemPrompt: effectiveSystemPrompt,
-            images:
-              summaryRequest ||
-              sideSummaryRequest ||
-              executorMode !== "acp" ||
-              userBatch.imageParts.length === 0
-                ? undefined
-                : userBatch.imageParts,
+            images: acpImages.length === 0 ? undefined : acpImages,
             historyBootstrap:
               summaryRequest || sideSummaryRequest
                 ? undefined

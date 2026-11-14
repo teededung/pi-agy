@@ -24,10 +24,12 @@ export const EAGER_PI_BRIDGE_TOOLS = [
 
 /**
  * Antigravity-exclusive native tools kept available alongside bridged Pi tools
- * so models retain native image generation and built-in web fallback when Pi
- * web extensions are not installed.
+ * so models retain native image viewing (`view_file`, avoiding ACP MCP image
+ * offloading), image generation, and built-in web fallback when Pi web
+ * extensions are not installed.
  */
 export const PI_TOOLS_AGENT_NATIVE_TOOLS = [
+  "view_file",
   "generate_image",
   "search_web",
   "read_url_content",
