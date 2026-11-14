@@ -11,7 +11,7 @@
 //   /grill-me       stress-test a plan or design via frontier-round interviews
 //   /agy            show agy conversation and persistent-driver status
 //   /agy-tools      toggle Pi tools on/off or show the current mode
-//   /agy-footer     toggle 2-row custom footer on/off or show status
+//   /agy-config     configure pi-agy settings (driver mode, custom footer)
 //   /agy-reset      drop the current agy conversation (next turn starts fresh)
 //   /agy-models     re-discover models from `agy models` and re-register
 //   /agy-login      authenticate Antigravity via ACP (`oauth-personal`, `oauth-business`, `gemini-api-key`, `agent-platform`)
@@ -70,12 +70,18 @@ import {
   RECOMMENDED_AGY_VERSION,
   runAgyCommand,
 } from "./lib/agy-diagnostics.ts";
+import {
+  normalizeAgyDriverMode,
+  resolveAgyDriverMode,
+  type AgyDriverMode,
+} from "./lib/agy-driver.ts";
 import { parseAgyAgents, readAgyProcessProfile } from "./lib/agy-profile.ts";
 import { createPiToolsAgent } from "./lib/pi-tools-agent.ts";
 import { readAgyToolMode, resolveAgyToolModeCommand, type AgyToolMode } from "./lib/tool-mode.ts";
 import {
   loadSavedAgyFooterMode,
   loadSavedAgyToolMode,
+  saveAgyDriverMode,
   saveAgyFooterMode,
   saveAgyToolMode,
 } from "./lib/tool-mode-settings.ts";
@@ -595,7 +601,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   };
   const runtime = createAntigravityRuntime(undefined, {
     onLiveActivity: (activity) => {
-      if (activity.type === "tool_start") {
+      if (activity.type === "tool_start" || activity.type === "tool_summary") {
         toolSummaries.recordToolStart(activity, mcpConfig.serverName);
         persistToolSummaries();
       }
@@ -1689,7 +1695,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   }
 
   function handleAgyActivity(activity: AgyActivity): void {
-    if (activity.type === "tool_start") {
+    if (activity.type === "tool_start" || activity.type === "tool_summary") {
       toolSummaries.recordToolStart(activity, mcpConfig.serverName);
       persistToolSummaries();
     }
@@ -2748,20 +2754,25 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         "tools on",
         "tools off",
         "tools status",
-        "footer",
-        "footer on",
-        "footer off",
-        "footer status",
+        "config",
+        "config status",
+        "config driver",
+        "config driver acp",
+        "config driver stream-json",
+        "config driver one-shot",
+        "config footer",
+        "config footer on",
+        "config footer off",
       ]
         .filter((value) => value.startsWith(prefix))
         .map((value) => ({ value, label: value })),
     handler: async (args, ctx) => {
       const [action, ...rest] = args.trim().split(/\s+/);
       if (action === "tools") return handleAgyToolsCommand(rest.join(" "), ctx);
-      if (action === "footer") return handleAgyFooterCommand(rest.join(" "), ctx);
+      if (action === "config") return handleAgyConfigCommand(rest.join(" "), ctx);
       if (args.trim()) {
         ctx.ui.notify(
-          'antigravity: use "/agy-tools", "/agy-footer", "/m", "/boost", "/teamwork", "/grill-me", "/agy-reset", "/agy-models", "/agy-agents", "/agy-doctor", "/agy-subagents", "/agy-tasks", "/agy-artifacts", or "/agy-usage".',
+          'antigravity: use "/agy-tools", "/agy-config", "/m", "/boost", "/teamwork", "/grill-me", "/agy-reset", "/agy-models", "/agy-agents", "/agy-doctor", "/agy-subagents", "/agy-tasks", "/agy-artifacts", or "/agy-usage".',
           "error",
         );
         return;
@@ -2806,14 +2817,149 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     },
   });
 
-  pi.registerCommand("agy-footer", {
-    description: "Toggle and save the 2-row custom footer, or use on, off, or status",
+  pi.registerCommand("agy-config", {
+    description: "Configure pi-agy settings (driver mode, custom footer)",
     getArgumentCompletions: (prefix) =>
-      ["on", "off", "status"]
+      [
+        "status",
+        "driver",
+        "driver acp",
+        "driver stream-json",
+        "driver one-shot",
+        "driver status",
+        "footer",
+        "footer on",
+        "footer off",
+        "footer status",
+      ]
         .filter((value) => value.startsWith(prefix))
         .map((value) => ({ value, label: value })),
-    handler: handleAgyFooterCommand,
+    handler: handleAgyConfigCommand,
   });
+
+  async function getActiveDriverMode(): Promise<AgyDriverMode> {
+    try {
+      const snap = await runAntigravity(runtime, service.snapshot);
+      if (snap.executor.mode === "persistent") return "stream-json";
+      if (snap.executor.mode === "one-shot") return "one-shot";
+      return "acp";
+    } catch {
+      return resolveAgyDriverMode();
+    }
+  }
+
+  async function applyDriverMode(
+    nextMode: AgyDriverMode,
+    ctx: ExtensionCommandContext,
+  ): Promise<void> {
+    await ctx.waitForIdle();
+    const envOverride = process.env.PI_ANTIGRAVITY_DRIVER?.trim();
+    await runAntigravity(runtime, service.switchDriverMode(nextMode));
+    try {
+      await saveAgyDriverMode(nextMode);
+      const overrideNote = envOverride
+        ? ` (Note: PI_ANTIGRAVITY_DRIVER=${envOverride} is set in env and will override saved setting on restart)`
+        : "";
+      ctx.ui.notify(`antigravity: driver set to ${nextMode}.${overrideNote}`, "info");
+    } catch (error) {
+      ctx.ui.notify(
+        `antigravity: switched active driver to ${nextMode}, but could not save (${error instanceof Error ? error.message : String(error)}).`,
+        "error",
+      );
+    }
+  }
+
+  async function handleAgyConfigCommand(
+    args: string,
+    ctx: ExtensionCommandContext,
+  ): Promise<void> {
+    const trimmed = args.trim();
+    const [section, ...rest] = trimmed.split(/\s+/);
+    const key = section?.toLowerCase() ?? "";
+    const subArg = rest.join(" ").trim();
+
+    const notifyAllStatus = async () => {
+      const driver = await getActiveDriverMode();
+      const footer = getFooterMode();
+      const envDriver = process.env.PI_ANTIGRAVITY_DRIVER?.trim();
+      const driverNote = envDriver ? ` (env: ${envDriver})` : "";
+      ctx.ui.notify(
+        `antigravity config:\n- driver: ${driver}${driverNote}\n- footer: ${footer.toUpperCase()}`,
+        "info",
+      );
+    };
+
+    if (!key) {
+      if (ctx.hasUI && typeof ctx.ui.select === "function") {
+        const driver = await getActiveDriverMode();
+        const footer = getFooterMode();
+        const choice = await ctx.ui.select("pi-agy configuration", [
+          `Driver mode (current: ${driver})`,
+          `Custom footer (current: ${footer.toUpperCase()})`,
+        ]);
+        if (!choice) return;
+        if (choice.startsWith("Driver mode")) {
+          const picked = await ctx.ui.select(`Select driver mode (current: ${driver})`, [
+            "acp — Antigravity ACP server (default)",
+            "stream-json — Legacy persistent stream-json driver",
+            "one-shot — One-shot --print per turn",
+          ]);
+          if (!picked) return;
+          const next = normalizeAgyDriverMode(picked.split(" ")[0]);
+          if (next) await applyDriverMode(next, ctx);
+          return;
+        }
+        if (choice.startsWith("Custom footer")) {
+          const picked = await ctx.ui.select(
+            `Select custom footer (current: ${footer.toUpperCase()})`,
+            ["on", "off"],
+          );
+          if (!picked) return;
+          await handleAgyFooterCommand(picked, ctx);
+          return;
+        }
+      }
+      await notifyAllStatus();
+      return;
+    }
+
+    if (key === "status" || key === "show") {
+      await notifyAllStatus();
+      return;
+    }
+
+    if (key === "driver") {
+      if (!subArg || subArg.toLowerCase() === "status") {
+        const driver = await getActiveDriverMode();
+        const envDriver = process.env.PI_ANTIGRAVITY_DRIVER?.trim();
+        ctx.ui.notify(
+          `antigravity: driver is ${driver}${envDriver ? ` (env PI_ANTIGRAVITY_DRIVER=${envDriver})` : ""}.`,
+          "info",
+        );
+        return;
+      }
+      const next = normalizeAgyDriverMode(subArg);
+      if (!next) {
+        ctx.ui.notify(
+          'agy-config driver: usage "/agy-config driver [acp|stream-json|one-shot|status]" (aliases: persistent, legacy).',
+          "error",
+        );
+        return;
+      }
+      await applyDriverMode(next, ctx);
+      return;
+    }
+
+    if (key === "footer") {
+      await handleAgyFooterCommand(subArg, ctx);
+      return;
+    }
+
+    ctx.ui.notify(
+      'agy-config: usage "/agy-config [status | driver [acp|stream-json|one-shot|status] | footer [on|off|status]]".',
+      "error",
+    );
+  }
 
   async function handleAgyFooterCommand(
     args: string,
@@ -2829,7 +2975,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     };
     if (action === undefined) {
       ctx.ui.notify(
-        'agy-footer: usage "/agy-footer [on|off|status]"; no argument toggles the footer.',
+        'agy-config footer: usage "/agy-config footer [on|off|status]"; no argument toggles the footer.',
         "error",
       );
       return;

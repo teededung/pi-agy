@@ -18,6 +18,7 @@
  *   markdown summary (`f30.f5`) from completed `CHECKPOINT` steps (`step_type = 23`).
  */
 
+import type { JsonObject } from "@earendil-works/pi-ai";
 import { closeSync, existsSync, openSync, readdirSync, readSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -120,12 +121,20 @@ export interface AgyCheckpointSummaryInfo {
   summary?: string;
 }
 
+export interface AgyPlannerToolCallInfo {
+  id: string;
+  name: string;
+  args: JsonObject;
+}
+
 export interface AgyThoughtPollResult {
   deltas: AgyThinkingDeltaActivity[];
   /** Newly completed checkpoint steps (`step_type = 23, status = 3`) observed in SQLite. */
   checkpoints: AgyCheckpointSummaryInfo[];
   /** Newly completed planner response usages (`step_type = 15, status = 3`) in this turn. */
   stepUsages: Array<{ stepId: number; usage: AgyUsage }>;
+  /** Newly observed planner tool calls carrying `toolSummary` / `toolAction` (for stream-json). */
+  toolSummaries: Array<{ stepId: number; name: string; args: JsonObject }>;
   /** True when new rows, status transitions, or growing step_payload bytes were observed. */
   dbProgressed: boolean;
   /** True when non-input/system agent steps (planner, tool, checkpoint) progressed in SQLite. */
@@ -267,6 +276,101 @@ function extractThinkingFromPlannerResponse(buf: Buffer): string {
     pos = next;
   }
   return chunks.join("");
+}
+
+/**
+ * Extract `PlannerResponse.tool_calls` (`CortexStep` field 20 -> repeated field 7:
+ * `f1 = id`, `f2 = name`, `f3 = argumentsJson`) from a raw `step_payload`.
+ */
+export function extractToolCallsFromStepPayload(
+  payload: Uint8Array | Buffer,
+): AgyPlannerToolCallInfo[] {
+  const buf = toBuffer(payload);
+  const out: AgyPlannerToolCallInfo[] = [];
+  let pos = 0;
+  while (pos < buf.length) {
+    const tag = readVarint(buf, pos);
+    if (!tag) break;
+    pos = tag[1];
+    const fieldNumber = Math.floor(tag[0] / 8);
+    const wireType = tag[0] & 7;
+    if (fieldNumber === 20 && wireType === 2) {
+      const len = readVarint(buf, pos);
+      if (!len) break;
+      const start = len[1];
+      const end = Math.min(buf.length, start + len[0]);
+      const prBuf = buf.subarray(start, end);
+      let prPos = 0;
+      while (prPos < prBuf.length) {
+        const prTag = readVarint(prBuf, prPos);
+        if (!prTag) break;
+        prPos = prTag[1];
+        const prField = Math.floor(prTag[0] / 8);
+        const prWire = prTag[0] & 7;
+        if (prField === 7 && prWire === 2) {
+          const tcLen = readVarint(prBuf, prPos);
+          if (!tcLen) break;
+          const tcStart = tcLen[1];
+          const tcEnd = Math.min(prBuf.length, tcStart + tcLen[0]);
+          const parsed = decodePlannerToolCall(prBuf.subarray(tcStart, tcEnd));
+          if (parsed) out.push(parsed);
+          prPos = tcEnd;
+          continue;
+        }
+        const prNext = skipWireValue(prBuf, prPos, prWire);
+        if (prNext === undefined) break;
+        prPos = prNext;
+      }
+      pos = end;
+      continue;
+    }
+    const next = skipWireValue(buf, pos, wireType);
+    if (next === undefined) break;
+    pos = next;
+  }
+  return out;
+}
+
+function decodePlannerToolCall(buf: Buffer): AgyPlannerToolCallInfo | undefined {
+  let id = "";
+  let name = "";
+  let argsJson = "";
+  let pos = 0;
+  while (pos < buf.length) {
+    const tag = readVarint(buf, pos);
+    if (!tag) break;
+    pos = tag[1];
+    const fieldNumber = Math.floor(tag[0] / 8);
+    const wireType = tag[0] & 7;
+    if (wireType === 2 && (fieldNumber === 1 || fieldNumber === 2 || fieldNumber === 3)) {
+      const len = readVarint(buf, pos);
+      if (!len) break;
+      const start = len[1];
+      const end = Math.min(buf.length, start + len[0]);
+      const text = buf.subarray(start, end).toString("utf8");
+      if (fieldNumber === 1) id = text;
+      else if (fieldNumber === 2) name = text;
+      else argsJson = text;
+      pos = end;
+      continue;
+    }
+    const next = skipWireValue(buf, pos, wireType);
+    if (next === undefined) break;
+    pos = next;
+  }
+  if (!name) return undefined;
+  let args: JsonObject = {};
+  if (argsJson) {
+    try {
+      const parsed: unknown = JSON.parse(argsJson);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        args = parsed as JsonObject;
+      }
+    } catch {
+      return undefined;
+    }
+  }
+  return { id, name, args };
 }
 
 /**
@@ -564,6 +668,7 @@ export class AgyThoughtTracker {
   #lastContextTokens: number | undefined;
   #lastTurnStepUsage: AgyUsage | undefined;
   #emittedStepUsages = new Set<number>();
+  #emittedToolSummaries = new Set<string>();
   #compactedAfterIdx = -1;
 
   /** Incremental CLI log tail state for live compaction detection. */
@@ -681,6 +786,7 @@ export class AgyThoughtTracker {
         deltas: [],
         checkpoints: [],
         stepUsages: [],
+        toolSummaries: [],
         dbProgressed: false,
         agentProgressed: retryAttempted,
         isGenerating: false,
@@ -720,6 +826,7 @@ export class AgyThoughtTracker {
         deltas: [],
         checkpoints: [],
         stepUsages: [],
+        toolSummaries: [],
         dbProgressed: false,
         agentProgressed: retryAttempted,
         isGenerating: false,
@@ -762,6 +869,7 @@ export class AgyThoughtTracker {
     const deltas: AgyThinkingDeltaActivity[] = [];
     const checkpoints: AgyCheckpointSummaryInfo[] = [];
     const stepUsages: Array<{ stepId: number; usage: AgyUsage }> = [];
+    const toolSummaries: Array<{ stepId: number; name: string; args: JsonObject }> = [];
 
     for (const row of rows) {
       if (row.idx < this.#minStepIndex) continue;
@@ -804,6 +912,18 @@ export class AgyThoughtTracker {
               stepId: row.idx,
             });
           }
+        }
+        const toolCalls = extractToolCallsFromStepPayload(row.step_payload);
+        for (let tcIdx = 0; tcIdx < toolCalls.length; tcIdx += 1) {
+          const tc = toolCalls[tcIdx]!;
+          const hasSummary =
+            (typeof tc.args.toolSummary === "string" && tc.args.toolSummary.trim().length > 0) ||
+            (typeof tc.args.toolAction === "string" && tc.args.toolAction.trim().length > 0);
+          if (!hasSummary) continue;
+          const key = `${row.idx}:${tc.id || tcIdx}`;
+          if (this.#emittedToolSummaries.has(key)) continue;
+          this.#emittedToolSummaries.add(key);
+          toolSummaries.push({ stepId: row.idx, name: tc.name, args: tc.args });
         }
         if (row.status === STEP_STATUS_DONE) {
           const stepUsage = extractUsageFromStepPayload(row.step_payload);
@@ -891,6 +1011,7 @@ export class AgyThoughtTracker {
       deltas,
       checkpoints,
       stepUsages,
+      toolSummaries,
       dbProgressed,
       agentProgressed,
       isGenerating,
@@ -1060,6 +1181,14 @@ export class AgyThoughtTracker {
         emitSideActivity({ type: "usage", usage: item.usage });
       }
     }
+    for (const item of res.toolSummaries) {
+      emitSideActivity({
+        type: "tool_summary",
+        stepId: item.stepId,
+        name: item.name,
+        args: item.args,
+      });
+    }
     return (
       res.deltas.length > 0 ||
       res.stepUsages.length > 0 ||
@@ -1113,6 +1242,9 @@ export class AgyThoughtTracker {
         }
       }
       return true;
+    }
+    if (activity.type === "tool_start") {
+      this.sync(conversationId, emitSideActivity);
     }
     if (
       activity.type === "text" ||

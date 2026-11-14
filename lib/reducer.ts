@@ -23,6 +23,7 @@ const MIN_VISIBLE_THOUGHT_TOKENS = 64;
 
 export type AgyActivity =
   | { type: "tool_start"; stepId?: number; conversationId?: string; name: string; args: JsonObject }
+  | { type: "tool_summary"; stepId?: number; name: string; args: JsonObject }
   | {
       type: "tool_done";
       stepId?: number;

@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import lockfile from "proper-lockfile";
+import { normalizeAgyDriverMode, type AgyDriverMode } from "./agy-driver.ts";
 import type { AgyFooterMode } from "./footer.ts";
 import type { AgyToolMode } from "./tool-mode.ts";
 
@@ -51,8 +52,24 @@ export function loadSavedAgyFooterMode(file = settingsPath()): AgyFooterMode | u
   throw new Error('Pi settings antigravity.footer must be exactly "on" or "off".');
 }
 
+/** Read the saved driver mode ("acp" | "stream-json" | "one-shot"). */
+export function loadSavedAgyDriverMode(file = settingsPath()): AgyDriverMode | undefined {
+  const document = readDocument(file);
+  const piAgy = isRecord(document["pi-agy"]) ? document["pi-agy"] : undefined;
+  const antigravity = document.antigravity as Record<string, unknown> | undefined;
+  const raw = piAgy?.driver ?? antigravity?.driver;
+  if (raw === undefined) return undefined;
+  const mode = normalizeAgyDriverMode(raw);
+  if (!mode) {
+    throw new Error(
+      'Pi settings driver must be one of "acp", "stream-json", "persistent", "legacy", or "one-shot".',
+    );
+  }
+  return mode;
+}
+
 async function saveAntigravitySetting(
-  key: "toolMode" | "footer",
+  key: "toolMode" | "footer" | "driver",
   value: string,
   file = settingsPath(),
 ): Promise<void> {
@@ -66,6 +83,11 @@ async function saveAntigravitySetting(
         ...(document.antigravity as Record<string, unknown> | undefined),
         [key]: value,
       };
+      if (key === "driver" && isRecord(document["pi-agy"]) && "driver" in document["pi-agy"]) {
+        const nextPiAgy = { ...document["pi-agy"] };
+        delete nextPiAgy.driver;
+        document["pi-agy"] = nextPiAgy;
+      }
       writeFileSync(temporary, `${JSON.stringify(document, null, 2)}\n`, {
         flag: "wx",
         mode: 0o600,
@@ -89,4 +111,9 @@ export async function saveAgyToolMode(mode: AgyToolMode, file = settingsPath()):
 /** Persist the custom footer preference ("on" | "off") under antigravity.footer. */
 export async function saveAgyFooterMode(mode: AgyFooterMode, file = settingsPath()): Promise<void> {
   await saveAntigravitySetting("footer", mode, file);
+}
+
+/** Persist the driver preference ("acp" | "stream-json" | "one-shot") under antigravity.driver. */
+export async function saveAgyDriverMode(mode: AgyDriverMode, file = settingsPath()): Promise<void> {
+  await saveAntigravitySetting("driver", mode, file);
 }

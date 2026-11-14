@@ -13,14 +13,24 @@ import {
   resetLegacyEffortSuffixCache,
   runAgyTurn,
 } from "../lib/agy-client.ts";
-import { AgyDriverSession } from "../lib/agy-driver.ts";
+import {
+  AgyDriverSession,
+  normalizeAgyDriverMode,
+  resolveAgyDriverMode,
+  SwitchableAgyTurnExecutor,
+} from "../lib/agy-driver.ts";
+import { extractToolCallsFromStepPayload } from "../lib/agy-thoughts.ts";
+import { ToolSummaryTracker } from "../lib/tool-summary.ts";
 import { readAgyFooterMode, resolveAgyFooterModeCommand } from "../lib/footer.ts";
 import {
+  loadSavedAgyDriverMode,
   loadSavedAgyFooterMode,
   loadSavedAgyToolMode,
+  saveAgyDriverMode,
   saveAgyFooterMode,
   saveAgyToolMode,
 } from "../lib/tool-mode-settings.ts";
+import { AntigravityRuntime, createAntigravityRuntime, runAntigravity } from "../src/runtime.ts";
 
 test("saved tool mode survives new readers and Pi's own settings writes", async (t) => {
   const dir = await mkdtemp(path.join(tmpdir(), "agy-tool-settings-"));
@@ -237,4 +247,105 @@ test("AgyDriverSession rejects cleanly with AgyStallError without unhandledRejec
   await new Promise((r) => setTimeout(r, 30));
   assert.equal(unhandled, undefined);
 });
+
+test("driver mode normalizes aliases, persists under antigravity.driver, and switches live", async (t) => {
+  assert.equal(normalizeAgyDriverMode("acp"), "acp");
+  assert.equal(normalizeAgyDriverMode("stream-json"), "stream-json");
+  assert.equal(normalizeAgyDriverMode("persistent"), "stream-json");
+  assert.equal(normalizeAgyDriverMode("legacy"), "stream-json");
+  assert.equal(normalizeAgyDriverMode("0"), "one-shot");
+  assert.equal(normalizeAgyDriverMode("oneshot"), "one-shot");
+  assert.equal(normalizeAgyDriverMode("unknown"), undefined);
+
+  const dir = await mkdtemp(path.join(tmpdir(), "agy-driver-settings-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "settings.json");
+
+  await writeFile(
+    file,
+    JSON.stringify({ "pi-agy": { turnTimeoutMs: 1000, driver: "legacy" }, antigravity: { toolMode: "pi" } }),
+  );
+  assert.equal(loadSavedAgyDriverMode(file), "stream-json");
+  assert.equal(resolveAgyDriverMode({ PI_CODING_AGENT_DIR: dir }), "stream-json");
+  assert.equal(
+    resolveAgyDriverMode({ PI_CODING_AGENT_DIR: dir, PI_ANTIGRAVITY_DRIVER: "acp" }),
+    "acp",
+  );
+
+  await saveAgyDriverMode("acp", file);
+  assert.equal(loadSavedAgyDriverMode(file), "acp");
+  assert.equal(resolveAgyDriverMode({ PI_CODING_AGENT_DIR: dir }), "acp");
+  assert.deepEqual(JSON.parse(await readFile(file, "utf8")), {
+    "pi-agy": { turnTimeoutMs: 1000 },
+    antigravity: { toolMode: "pi", driver: "acp" },
+  });
+
+  const executor = new SwitchableAgyTurnExecutor("acp");
+  t.after(() => executor.close("shutdown"));
+  assert.equal(executor.snapshot().mode, "acp");
+  await executor.switchMode("stream-json");
+  assert.equal(executor.mode, "stream-json");
+  assert.equal(executor.snapshot().mode, "persistent");
+  await executor.switchMode("one-shot");
+  assert.equal(executor.snapshot().mode, "one-shot");
+
+  const runtime = createAntigravityRuntime(new SwitchableAgyTurnExecutor("acp"));
+  const service = runtime.runSync(AntigravityRuntime);
+  t.after(() => runAntigravity(runtime, service.close));
+  await runAntigravity(runtime, service.switchDriverMode("stream-json"));
+  const snap = await runAntigravity(runtime, service.snapshot);
+  assert.equal(snap.executor.mode, "persistent");
+});
+
+test("extractToolCallsFromStepPayload decodes PlannerResponse toolSummary and pairs with bridged Pi call", () => {
+  const encodeVarint = (n: number): number[] => {
+    const out: number[] = [];
+    let v = n >>> 0;
+    while (v >= 0x80) {
+      out.push((v & 0x7f) | 0x80);
+      v >>>= 7;
+    }
+    out.push(v);
+    return out;
+  };
+  const encodeFieldBytes = (field: number, data: Uint8Array): Buffer => {
+    const tag = Buffer.from(encodeVarint((field << 3) | 2));
+    const len = Buffer.from(encodeVarint(data.length));
+    return Buffer.concat([tag, len, data]);
+  };
+  const idBuf = Buffer.from("call_123", "utf8");
+  const nameBuf = Buffer.from("mcp_pi-test_pi__read", "utf8");
+  const argsBuf = Buffer.from(
+    JSON.stringify({
+      path: "lani-server/db/re/quest_db.yml",
+      offset: 14680,
+      limit: 25,
+      toolSummary: "Read quest_db.yml around 21712",
+    }),
+    "utf8",
+  );
+  const tcMsg = Buffer.concat([
+    encodeFieldBytes(1, idBuf),
+    encodeFieldBytes(2, nameBuf),
+    encodeFieldBytes(3, argsBuf),
+  ]);
+  const prMsg = encodeFieldBytes(7, tcMsg);
+  const stepPayload = encodeFieldBytes(20, prMsg);
+
+  const calls = extractToolCallsFromStepPayload(stepPayload);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]?.id, "call_123");
+  assert.equal(calls[0]?.name, "mcp_pi-test_pi__read");
+  assert.equal(calls[0]?.args.toolSummary, "Read quest_db.yml around 21712");
+
+  const tracker = new ToolSummaryTracker();
+  tracker.recordBridgeCall({
+    id: "pi-bridge-45",
+    tool: "read",
+    args: { path: "lani-server/db/re/quest_db.yml", offset: 14680, limit: 25 },
+  });
+  tracker.recordToolStart({ name: calls[0]!.name, args: calls[0]!.args }, "pi-test");
+  assert.equal(tracker.get("pi-bridge-45"), "Read quest_db.yml around 21712");
+});
+
 

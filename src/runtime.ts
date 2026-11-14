@@ -23,6 +23,8 @@ import {
 } from "../lib/agy-client.ts";
 import {
   createAgyTurnExecutor,
+  SwitchableAgyTurnExecutor,
+  type AgyDriverMode,
   type AgyExecutorSnapshot,
   type AgyRecycleCause,
   type AgyTurnExecutor,
@@ -859,6 +861,20 @@ const makeRuntime = (
           })),
         ),
       ),
+
+      switchDriverMode: (mode: AgyDriverMode) =>
+        ensureOpen.pipe(
+          Effect.andThen(
+            Effect.promise(async () => {
+              if (!(executor instanceof SwitchableAgyTurnExecutor)) {
+                throw new Error("Active Antigravity executor does not support switching driver mode.");
+              }
+              invalidateActiveTurn();
+              await executor.switchMode(mode);
+              lastSentSystemPrompt = undefined;
+            }),
+          ),
+        ),
 
       authenticate: (options) =>
         ensureOpen.pipe(
