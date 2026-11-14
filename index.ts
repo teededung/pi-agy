@@ -3154,7 +3154,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         );
         if (isBelowRecommendedAgy(binary.version)) {
           lines.push(
-            `binary: WARN agy ${binary.version} < recommended ${RECOMMENDED_AGY_VERSION} (ACP cancel/update fixes, Carbon thinking fix, and background-input/stall fixes); run \`agy update\`.`,
+            `binary: WARN agy ${binary.version} < recommended ${RECOMMENDED_AGY_VERSION} (ACP cancel/auth/error/diff fixes, Carbon thinking fix, and background-input/stall fixes); run \`agy update\`.`,
           );
         }
       } else {

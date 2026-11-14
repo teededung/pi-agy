@@ -790,6 +790,7 @@ const KNOWN_AGY_TOOLS = new Set([
   "send_message",
   "manage_subagents",
   "manage_task",
+  "run_workflow",
   "call_mcp_tool",
 ]);
 

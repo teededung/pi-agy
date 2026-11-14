@@ -1429,8 +1429,8 @@ test("deleteDisposableAgyConversation recursively deletes subagent trees and cle
   }
 });
 
-test("reduceAgyStream strips invisible U+FFF9-U+FFFB chars without truncating subsequent deltas and RECOMMENDED_AGY_VERSION is 1.5.7", () => {
-  assert.equal(RECOMMENDED_AGY_VERSION, "1.5.7");
+test("reduceAgyStream strips invisible U+FFF9-U+FFFB chars without truncating subsequent deltas and RECOMMENDED_AGY_VERSION is 1.5.9", () => {
+  assert.equal(RECOMMENDED_AGY_VERSION, "1.5.9");
   assert.equal(stripHallucinatedTurnSuffix("hello \uFFF9code\uFFFA\uFFFB world"), "hello code world");
 
   const stream = [
