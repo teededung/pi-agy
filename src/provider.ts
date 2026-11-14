@@ -278,9 +278,13 @@ function inferMimeTypeFromExtension(ext: string): string {
   }
 }
 
-function persistUserImagePart(
-  part: ImagePart,
-): { filePath: string; image: AgyPromptImage } | undefined {
+interface ExtractedUserImage {
+  bytes: Buffer;
+  ext: string;
+  image: AgyPromptImage;
+}
+
+function extractUserImagePart(part: ImagePart): ExtractedUserImage | undefined {
   const rawData =
     typeof part.data === "string"
       ? part.data
@@ -310,20 +314,39 @@ function persistUserImagePart(
     if (bytes.length === 0) return undefined;
     const ext = inferImageExtension(mimeType, bytes);
     const normalizedMime = mimeType?.trim() || inferMimeTypeFromExtension(ext);
-    const hash = createHash("sha256").update(bytes).digest("hex").slice(0, 16);
-    const dir = path.join(tmpdir(), "pi-agy-images");
-    mkdirSync(dir, { recursive: true, mode: 0o700 });
-    const filePath = path.join(dir, `user-image-${hash}.${ext}`);
-    if (!existsSync(filePath)) {
-      writeFileSync(filePath, bytes, { mode: 0o600 });
-    }
     return {
-      filePath,
+      bytes,
+      ext,
       image: { data: base64.replace(/\s+/g, ""), mimeType: normalizedMime },
     };
   } catch {
     return undefined;
   }
+}
+
+function persistExtractedUserImage(extracted: ExtractedUserImage): string | undefined {
+  try {
+    const hash = createHash("sha256").update(extracted.bytes).digest("hex").slice(0, 16);
+    const dir = path.join(tmpdir(), "pi-agy-images");
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const filePath = path.join(dir, `user-image-${hash}.${extracted.ext}`);
+    if (!existsSync(filePath)) {
+      writeFileSync(filePath, extracted.bytes, { mode: 0o600 });
+    }
+    return filePath;
+  } catch {
+    return undefined;
+  }
+}
+
+function persistUserImagePart(
+  part: ImagePart,
+): { filePath: string; image: AgyPromptImage } | undefined {
+  const extracted = extractUserImagePart(part);
+  if (!extracted) return undefined;
+  const filePath = persistExtractedUserImage(extracted);
+  if (!filePath) return undefined;
+  return { filePath, image: extracted.image };
 }
 
 /**
@@ -336,14 +359,16 @@ function latestUserBatch(context: TranscriptContext): {
   start: number;
   prompt: string;
   images: number;
+  extractedImages: ExtractedUserImage[];
   imageParts: AgyPromptImage[];
+  omittedImages: number;
 } {
   for (let i = context.messages.length - 1; i >= 0; i--) {
     if (context.messages[i].role !== "user") continue;
     const end = i + 1;
     while (i > 0 && context.messages[i - 1].role === "user") i--;
     const texts: string[] = [];
-    const savedImagePaths: string[] = [];
+    const extractedImages: ExtractedUserImage[] = [];
     const imageParts: AgyPromptImage[] = [];
     let omittedImages = 0;
     let images = 0;
@@ -358,10 +383,10 @@ function latestUserBatch(context: TranscriptContext): {
           texts.push(part.text);
         } else if (part?.type === "image") {
           images += 1;
-          const persisted = persistUserImagePart(part as ImagePart);
-          if (persisted) {
-            savedImagePaths.push(persisted.filePath);
-            imageParts.push(persisted.image);
+          const extracted = extractUserImagePart(part as ImagePart);
+          if (extracted) {
+            extractedImages.push(extracted);
+            imageParts.push(extracted.image);
           } else {
             omittedImages += 1;
           }
@@ -370,9 +395,6 @@ function latestUserBatch(context: TranscriptContext): {
     }
     if (texts.length === 0 && images === 0) continue;
     const promptSegments = [...texts];
-    if (savedImagePaths.length > 0) {
-      promptSegments.push(attachedImagesPrompt(savedImagePaths));
-    }
     if (omittedImages > 0) {
       promptSegments.push(omittedImagesPrompt(omittedImages));
     }
@@ -380,16 +402,33 @@ function latestUserBatch(context: TranscriptContext): {
       start: i,
       prompt: promptSegments.join("\n"),
       images,
+      extractedImages,
       imageParts,
+      omittedImages,
     };
   }
-  return { start: -1, prompt: "", images: 0, imageParts: [] };
+  return { start: -1, prompt: "", images: 0, extractedImages: [], imageParts: [], omittedImages: 0 };
 }
 
-/** Extract all text in the latest user batch (plus an image-omitted note). */
+/** Extract all text in the latest user batch (plus disk-materialized image note for text-only callers). */
 export function latestUserPrompt(context: TranscriptContext): { prompt: string; images: number } {
-  const { prompt, images } = latestUserBatch(context);
-  return { prompt, images };
+  const { prompt, images, extractedImages, omittedImages } = latestUserBatch(context);
+  if (extractedImages.length === 0) return { prompt, images };
+  const savedImagePaths: string[] = [];
+  let extraOmitted = 0;
+  for (const extracted of extractedImages) {
+    const filePath = persistExtractedUserImage(extracted);
+    if (filePath) savedImagePaths.push(filePath);
+    else extraOmitted += 1;
+  }
+  const segments = prompt ? [prompt] : [];
+  if (savedImagePaths.length > 0) {
+    segments.push(attachedImagesPrompt(savedImagePaths));
+  }
+  if (extraOmitted > 0 && omittedImages === 0) {
+    segments.push(omittedImagesPrompt(extraOmitted));
+  }
+  return { prompt: segments.join("\n"), images };
 }
 
 // A fresh fallback conversation can safely receive roughly 60k characters of
@@ -1176,7 +1215,7 @@ export function streamAntigravity(
 
         stream.push({ type: "start", partial: output });
 
-        if (!rawUserPrompt) {
+        if (!rawUserPrompt && userBatch.imageParts.length === 0) {
           throw new Error("antigravity: no user text found in the request context.");
         }
         let isBoost = false;
@@ -1336,14 +1375,38 @@ export function streamAntigravity(
             ? buildSideConversationSystemPrompt(systemPrompt, getSystemPromptRelay?.())
             : (getSystemPromptRelay?.() ?? systemPrompt);
 
+        // Only persist user images to disk and append file-path instructions when
+        // running on a text-only executor; ACP delivers native `type: "image"` blocks.
+        let turnPromptWithImages = turnPrompt;
+        if (
+          !summaryRequest &&
+          !sideSummaryRequest &&
+          executorMode !== "acp" &&
+          userBatch.extractedImages.length > 0
+        ) {
+          const savedImagePaths: string[] = [];
+          let omittedOnWrite = 0;
+          for (const extracted of userBatch.extractedImages) {
+            const filePath = persistExtractedUserImage(extracted);
+            if (filePath) savedImagePaths.push(filePath);
+            else omittedOnWrite += 1;
+          }
+          const imageNotes: string[] = [];
+          if (savedImagePaths.length > 0) imageNotes.push(attachedImagesPrompt(savedImagePaths));
+          if (omittedOnWrite > 0) imageNotes.push(omittedImagesPrompt(omittedOnWrite));
+          if (imageNotes.length > 0) {
+            turnPromptWithImages = [turnPrompt, ...imageNotes].filter(Boolean).join("\n");
+          }
+        }
+
         const effectiveTurnPrompt = summaryRequest
           ? boundSummarizationPrompt(
-              turnPrompt,
+              turnPromptWithImages,
               executorMode === "acp"
                 ? MAX_ACP_SUMMARIZATION_PROMPT_CHARS
                 : MAX_AGY_SUMMARIZATION_PROMPT_CHARS,
             )
-          : turnPrompt;
+          : turnPromptWithImages;
         const readOnlyPermissions =
           summaryRequest ||
           sideSummaryRequest ||
@@ -1357,7 +1420,10 @@ export function streamAntigravity(
             // (stripping conflicting <btw_capabilities> tool claims).
             systemPrompt: effectiveSystemPrompt,
             images:
-              summaryRequest || sideSummaryRequest || userBatch.imageParts.length === 0
+              summaryRequest ||
+              sideSummaryRequest ||
+              executorMode !== "acp" ||
+              userBatch.imageParts.length === 0
                 ? undefined
                 : userBatch.imageParts,
             historyBootstrap:

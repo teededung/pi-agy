@@ -2507,3 +2507,147 @@ test("streamAntigravity keeps pre-compaction stall entries chronologically ahead
     await runtime.dispose();
   }
 });
+
+test("streamAntigravity sends native ACP images without disk-path instructions and falls back to disk paths on stream-json", async () => {
+  const tinyPngBase64 =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+  const fake = createFakeAcpSpawn();
+  const innerDriver = new AgyAcpDriverSession();
+  const acpExecutor = {
+    supportsNativeSystemPrompt: true,
+    supportsNativeImages: true,
+    run: (req: Parameters<typeof innerDriver.run>[0]) =>
+      innerDriver.run({ ...req, spawnOverride: fake.spawnOverride }),
+    snapshot: () => innerDriver.snapshot(),
+    close: (
+      reason: Parameters<typeof innerDriver.close>[0],
+      cause?: Parameters<typeof innerDriver.close>[1],
+    ) => innerDriver.close(reason, cause),
+  };
+
+  const runtime = createAntigravityRuntime(acpExecutor);
+  const service = runtime.runSync(AntigravityRuntime);
+  const replay = new AgyReplayStore();
+  const bridge = new AgyPiBridge("pi-test");
+  const prevPaceEnv = process.env.PI_ANTIGRAVITY_THINKING_PACE;
+  process.env.PI_ANTIGRAVITY_THINKING_PACE = "0";
+
+  const model: Model<string> = {
+    id: "gemini-4-argon",
+    name: "Gemini 4 Argon",
+    api: "antigravity-stream-json",
+    provider: "antigravity",
+    baseUrl: "agy://local-stream-json",
+    reasoning: true,
+    input: ["text", "image"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 1_000_000,
+    maxTokens: 64_000,
+  };
+
+  try {
+    const streamFn = streamAntigravity(runtime, service, replay, bridge);
+
+    // 1. ACP mode with text + image: native image block, no disk-path prompt injection
+    const ctxTextAndImage = {
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "What is in this screenshot?" },
+            { type: "image", mimeType: "image/png", data: tinyPngBase64 },
+          ],
+          timestamp: 1,
+        },
+      ],
+    } as unknown as TranscriptContext;
+    for await (const _ev of streamFn(model, ctxTextAndImage)) {
+      // drain
+    }
+
+    // 2. ACP mode with image-only prompt (no text): must not fail and must omit empty text block
+    const ctxImageOnly = {
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "image", mimeType: "image/png", data: tinyPngBase64 }],
+          timestamp: 2,
+        },
+      ],
+    } as unknown as TranscriptContext;
+    for await (const _ev of streamFn(model, ctxImageOnly)) {
+      // drain
+    }
+
+    const promptCalls = fake.rpcLog.filter((c) => c.method === "session/prompt");
+    assert.equal(promptCalls.length, 2);
+    assert.deepEqual(promptCalls[0]!.params.prompt, [
+      { type: "image", data: tinyPngBase64, mimeType: "image/png" },
+      { type: "text", text: "What is in this screenshot?" },
+    ]);
+    assert.deepEqual(promptCalls[1]!.params.prompt, [
+      { type: "image", data: tinyPngBase64, mimeType: "image/png" },
+    ]);
+  } finally {
+    if (prevPaceEnv === undefined) delete process.env.PI_ANTIGRAVITY_THINKING_PACE;
+    else process.env.PI_ANTIGRAVITY_THINKING_PACE = prevPaceEnv;
+    await runAntigravity(runtime, service.close);
+  }
+
+  // 3. Legacy stream-json (text-only) mode: persists image to disk and appends attachedImagesPrompt
+  const seenRequests: Array<{ prompt: string; images?: unknown }> = [];
+  const textOnlyExecutor = {
+    run: async (req: Parameters<typeof innerDriver.run>[0]) => {
+      seenRequests.push({ prompt: req.prompt, images: req.images });
+      req.onActivity?.({ type: "text", delta: "ok" });
+      return { ...newTurnOutcome(), finished: true, status: "OK" as const, response: "ok" };
+    },
+    snapshot: () => ({
+      mode: "persistent" as const,
+      state: "idle" as const,
+      cwd: "/workspace/demo",
+      model: "gemini-4-argon",
+      openSessions: 0,
+      ignoredNoiseLines: 0,
+      restartCount: 0,
+      stderrTail: [],
+      lifecycle: [],
+    }),
+    close: async () => undefined,
+  };
+  const legacyRuntime = createAntigravityRuntime(textOnlyExecutor);
+  const legacyService = legacyRuntime.runSync(AntigravityRuntime);
+  const legacyStream = streamAntigravity(
+    legacyRuntime,
+    legacyService,
+    new AgyReplayStore(),
+    new AgyPiBridge("pi-test"),
+  );
+  try {
+    const ctxLegacy = {
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Check image" },
+            { type: "image", mimeType: "image/png", data: tinyPngBase64 },
+          ],
+          timestamp: 3,
+        },
+      ],
+    } as unknown as TranscriptContext;
+    for await (const _ev of legacyStream(model, ctxLegacy)) {
+      // drain
+    }
+    assert.equal(seenRequests.length, 1);
+    assert.equal(seenRequests[0]!.images, undefined);
+    assert.match(seenRequests[0]!.prompt, /Check image/);
+    assert.match(seenRequests[0]!.prompt, /Attached user image\(s\) saved to disk/);
+    const pathMatch = seenRequests[0]!.prompt.match(/^- Image 1: (.+\.png)$/m);
+    if (pathMatch?.[1]) {
+      rmSync(pathMatch[1], { force: true });
+    }
+  } finally {
+    await runAntigravity(legacyRuntime, legacyService.close);
+  }
+});

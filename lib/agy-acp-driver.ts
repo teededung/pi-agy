@@ -1205,7 +1205,9 @@ async function awaitTurnExecution(
       }
     }
   }
-  blocks.push({ type: "text", text: promptText });
+  if (promptText || blocks.length === 0) {
+    blocks.push({ type: "text", text: promptText });
+  }
 
   let resolveAbortedOutcome: ((abortedOutcome: AgyTurnOutcome) => void) | undefined;
   const abortedPromise = new Promise<AgyTurnOutcome>((resolve) => {
